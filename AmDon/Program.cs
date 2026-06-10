@@ -1,5 +1,6 @@
 ﻿using System.Text.Json;
 using AmDon;
+using AmDon.Tests;
 using ConsoleInk;
 
 var config = JsonSerializer.Deserialize<JsonElement>(
@@ -322,6 +323,21 @@ while (true)
         continue;
     }
 
+    if (input.Equals("/test", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine("\n  Running tokenizer and guard tests...\n");
+        
+        var tokenAnalyzer = new TokenAnalyzer(nim, router.Resolve(ModelRole.Embedding));
+        var tokenTests = new TokenAnalyzerTests(tokenAnalyzer, nim);
+        await tokenTests.RunAllTests();
+        
+        var guardTests = new GuardPipelineTests(guards);
+        await guardTests.RunAllTests();
+        
+        Console.WriteLine("  Tests complete.\n");
+        continue;
+    }
+
     if (input.Equals("/help", StringComparison.OrdinalIgnoreCase))
     {
         Console.WriteLine("\n  Commands:");
@@ -332,6 +348,7 @@ while (true)
         Console.WriteLine("    /memory remove <id>    — remove entry by ID");
         Console.WriteLine("    /sleep                 — run consolidation cycle");
         Console.WriteLine("    /import                — import from chatbot export");
+        Console.WriteLine("    /test                  — run tokenizer and guard tests");
         Console.WriteLine("    /paste [DELIM]         — heredoc paste mode (default delimiter: EOF)");
         Console.WriteLine("    /help                  — show this help");
         Console.WriteLine("    /exit                  — quit AMDON");
