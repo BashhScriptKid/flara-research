@@ -141,12 +141,31 @@ public class GuardPipeline
             """;
 
         var guardResult = await Classify(deltaCopyPrompt, input, "(with delta copy task)");
+        
+        // Parse guard result - handle both formats:
+        // Format 1: "trust,intent,integrity,delta_copy" (4 fields)
+        // Format 2: "label,trust,intent,integrity,delta_copy" (5 fields with label)
         var parts = guardResult.Split(',');
         
-        var trust = ParseCsvFloat(guardResult, 0, 0.5f);
-        var intent = ParseCsvString(guardResult, 1, "unknown");
-        var integrity = ParseCsvFloat(guardResult, 2, 0.5f);
-        var deltaCopy = ParseCsvFloat(guardResult, 3, -1f);
+        float trust, integrity, deltaCopy;
+        string intent;
+        
+        if (parts.Length >= 5)
+        {
+            // Format 2: skip the first field (label)
+            trust = ParseCsvFloat(guardResult, 1, 0.5f);
+            intent = ParseCsvString(guardResult, 2, "unknown");
+            integrity = ParseCsvFloat(guardResult, 3, 0.5f);
+            deltaCopy = ParseCsvFloat(guardResult, 4, -1f);
+        }
+        else
+        {
+            // Format 1: standard 4-field format
+            trust = ParseCsvFloat(guardResult, 0, 0.5f);
+            intent = ParseCsvString(guardResult, 1, "unknown");
+            integrity = ParseCsvFloat(guardResult, 2, 0.5f);
+            deltaCopy = ParseCsvFloat(guardResult, 3, -1f);
+        }
 
         // Step 3: Delta mismatch check (±0.3 threshold)
         var deltaMismatch = MathF.Abs(deltaCopy - tokenMetrics.AverageAngleDelta) > 0.3f;
