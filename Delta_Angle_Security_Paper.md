@@ -133,6 +133,12 @@ Softmax weighting amplifies this signal. Even if most of the injection is token-
 
 The delta angle catches semantic contradictions, not just token-level mixing. This is why softmax weighting is critical — it amplifies the security-relevant signal.
 
+**Why long-range contradictions are also caught:**
+
+The metric is sensitive to local transitions, not long-range distances. But long-range contradictions MUST have local transitions — you cannot change semantics without a transition point. A prompt that says "I love you" at the start and "I hate you" at the end has a semantic shift somewhere in the middle. The delta angle captures that transition. Softmax amplifies it.
+
+The attacker cannot have a contradiction without a transition. The transition is always local. The delta angle always catches it.
+
 ## 4. The Mechanism
 
 ### 4.1 Tokenizer Analysis
