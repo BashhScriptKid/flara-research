@@ -196,7 +196,7 @@ The copy task is a simple coherence check. Failure to copy implies something is 
 
 **Why the copy task is not circular.**
 
-The critique assumes the defense requires the guard to be trustworthy. This is wrong. The defense requires the guard to be COHERENT. There's a difference:
+The defense requires the guard to be COHERENT, not trustworthy. There's a difference:
 - Trustworthy: the guard correctly classifies the input
 - Coherent: the guard can follow its own instructions
 
@@ -210,7 +210,7 @@ The attacker cannot have both. The copy task detects injection by checking if th
 
 **Why gradient-based optimization is impractical.**
 
-The critique suggests attackers could optimize inputs to have low delta while remaining malicious. This requires:
+Optimizing inputs to have low delta while remaining malicious requires:
 1. Access to the tokenizer (model-specific, not public)
 2. Access to the embedding model (separate from guard model)
 3. Ability to run gradient-based optimization (computationally expensive)
