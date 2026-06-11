@@ -167,8 +167,8 @@ public class GuardPipeline
             deltaCopy = ParseCsvFloat(guardResult, 3, -1f);
         }
 
-        // Step 3: Delta mismatch check (±0.3 threshold)
-        var deltaMismatch = MathF.Abs(deltaCopy - tokenMetrics.AverageAngleDelta) > 0.3f;
+        // Step 3: Delta mismatch check (±0.01 tolerance — floating point error + model reinterpretation only)
+        var deltaMismatch = MathF.Abs(deltaCopy - tokenMetrics.AverageAngleDelta) > 0.01f;
         
         // Delta scales inversely to threshold: higher delta = lower threshold for flagging
         var dynamicThreshold = 0.3f - (tokenMetrics.AverageAngleDelta * 0.2f);
