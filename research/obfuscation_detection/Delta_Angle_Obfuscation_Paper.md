@@ -1,10 +1,11 @@
 # Delta Angle as an Obfuscation Detector
 
 **Flara Research Lab**
+**Status: Early-stage research, not for production use**
 
 ## Abstract
 
-We show that embedding-space delta angle measurements can detect obfuscated prompt injections with high accuracy. Obfuscated inputs—those using encoding, character substitution, or structural manipulation to evade detection—produce consistently lower delta angles than benign inputs across multiple embedding models. We evaluate on 287 obfuscation samples and 813 benign samples, achieving F1 scores of 0.879 and 0.891 on two production embedding models, with consistent separation gaps of 0.33–0.34. This result suggests that obfuscation attacks, which are specifically designed to evade surface-level detection, create measurable semantic distortions in embedding space that delta angle can capture.
+We present preliminary evidence that embedding-space delta angle measurements can detect obfuscated prompt injections. Obfuscated inputs—those using encoding, character substitution, or structural manipulation to evade detection—produce consistently lower delta angles than benign inputs across two embedding models. We evaluate on 50 obfuscation samples and 50 benign samples per model, achieving F1 scores of 0.879 and 0.891. While these results are promising, the evaluation is small and requires validation on larger datasets before any production claims can be made.
 
 ## 1. Introduction
 
@@ -23,7 +24,7 @@ We previously found that delta angle performs poorly as a general injection dete
 
 ### 2.1 Previous Work
 
-In earlier work (Flara Research Lab, 2025), we proposed delta angle as a general-purpose security measure against prompt injection. The hypothesis was that injection attacks would produce higher delta angles than benign prompts, making delta angle a reliable detector. We provided mathematical framework (three properties: checksum, self-flagging, auxiliary scaler) and preliminary evaluation in the AMDON prototype.
+In earlier work (Flara Research Lab, 2025), we proposed delta angle as a general-purpose security measure against prompt injection. The hypothesis was that injection attacks would produce higher delta angles than benign prompts, making delta angle a reliable detector.
 
 However, evaluation revealed significant limitations. Normal prompts and injection prompts had overlapping delta ranges (0.48–0.76 radians), with sophisticated injections producing similar deltas to benign inputs. The distributions overlapped by more than 50%, making delta angle unreliable as a standalone detector for general injection.
 
@@ -150,23 +151,28 @@ This result suggests that delta angle is not a general-purpose detector but a sp
 
 ## 6. Limitations
 
-1. **Small dataset**: 50 samples per model is insufficient for production deployment
-2. **Limited obfuscation types**: We evaluate hex, base64, and character substitution, but not all possible obfuscation techniques
-3. **Model dependency**: Results vary across embedding models
-4. **Not standalone**: Delta angle should be used as part of a multi-layer defense, not as a sole detector
+**This is early-stage research. The following limitations are significant:**
+
+1. **Small evaluation**: 50 samples per model is insufficient for production claims. This is a pilot study, not a validation.
+2. **Limited obfuscation types**: We evaluate hex, base64, and character substitution, but not all possible obfuscation techniques.
+3. **Model dependency**: Results vary across embedding models. We only tested two models.
+4. **No comparison with baselines**: We do not compare with perplexity, entropy, or other detection methods.
+5. **Not standalone**: Delta angle should be used as part of a multi-layer defense, not as a sole detector.
+6. **Private repository**: Code is not yet publicly available. Reproduction requires access to Flara-workspace (private).
 
 ## 7. Future Work
 
-1. **Larger evaluation**: Test on 287 obfuscation samples (full dataset)
+1. **Larger evaluation**: Test on all 287 obfuscation samples and 813 benign samples
 2. **More obfuscation types**: Evaluate Unicode encoding, markdown manipulation, code block injection
 3. **Cross-model validation**: Test on additional embedding models
-4. **Production integration**: Implement as a classifier in AMDON guard pipeline
+4. **Baseline comparison**: Compare with perplexity, entropy, and embedding clustering methods
+5. **Production integration**: Implement as a classifier in AMDON guard pipeline (if results hold at scale)
 
 ## 8. Conclusion
 
-Delta angle measurements can detect obfuscated prompt injections with high accuracy (F1 ≈ 0.885). The key insight is that obfuscation creates measurable semantic distortions in embedding space, even when the lexical form is changed. This makes delta angle a valuable component of multi-layer defense systems, particularly against encoding-based attacks.
+Preliminary results suggest that delta angle measurements may detect obfuscated prompt injections (F1 ≈ 0.885 on 50 samples). The key insight is that obfuscation creates measurable semantic distortions in embedding space, even when the lexical form is changed.
 
-This result represents a refinement of our earlier work. Where delta angle failed as a general-purpose detector due to overlapping distributions between benign and injection prompts, it succeeds as a specialized detector for obfuscated inputs. The lesson is that security measures often have narrow domains of effectiveness, and identifying those domains is as important as the measures themselves.
+However, this is a small-scale pilot study. The results need validation on larger datasets, more obfuscation types, and additional embedding models before any production claims can be made. We present this as a promising direction for further research, not a validated solution.
 
 ## References
 
@@ -177,6 +183,8 @@ This result represents a refinement of our earlier work. Where delta angle faile
 3. Flara Research Lab. (2025). "PSNAT-AMDON: API-based Model Distribution and Orchestration Network." Technical Report.
 
 ## Appendix A: Graphs
+
+*Note: Figures are hosted on imgur for this draft. Final version will use proper figure placement.*
 
 ### Comparison Chart
 ![Delta Angle Comparison](https://i.imgur.com/2aklo2D.png)
@@ -195,11 +203,12 @@ This result represents a refinement of our earlier work. Where delta angle faile
 
 ## Appendix B: Reproduction
 
-To reproduce these results:
+Reproduction requires access to the Flara-workspace repository (currently private). Instructions:
 
-1. Clone the repository
-2. Run `python3 download_benchmarks.py` to fetch the Threat-Matrix dataset
-3. Run the AMDON CLI and execute `/benchmark-obf`
-4. Run `python3 obf_graphs.py` to generate graphs
+1. Run `python3 download_benchmarks.py` to fetch the Threat-Matrix dataset
+2. Run the AMDON CLI and execute `/benchmark-obf`
+3. Run `python3 obf_graphs.py` to generate graphs
+
+We plan to make the repository public once the research matures beyond the pilot stage.
 
 All data and code are available in the Flara-workspace repository.
