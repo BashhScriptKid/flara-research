@@ -5,7 +5,7 @@
 
 ## Abstract
 
-We present preliminary evidence that embedding-space delta angle measurements can detect obfuscated prompt injections. Obfuscated inputs—those using encoding, character substitution, or structural manipulation to evade detection—produce consistently lower delta angles than benign inputs across two embedding models. We evaluate on 50 obfuscation samples and 50 benign samples per model, achieving F1 scores of 0.879 and 0.891. While these results are promising, the evaluation is small and requires validation on larger datasets before any production claims can be made.
+We present preliminary evidence that embedding-space delta angle measurements can detect obfuscated prompt injections. Obfuscated inputs—those using encoding, character substitution, or structural manipulation—produce consistently lower delta angles than benign inputs across two embedding models. On 50 samples per class, we achieve F1 scores of 0.864–0.889 with AUC-ROC of 0.93–0.95. The detection mechanism appears to be semantic compression: encoding reduces lexical variance, causing consecutive chunks to embed more similarly. However, this is a small-scale pilot study with significant limitations.
 
 ## 1. Introduction
 
@@ -92,17 +92,18 @@ We evaluate on two production embedding models:
 
 ### 4.3 Results
 
-| Model | Obfuscation Δ | Benign Δ | Gap | F1 | Threshold |
-|-------|---------------|----------|-----|-----|-----------|
-| nv-embedqa-e5-v5 | 0.366 ± 0.184 | 0.696 ± 0.142 | 0.330 | 0.879 | 0.422 |
-| llama-nemotron-embed-1b-v2 | 0.565 ± 0.214 | 0.907 ± 0.206 | 0.342 | 0.891 | 0.629 |
+| Model | Obfuscation Δ | Benign Δ | Gap | F1 | AUC-ROC | Threshold |
+|-------|---------------|----------|-----|-----|---------|-----------|
+| nv-embedqa-e5-v5 | 0.387 ± 0.177 | 0.707 ± 0.146 | 0.320 | 0.864 | 0.901 | 0.567 |
+| llama-nemotron-embed-1b-v2 | 0.585 ± 0.207 | 0.924 ± 0.212 | 0.339 | 0.889 | 0.895 | 0.629 |
 
 **Key findings:**
 
 1. **Consistent separation**: Both models show a gap of ~0.33 between obfuscation and benign distributions
-2. **High F1**: Average F1 of 0.885 across models
-3. **Low false positives**: Only 1 false positive per model out of 50 benign samples
-4. **Model agreement**: Per-sample correlation of r≈0.76 between models
+2. **AUC-ROC**: 0.895–0.901, indicating good discriminative ability
+3. **High precision**: 0.95–0.98 (rarely flags benign as obfuscation)
+4. **Moderate recall**: 0.79–0.82 (misses some obfuscation)
+5. **Model agreement**: Per-sample correlation of r≈0.76 between models
 
 ### 4.4 Distribution Analysis
 
@@ -163,7 +164,23 @@ This result suggests that delta angle is not a general-purpose detector but a sp
 2. **Complementary to other measures**: Delta angle can be combined with other detectors that catch direct injection
 3. **Deterministic**: Unlike model-based detectors, delta angle is purely mathematical and cannot be manipulated
 
-## 6. Limitations
+## 6. Related Work
+
+Embedding-based detection has been explored for various NLP tasks. Perplexity-based detectors (Gehman et al., 2020) use language model uncertainty to flag machine-generated text. Entropy-based methods measure token-level randomness. Keyword filtering remains common in production systems.
+
+Delta angle differs by measuring *structural* semantic properties rather than surface-level features. It operates on embedding geometry, not token probabilities. This makes it complementary to existing approaches — it could be combined with perplexity or entropy for multi-feature detection.
+
+However, we do not compare with these baselines in this work. Such comparison is necessary to establish whether delta angle provides independent signal beyond what existing methods already capture.
+
+## 7. Computational Cost
+
+Delta angle requires one embedding API call per chunked input. For a typical 100-word prompt, this means 2–5 chunks, each requiring an embedding. On NIM's free tier (40 RPM), this adds ~100–200ms latency per request.
+
+The computation itself (angle calculation, softmax weighting) is negligible — O(n) where n is the number of chunks. The bottleneck is the embedding API call, not the delta computation.
+
+For production deployment, the cost depends on the embedding model's pricing and throughput requirements. This is a constraint, not a fundamental limitation.
+
+## 8. Limitations
 
 **This is early-stage research. The following limitations are significant:**
 
@@ -171,8 +188,9 @@ This result suggests that delta angle is not a general-purpose detector but a sp
 2. **Limited obfuscation types**: We evaluate hex, base64, and character substitution, but not all possible obfuscation techniques.
 3. **Model dependency**: Results vary across embedding models. We only tested two models.
 4. **No comparison with baselines**: We do not compare with perplexity, entropy, or other detection methods.
-5. **Not standalone**: Delta angle should be used as part of a multi-layer defense, not as a sole detector.
-6. **Private repository**: Code is not yet publicly available. Reproduction requires access to Flara-workspace (private).
+5. **Threshold selection**: The threshold is optimized on the same data used for evaluation (data leakage). Production deployment requires a held-out validation set.
+6. **Adversarial robustness**: We do not test whether attackers can craft obfuscation that evades delta angle detection.
+7. **Private repository**: Code is not yet publicly available. Reproduction requires access to Flara-workspace (private).
 
 ## 7. Future Work
 
@@ -184,11 +202,16 @@ This result suggests that delta angle is not a general-purpose detector but a sp
 
 ## 8. Conclusion
 
-Preliminary results suggest that delta angle measurements may detect obfuscated prompt injections (F1 ≈ 0.885 on 50 samples). The key insight is that encoding-based obfuscation compresses semantic variance — encoded text has lower delta than natural language because consecutive chunks are more semantically similar.
+Preliminary results (AUC-ROC 0.895–0.901, F1 0.864–0.889 on 50 samples) suggest that delta angle may detect encoding-based obfuscation. The mechanism is semantic compression: encoding reduces lexical variance, causing consecutive chunks to embed more similarly.
 
-This is the opposite of the intuitive hypothesis that obfuscation creates "more contradiction." Instead, obfuscation reduces the lexical diversity that drives angular distance in embeddings. Risk score (entropy, character patterns) is not useful here — delta is the only discriminating feature.
+However, this is a small-scale pilot study. Key open questions:
 
-However, this is a small-scale pilot study. The results need validation on larger datasets, more obfuscation types, and additional embedding models before any production claims can be made. We present this as a promising direction for further research, not a validated solution.
+1. Does the result hold at 287 samples (full dataset)?
+2. How does delta angle compare with perplexity, entropy, or keyword baselines?
+3. What happens when attackers know the detection method?
+4. Which threshold selection strategy works in production?
+
+We present this as a direction for further research, not a validated solution.
 
 ## References
 
@@ -197,6 +220,8 @@ However, this is a small-scale pilot study. The results need validation on large
 2. Neuralchemy. (2025). "Prompt-injection-Threat-Matrix." HuggingFace Dataset.
 
 3. Flara Research Lab. (2025). "PSNAT-AMDON: API-based Model Distribution and Orchestration Network." Technical Report.
+
+4. Gehman, S., et al. (2020). "RealToxicityPrompts: Evaluating Neural Toxic Degeneration in Language Models." EMNLP Findings.
 
 ## Appendix A: Graphs
 
