@@ -335,23 +335,55 @@ Current defenses rely on the model's ability to distinguish between legitimate a
 
 The delta checksum can be used to evaluate whether a model is being manipulated. If the model's output doesn't match the tokenizer's analysis, something is wrong.
 
-## 9. Limitations
+## 8. Limitations
 
-1. **Tokenizer dependency** — the measure is only as good as the tokenizer. Different tokenizers may produce different deltas. The security properties depend on the tokenizer's quality and consistency.
+The delta angle is not a complete security solution. It has significant limitations that must be understood:
 
-2. **Embedding quality** — the delta depends on the embedding model's quality. A poor embedding model may not capture semantic contradictions effectively. The measure is tied to the specific embedding model used.
+**Fundamental limitations:**
 
-3. **Computational cost** — requires embedding computation for each input. This adds latency and resource requirements. The cost is non-trivial for high-throughput systems.
+1. **Overlapping distributions** — Normal prompts and injection prompts have overlapping delta ranges (0.48 - 0.76 radians). The delta angle alone cannot reliably distinguish between them. This is visible in our test results where sophisticated injections have similar deltas to normal prompts.
 
-4. **Not a complete solution** — should be combined with other measures. The delta angle catches some attacks but not all. Defense in depth is required.
+2. **Not a standalone detector** — The delta angle provides context, not a final decision. It must be combined with other classifiers (trust, intent, integrity) to be effective. The auxiliary scaler property is more valuable than the direct detection property.
 
-5. **Informal proof** — the security argument is based on informal reasoning, not formal theorem. Edge cases and bounds are not rigorously analyzed.
+3. **Semantic coherence hides attacks** — Well-crafted injections can be semantically coherent within one narrative. The delta angle may not catch these because the semantic transitions are smooth, not abrupt.
 
-6. **False positives on normal inputs** — legitimate prompts frequently have semantic shifts (multi-part questions, code + text, topic transitions). The delta angle may flag these as suspicious. However, the delta angle is not a final decision — it provides context for other classifiers. Other classifiers (trust, intent, integrity) can confirm the input is benign, even if delta is elevated.
+**Implementation limitations:**
 
-7. **False negatives on sophisticated attacks** — well-crafted injections can be semantically coherent within one narrative. The delta angle may not catch these. However, other classifiers can still detect the injection. The delta angle is one layer of defense, not the only layer.
+4. **Tokenizer dependency** — The measure is only as good as the tokenizer. Different tokenizers may produce different deltas. The security properties depend on the tokenizer's quality and consistency.
 
-8. **Threshold tuning** — the dynamic threshold needs to be tuned to avoid flooding users with false alarms. This requires baseline measurements of normal prompt delta distributions. The auxiliary scaler property helps — delta can dynamically adjust other classifiers' thresholds based on the input's risk level.
+5. **Embedding quality** — The delta depends on the embedding model's quality. A poor embedding model may not capture semantic contradictions effectively. The measure is tied to the specific embedding model used.
+
+6. **Computational cost** — Requires embedding computation for each input. This adds latency and resource requirements. The cost is non-trivial for high-throughput systems.
+
+7. **Threshold tuning** — The dynamic threshold needs to be tuned to avoid flooding users with false alarms. This requires baseline measurements of normal prompt delta distributions.
+
+**Evaluation limitations:**
+
+8. **Preliminary evaluation** — Current results are from a prototype system. A rigorous evaluation would require:
+   - Detection rates and false positive rates on standard datasets (HackAPrompt, InjecAgent, OWASP Benchmark)
+   - Baselines (perplexity, entropy alone, embedding clustering)
+   - Attack success rates against real prompt injection datasets
+   - Comparison with existing defenses (InjecGuard, LlamaGuard, etc.)
+
+9. **No formal bounds** — The security argument is based on informal reasoning. Edge cases and bounds are not rigorously analyzed. The theorems in Section 3 are plausible reasoning, not proven facts.
+
+10. **False positives on normal inputs** — Legitimate prompts frequently have semantic shifts (multi-part questions, code + text, topic transitions). The delta angle may flag these as suspicious. The auxiliary scaler property helps — delta can dynamically adjust other classifiers' thresholds based on the input's risk level.
+
+**What the delta angle IS:**
+
+- One layer of defense in a defense-in-depth architecture
+- A continuous measure of semantic contradiction
+- A canary that detects when the guard model is not following its own instructions
+- An auxiliary scaler that informs other classifiers
+
+**What the delta angle IS NOT:**
+
+- A standalone detector
+- A complete security solution
+- A silver bullet against all prompt injection attacks
+- A replacement for other security measures
+
+The delta angle is a useful component of a comprehensive security architecture, not a replacement for it.
 
 ## 9. Future Work
 
