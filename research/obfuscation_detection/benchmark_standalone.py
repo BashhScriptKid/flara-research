@@ -166,8 +166,20 @@ def run_benchmark(model: str, max_samples: int = 50) -> pd.DataFrame:
 
 def compute_metrics(df: pd.DataFrame) -> dict:
     """Compute performance metrics."""
+    from sklearn.metrics import roc_auc_score
+    
     obf = df[df['label'] == 'obfuscation']['delta']
     ben = df[df['label'] == 'benign']['delta']
+    
+    # For AUC-ROC: obfuscation=1 (positive), benign=0 (negative)
+    # Delta is INVERSELY related to obfuscation (lower = more obfuscated)
+    y_true = [1] * len(obf) + [0] * len(ben)
+    y_scores = list(-obf.values) + list(-ben.values)  # Negate so higher = more obfuscated
+    
+    try:
+        auc_roc = roc_auc_score(y_true, y_scores)
+    except:
+        auc_roc = 0
     
     # Find optimal threshold
     all_deltas = np.concatenate([obf.values, ben.values])
@@ -207,6 +219,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         'ben_mean': ben.mean(),
         'ben_std': ben.std(),
         'gap': abs(ben.mean() - obf.mean()),
+        'auc_roc': auc_roc,
         **best_metrics
     }
 

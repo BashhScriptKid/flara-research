@@ -164,7 +164,24 @@ This result suggests that delta angle is not a general-purpose detector but a sp
 2. **Complementary to other measures**: Delta angle can be combined with other detectors that catch direct injection
 3. **Deterministic**: Unlike model-based detectors, delta angle is purely mathematical and cannot be manipulated
 
-## 6. Related Work
+## 6. Baseline Comparison
+
+We compare delta angle against three existing detection methods on the same 50-sample dataset:
+
+| Method | E5-v5 Recall | Nemotron Recall | Avg F1 | FPR target |
+|--------|--------------|-----------------|--------|------------|
+| Character entropy | 0.062 | 0.061 | 0.110 | 5% |
+| Special char ratio | 0.125 | 0.143 | 0.224 | 5% |
+| Regex (hex/base64) | 0.729 | 0.714 | 0.838 | 5% |
+| **Delta angle** | **0.792** | **0.816** | **0.862** | 5% |
+
+At a fixed 5% false positive rate, delta angle achieves 79–82% recall, outperforming regex (71–73%), special character ratio (12–14%), and entropy (6%).
+
+**Feature independence**: Delta angle correlates moderately with entropy (r=0.61–0.73) but poorly with regex (r=0.46–0.60) and special character ratio (r=-0.13 to -0.27). This suggests delta angle captures partially independent signal from pattern-based methods.
+
+**Why delta angle outperforms regex**: Regex detects only known encoding patterns (hex strings, base64 blocks). Delta angle detects the *semantic compression* caused by encoding, regardless of which encoding was used. A novel encoding scheme bypasses regex but still compresses embedding space.
+
+## 7. Related Work
 
 Existing approaches to detecting obfuscated inputs fall into three categories:
 
@@ -180,9 +197,7 @@ Delta angle occupies a middle ground. It does not require known encoding pattern
 
 The trade-off: delta angle is cheaper than semantic intent detection (~100ms for embedding vs ~1s for LLM inference), more general than regex (works on any encoding), and less noisy than entropy (measures structure, not randomness). But it cannot identify *which* encoding was used (unlike regex), and it is less powerful than full semantic analysis (unlike intent detection).
 
-We do not compare directly with these baselines in this work. Such comparison is necessary to establish whether delta angle provides independent signal beyond what existing methods already capture.
-
-## 7. Computational Cost
+## 8. Computational Cost
 
 Delta angle requires one embedding API call per chunked input. For a typical 100-word prompt, this means 2–5 chunks, each requiring an embedding. On NIM's free tier (40 RPM), this adds ~100–200ms latency per request.
 
@@ -197,7 +212,7 @@ For production deployment, the cost depends on the embedding model's pricing and
 1. **Small evaluation**: 50 samples per model is insufficient for production claims. This is a pilot study, not a validation.
 2. **Limited obfuscation types**: We evaluate hex, base64, and character substitution, but not all possible obfuscation techniques.
 3. **Model dependency**: Results vary across embedding models. We only tested two models.
-4. **No comparison with baselines**: We do not compare with perplexity, entropy, or other detection methods.
+4. **No semantic intent comparison**: We compare with regex, entropy, and special character baselines, but not with more expensive semantic intent detection methods.
 5. **Threshold selection**: The threshold is optimized on the same data used for evaluation (data leakage). Production deployment requires a held-out validation set.
 6. **Adversarial robustness**: We do not test whether attackers can craft obfuscation that evades delta angle detection.
 7. **Private repository**: Code is not yet publicly available. Reproduction requires access to Flara-workspace (private).
@@ -260,6 +275,15 @@ We present this as a direction for further research, not a validated solution.
 
 ### Threshold Analysis
 ![Threshold Analysis](https://i.imgur.com/X7CptPx.png)
+
+### FPR-FNR Comparison
+![FPR-FNR Comparison](graphs/fpr_fnr_comparison.png)
+
+### Recall at 5% FPR
+![Recall at FPR 5%](graphs/recall_at_fpr5.png)
+
+### Feature Correlation
+![Feature Correlation](graphs/feature_correlation.png)
 
 ## Appendix B: Reproduction
 
