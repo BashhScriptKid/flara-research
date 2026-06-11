@@ -351,6 +351,44 @@ while (true)
         continue;
     }
 
+    if (input.Equals("/benchmark-all", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine("\n  Running multi-model benchmark...\n");
+        
+        var allModels = new List<string>
+        {
+            "nvidia/nv-embedqa-e5-v5",
+            "nvidia/nv-embed-v1",
+            "nvidia/llama-nemotron-embed-1b-v2",
+            "nvidia/nv-embedcode-7b-v1"
+        };
+        
+        var tokenAnalyzer = new TokenAnalyzer(nim, router.Resolve(ModelRole.Embedding));
+        var benchmarkAnalyzer = new BenchmarkAnalyzer(tokenAnalyzer, nim, router.Resolve(ModelRole.Embedding));
+        await benchmarkAnalyzer.RunMultiModelAnalysis(allModels, maxSamples: 30);
+        
+        Console.WriteLine("  Multi-model benchmark complete.\n");
+        continue;
+    }
+
+    if (input.Equals("/benchmark-obf", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine("\n  Running obfuscation detection benchmark...\n");
+        
+        var obfModels = new List<string>
+        {
+            "nvidia/nv-embedqa-e5-v5",
+            "nvidia/llama-nemotron-embed-1b-v2"
+        };
+        
+        var tokenAnalyzer = new TokenAnalyzer(nim, router.Resolve(ModelRole.Embedding));
+        var benchmarkAnalyzer = new BenchmarkAnalyzer(tokenAnalyzer, nim, router.Resolve(ModelRole.Embedding));
+        await benchmarkAnalyzer.RunObfuscationAnalysis(obfModels, maxSamples: 50);
+        
+        Console.WriteLine("  Obfuscation benchmark complete.\n");
+        continue;
+    }
+
     if (input.Equals("/help", StringComparison.OrdinalIgnoreCase))
     {
         Console.WriteLine("\n  Commands:");
@@ -362,6 +400,9 @@ while (true)
         Console.WriteLine("    /sleep                 — run consolidation cycle");
         Console.WriteLine("    /import                — import from chatbot export");
         Console.WriteLine("    /test                  — run tokenizer and guard tests");
+        Console.WriteLine("    /benchmark             — run single-model benchmark");
+        Console.WriteLine("    /benchmark-all         — run multi-model benchmark (7 models)");
+        Console.WriteLine("    /benchmark-obf         — run obfuscation detection benchmark");
         Console.WriteLine("    /paste [DELIM]         — heredoc paste mode (default delimiter: EOF)");
         Console.WriteLine("    /help                  — show this help");
         Console.WriteLine("    /exit                  — quit AMDON");

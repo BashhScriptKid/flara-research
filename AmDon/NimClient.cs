@@ -79,7 +79,11 @@ public class NimClient : IDisposable
             encoding_format = "float"
         };
 
-        var resp = await _http.PostAsJsonAsync("embeddings", body);
+        var json = System.Text.Json.JsonSerializer.Serialize(body);
+        var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+        content.Headers.ContentType.CharSet = null;
+
+        var resp = await _http.PostAsync("embeddings", content);
         if (!resp.IsSuccessStatusCode)
         {
             var error = await resp.Content.ReadAsStringAsync();
