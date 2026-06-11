@@ -16,7 +16,18 @@ public class TokenAnalyzer
 
     public async Task<TokenMetrics> AnalyzeAsync(string input)
     {
-        var embedding = await _nim.EmbedAsync(_embeddingModel, input, "passage") ?? [];
+        // Chunk input by sentence/clause for token-level analysis
+        var chunks = ChunkInput(input);
+        var chunkEmbeddings = new List<float[]>();
+
+        foreach (var chunk in chunks)
+        {
+            var embedding = await _nim.EmbedAsync(_embeddingModel, chunk, "passage");
+            if (embedding != null && embedding.Length > 0)
+            {
+                chunkEmbeddings.Add(embedding);
+            }
+        }
 
         var charEntropy = ComputeCharEntropy(input);
         var unknownTokenRatio = ComputeUnknownTokenRatio(input);
@@ -26,7 +37,6 @@ public class TokenAnalyzer
 
         var metrics = new TokenMetrics
         {
-            Embedding = embedding,
             CharEntropy = charEntropy,
             UnknownTokenRatio = unknownTokenRatio,
             TokenBoundaryBreaks = tokenBoundaryBreaks,
@@ -34,10 +44,56 @@ public class TokenAnalyzer
             LanguageMixing = languageMixing
         };
 
-        metrics.AverageAngleDelta = ComputeAverageAngleDelta(embedding);
+        if (chunkEmbeddings.Count >= 2)
+        {
+            metrics.AverageAngleDelta = ComputeAverageAngleDelta(chunkEmbeddings);
+        }
+
         metrics.TokenRisk = ComputeTokenRisk(metrics);
 
         return metrics;
+    }
+
+    private List<string> ChunkInput(string input)
+    {
+        // Split by sentence boundaries, clauses, and significant pauses
+        var chunks = new List<string>();
+
+        // Split by sentence-ending punctuation
+        var sentences = System.Text.RegularExpressions.Regex.Split(input, @"(?<=[.!?])\s+");
+
+        foreach (var sentence in sentences)
+        {
+            if (string.IsNullOrWhiteSpace(sentence)) continue;
+
+            // Further split long sentences by commas, semicolons, or conjunctions
+            if (sentence.Length > 50)
+            {
+                var subChunks = System.Text.RegularExpressions.Regex.Split(sentence, @"(?<=[,;])\s+|(?<=\s+(?:and|but|or|then|while|because|although|if|when|where|how|what|why|who|which|that))\s+");
+                foreach (var subChunk in subChunks)
+                {
+                    if (!string.IsNullOrWhiteSpace(subChunk))
+                        chunks.Add(subChunk.Trim());
+                }
+            }
+            else
+            {
+                chunks.Add(sentence.Trim());
+            }
+        }
+
+        // Ensure we have at least 2 chunks for comparison
+        if (chunks.Count < 2 && input.Length > 10)
+        {
+            // Fallback: split by word count
+            var words = input.Split(' ');
+            var mid = words.Length / 2;
+            chunks.Clear();
+            chunks.Add(string.Join(" ", words.Take(mid)));
+            chunks.Add(string.Join(" ", words.Skip(mid)));
+        }
+
+        return chunks;
     }
 
     private float ComputeCharEntropy(string input)
@@ -125,16 +181,35 @@ public class TokenAnalyzer
         return Math.Min(1f, (float)(scripts.Count - 1) / 5);
     }
 
-    private float ComputeAverageAngleDelta(float[] embedding)
+    private float ComputeAverageAngleDelta(List<float[]> embeddings)
     {
-        if (embedding == null || embedding.Length < 2) return 0f;
+        if (embeddings == null || embeddings.Count < 2) return 0f;
 
         var angles = new List<float>();
-        for (int i = 1; i < embedding.Length; i++)
+        for (int i = 1; i < embeddings.Count; i++)
         {
-            var dot = embedding[i - 1] * embedding[i];
-            var mag1 = MathF.Abs(embedding[i - 1]);
-            var mag2 = MathF.Abs(embedding[i]);
+            var v1 = embeddings[i - 1];
+            var v2 = embeddings[i];
+
+            if (v1.Length != v2.Length) continue;
+
+            // Compute dot product
+            var dot = 0f;
+            for (int j = 0; j < v1.Length; j++)
+            {
+                dot += v1[j] * v2[j];
+            }
+
+            // Compute magnitudes
+            var mag1 = 0f;
+            var mag2 = 0f;
+            for (int j = 0; j < v1.Length; j++)
+            {
+                mag1 += v1[j] * v1[j];
+                mag2 += v2[j] * v2[j];
+            }
+            mag1 = MathF.Sqrt(mag1);
+            mag2 = MathF.Sqrt(mag2);
 
             if (mag1 > 0 && mag2 > 0)
             {
@@ -184,7 +259,6 @@ public class TokenAnalyzer
 
 public class TokenMetrics
 {
-    public float[] Embedding { get; set; } = [];
     public float CharEntropy { get; set; }
     public float UnknownTokenRatio { get; set; }
     public float TokenBoundaryBreaks { get; set; }
