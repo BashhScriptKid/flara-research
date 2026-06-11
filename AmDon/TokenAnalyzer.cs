@@ -143,7 +143,23 @@ public class TokenAnalyzer
             }
         }
 
-        return angles.Count > 0 ? angles.Average() : 0f;
+        if (angles.Count == 0) return 0f;
+
+        // Softmax weighting: larger angles (contradictions) get more weight
+        var temperature = 0.5f; // Lower = more focus on contradictions
+        var maxAngle = angles.Max();
+        var expValues = angles.Select(a => MathF.Exp((a - maxAngle) / temperature)).ToList();
+        var sumExp = expValues.Sum();
+        var weights = expValues.Select(e => e / sumExp).ToList();
+
+        // Weighted mean
+        var weightedSum = 0f;
+        for (int i = 0; i < angles.Count; i++)
+        {
+            weightedSum += weights[i] * angles[i];
+        }
+
+        return weightedSum;
     }
 
     private float ComputeTokenRisk(TokenMetrics metrics)
