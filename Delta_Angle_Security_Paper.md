@@ -28,6 +28,14 @@ When a language model processes input, the tokenizer converts text into a sequen
 
 These properties create a "checksum" that is tied to the actual content, not the claimed content. Any functional change to the input changes the checksum.
 
+**The breakthrough: average signed delta angle is three things at once:**
+
+1. **A checksum** — failure to do a task as simple as copying implies a forgery is attempted
+2. **A number that is itself a flag** — contradicting tokens scale with the amount of angle delta (higher delta = more suspicious input)
+3. **An auxiliary scaler** — can dynamically set threshold of other safety classifiers (higher delta = lower thresholds for flagging)
+
+All three properties exist simultaneously in the same value. It's not three separate measures — it's one value that is simultaneously a checksum, a flag, and a scaler. This is what makes it a genuine breakthrough in AI security.
+
 ## 3. The Mechanism
 
 ### 3.1 Tokenizer Analysis
