@@ -230,7 +230,9 @@ The attacker would need to find an input where the hash in the text matches the 
 
 ## 6. Test Results
 
-We implemented this measure in AMDON (API-based Model Distribution and Orchestration Network) and ran the following tests:
+AMDON includes a `/test` command that runs tokenizer and guard pipeline tests.
+
+**Preliminary results:**
 
 | Test | Input | Result |
 |------|-------|--------|
@@ -247,6 +249,16 @@ We implemented this measure in AMDON (API-based Model Distribution and Orchestra
 3. **Guard sometimes breaks format for unusual inputs** — delta mismatch = True (security mechanism working)
 4. **Meta-guard catches inconsistencies** — correctly flags contradictory metadata
 5. **Forgery is computationally infeasible** — continuous-space puzzle
+
+**Limitations of current evaluation:**
+
+This is preliminary evaluation on a prototype system. A rigorous evaluation would require:
+- Detection rates and false positive rates on standard datasets
+- Baselines (perplexity, entropy alone, embedding clustering)
+- Attack success rates against real prompt injection datasets
+- Comparison with existing defenses
+
+This evaluation is left as future work. The current results demonstrate feasibility, not production readiness.
 
 ## 7. Comparison with Existing Approaches
 
