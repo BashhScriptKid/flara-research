@@ -685,7 +685,8 @@ The tokenizer computes mathematical properties of the input that are independent
 2. **Guard copy task:**
    - Guard is given the correct delta value
    - Guard must output its verdict AND repeat the delta
-   - If guard's delta differs by ±0.3 from real delta → flag regardless
+   - If guard's delta differs by ±0.01 from real delta → flag regardless
+   - Tolerance accounts for floating point error and model reinterpretation only
 
 3. **Dynamic threshold:**
    - Delta scales inversely to flagging threshold

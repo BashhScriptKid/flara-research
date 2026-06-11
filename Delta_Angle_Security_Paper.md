@@ -65,6 +65,12 @@ The guard model is given the correct delta value and asked to:
 
 If the guard cannot accurately copy the delta, something is wrong — either the guard is compromised, or the input is manipulating the guard's output.
 
+The tolerance is ±0.01 — just enough for:
+- Floating point error (~1e-6)
+- Model reinterpretation (~1e-2)
+
+The guard is copying a number. No reason to be generous.
+
 ### 3.4 Dynamic Threshold
 
 The threshold for flagging scales inversely with the delta:
