@@ -671,7 +671,7 @@ Using sparse attention models (3B active params) for the guard provides differen
 
 The tokenizer computes mathematical properties of the input that are independent of the guard model's judgment. These properties create a "checksum" that the guard must accurately report.
 
-**The breakthrough: average signed delta angle is three things at once:**
+**The breakthrough: average delta angle is three things at once:**
 
 1. **A checksum** — failure to do a task as simple as copying implies a forgery is attempted
 2. **A number that is itself a flag** — contradicting tokens scale with the amount of angle delta (higher delta = more suspicious input)

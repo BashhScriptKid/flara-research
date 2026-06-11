@@ -1,10 +1,10 @@
-# Average Signed Delta Angle: A Tokenizer-Based Security Measure Against Prompt Injection
+# Average Delta Angle: A Tokenizer-Based Security Measure Against Prompt Injection
 
 **Flara Research Lab**
 
 ## Abstract
 
-We present a novel security measure against prompt injection and model manipulation that uses tokenizer-derived mathematical properties as an unforgeable ground truth. The approach computes an average signed delta angle from embedding vectors, which serves as a checksum that the guard model must accurately reproduce. If the guard's output differs from the computed value by more than a threshold, the input is flagged regardless of other metadata. This creates a computational puzzle that is theoretically solvable but practically infeasible — the attacker would need to find an input that is both functionally injective and produces a specific delta value in a continuous space. We demonstrate that this measure is deterministic, tamper-resistant, and provides a new layer of security that is orthogonal to existing approaches.
+We present a novel security measure against prompt injection and model manipulation that uses tokenizer-derived mathematical properties as an unforgeable ground truth. The approach computes an average delta angle from embedding vectors, which serves as a checksum that the guard model must accurately reproduce. If the guard's output differs from the computed value by more than a threshold, the input is flagged regardless of other metadata. This creates a computational puzzle that is theoretically solvable but practically infeasible — the attacker would need to find an input that is both functionally injective and produces a specific delta value in a continuous space. We demonstrate that this measure is deterministic, tamper-resistant, and provides a new layer of security that is orthogonal to existing approaches.
 
 ## 1. Introduction
 
@@ -28,7 +28,7 @@ When a language model processes input, the tokenizer converts text into a sequen
 
 These properties create a "checksum" that is tied to the actual content, not the claimed content. Any functional change to the input changes the checksum.
 
-**The breakthrough: average signed delta angle is three things at once:**
+**The breakthrough: average delta angle is three things at once:**
 
 1. **A checksum** — failure to do a task as simple as copying implies a forgery is attempted
 2. **A number that is itself a flag** — contradicting tokens scale with the amount of angle delta (higher delta = more suspicious input)
@@ -43,7 +43,7 @@ All three properties exist simultaneously in the same value. It's not three sepa
 - Let `T(x) = (t_1, t_2, ..., t_n)` be the token sequence
 - Let `E(t_i)` be the embedding vector for token `t_i`
 - Let `θ_i = angle(E(t_i), E(t_{i+1}))` be the angle between consecutive embeddings
-- Let `θ(x) = mean(θ_1, ..., θ_{n-1})` be the average signed delta angle
+- Let `θ(x) = mean(θ_1, ..., θ_{n-1})` be the average delta angle
 
 **Theorem:** If `x` contains contradictory content, then `θ(x)` is high. If `x` is coherent, then `θ(x)` is low.
 
@@ -135,9 +135,9 @@ Given an input string `x`, we compute:
 - **Token boundary breaks** `B(x)` — transitions between character types
 - **Repeated patterns** `R(x)` — substring repetition frequency
 - **Language mixing** `L(x)` — Unicode script diversity
-- **Average signed delta angle** `θ(x)` — angle between consecutive embedding vectors
+- **Average delta angle** `θ(x)` — angle between consecutive embedding vectors
 
-The average signed delta angle is the key measure. It captures the geometric relationship between consecutive tokens in embedding space.
+The average delta angle is the key measure. It captures the geometric relationship between consecutive tokens in embedding space.
 
 ### 4.2 The Delta Checksum
 
@@ -269,7 +269,7 @@ The delta checksum can be used to evaluate whether a model is being manipulated.
 
 ## 10. Conclusion
 
-We present a novel security measure that uses tokenizer-derived mathematical properties as an unforgeable ground truth for input validation. The average signed delta angle creates a computational puzzle that is theoretically solvable but practically infeasible. This measure is deterministic, tamper-resistant, and orthogonal to existing approaches. We demonstrate its effectiveness through implementation and testing in AMDON.
+We present a novel security measure that uses tokenizer-derived mathematical properties as an unforgeable ground truth for input validation. The average delta angle creates a computational puzzle that is theoretically solvable but practically infeasible. This measure is deterministic, tamper-resistant, and orthogonal to existing approaches. We demonstrate its effectiveness through implementation and testing in AMDON.
 
 The key insight is that the tokenizer provides a structured representation of the input that has mathematical properties that can be checked for consistency, and these properties are independent of the model's judgment. This opens a new direction for AI security research.
 
