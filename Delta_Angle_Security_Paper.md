@@ -4,7 +4,7 @@
 
 ## Abstract
 
-We present a novel security measure against prompt injection and model manipulation that uses tokenizer-derived mathematical properties as an unforgeable ground truth. The approach computes an average delta angle from embedding vectors, which serves as a checksum that the guard model must accurately reproduce. If the guard's output differs from the computed value by more than a threshold, the input is flagged regardless of other metadata. This creates a computational puzzle that is theoretically solvable but practically infeasible — the attacker would need to find an input that is both functionally injective and produces a specific delta value in a continuous space. We demonstrate that this measure is deterministic, tamper-resistant, and provides a new layer of security that is orthogonal to existing approaches.
+We present a security measure against prompt injection that uses tokenizer-derived mathematical properties as a ground truth. The approach computes an average delta angle from embedding vectors, which serves as a checksum that the guard model must reproduce. If the guard's output differs from the computed value by more than a threshold, the input is flagged. This creates a computational puzzle that is theoretically solvable but practically infeasible — the attacker would need to find an input that is both functionally injective and produces a specific delta value in a continuous space. We demonstrate that this measure is deterministic and provide preliminary evaluation in AMDON.
 
 ## 1. Introduction
 
@@ -28,13 +28,13 @@ When a language model processes input, the tokenizer converts text into a sequen
 
 These properties create a "checksum" that is tied to the actual content, not the claimed content. Any functional change to the input changes the checksum.
 
-**The breakthrough: average delta angle is three things at once:**
+**The breakthrough: average delta angle is three properties simultaneously:**
 
 1. **A checksum** — failure to do a task as simple as copying implies a forgery is attempted
 2. **A number that is itself a flag** — contradicting tokens scale with the amount of angle delta (higher delta = more suspicious input)
 3. **An auxiliary scaler** — can dynamically set threshold of other safety classifiers (higher delta = lower thresholds for flagging)
 
-All three properties exist simultaneously in the same value. It's not three separate measures — it's one value that is simultaneously a checksum, a flag, and a scaler. This is what makes it a genuine breakthrough in AI security.
+All three properties exist simultaneously in the same value. It's not three separate measures — it's one value that is simultaneously a checksum, a flag, and a scaler. This is what makes it a breakthrough in AI security.
 
 ## 3. Mathematical Proof: Why Delta Self-Flags
 
@@ -123,7 +123,7 @@ The attacker faces a fundamental tradeoff:
 
 These are mutually exclusive properties. The attacker cannot have both.
 
-This is not a heuristic — it's a mathematical property of the embedding space. The delta self-flags because contradiction is required for injection, and contradiction produces high delta by construction.
+This is not a heuristic — it's a mathematical property of the embedding space. The delta flags itself because contradiction is required for injection, and contradiction produces high delta by construction.
 
 **Why token-coherent injections still produce high delta:**
 
@@ -292,10 +292,15 @@ The delta checksum can be used to evaluate whether a model is being manipulated.
 
 ## 9. Limitations
 
-1. **Tokenizer dependency** — the measure is only as good as the tokenizer
-2. **Embedding quality** — the delta depends on the embedding model's quality
-3. **Not a complete solution** — should be combined with other measures
-4. **Computational cost** — requires embedding computation for each input
+1. **Tokenizer dependency** — the measure is only as good as the tokenizer. Different tokenizers may produce different deltas. The security properties depend on the tokenizer's quality and consistency.
+
+2. **Embedding quality** — the delta depends on the embedding model's quality. A poor embedding model may not capture semantic contradictions effectively. The measure is tied to the specific embedding model used.
+
+3. **Computational cost** — requires embedding computation for each input. This adds latency and resource requirements. The cost is non-trivial for high-throughput systems.
+
+4. **Not a complete solution** — should be combined with other measures. The delta angle catches some attacks but not all. Defense in depth is required.
+
+5. **Informal proof** — the security argument is based on informal reasoning, not formal theorem. Edge cases and bounds are not rigorously analyzed.
 
 ## 9. Future Work
 
