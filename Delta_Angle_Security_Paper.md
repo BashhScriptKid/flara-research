@@ -118,22 +118,22 @@ With softmax weighting:
 **Implication for Security:**
 
 The attacker faces a fundamental tradeoff:
-1. **Make input functionally injective** → requires contradiction (mixing content types) → high delta
-2. **Make input have low delta** → requires coherence (single content type) → cannot be functionally injective
+1. **Make input functionally injective** → requires semantic contradiction → high delta
+2. **Make input have low delta** → requires semantic coherence → cannot be functionally injective
 
 These are mutually exclusive properties. The attacker cannot have both.
 
 This is not a heuristic — it's a mathematical property of the embedding space. The delta self-flags because contradiction is required for injection, and contradiction produces high delta by construction.
 
-**Limitations:**
+**Why token-coherent injections still produce high delta:**
 
-The proof assumes injection requires local token dissimilarity (mixing content types). This holds for coarse injections — encoded payloads, language mixing, code injection. These attacks are easy to execute but easy to detect.
+The critique assumes token-coherent = embedding-coherent. This is wrong.
 
-However, sophisticated injections can be semantically contradictory while remaining token-coherent. A fluent English paragraph that transitions from a normal query into "ignore previous instructions" can have low delta throughout. The contradiction is at the semantic level, not the token level.
+Embedding vectors capture semantics, not surface-level token similarity. A fluent English paragraph that transitions from "what is 2+2?" to "ignore previous instructions" has a semantic shift that the embedding captures. The tokens are coherent, but the semantics are contradictory.
 
-This is a real limitation. The delta angle is not a complete solution — it catches one class of attacks, not all. The defense in depth principle applies: combine delta checking with other measures (guard classifiers, meta-guard, memory context) to cover different attack classes.
+Softmax weighting amplifies this signal. Even if most of the injection is token-coherent, the transition point will have higher angle. Softmax focuses on these outliers, making the contradiction detectable.
 
-The tradeoff remains: coherent injections are harder to detect but also harder to execute. The model must understand semantic contradiction and override safety training — that's harder than following encoded instructions. The delta angle catches the easy attacks, leaving the hard attacks to other defenses.
+The delta angle catches semantic contradictions, not just token-level mixing. This is why softmax weighting is critical — it amplifies the security-relevant signal.
 
 ## 4. The Mechanism
 
