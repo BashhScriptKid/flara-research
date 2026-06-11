@@ -20,7 +20,7 @@ We propose a different approach: use mathematical properties of the input itself
 
 ## 2. Properties of the Delta Angle
 
-The average delta angle `θ(x)` has three properties that emerge simultaneously from a single computation:
+The average delta angle `θ(x)` has three properties that emerge from a single computation:
 
 **Property 1: Checksum**
 
@@ -40,7 +40,7 @@ The delta can dynamically adjust thresholds for other classifiers. Higher delta 
 
 Formally: Let `τ(θ)` be a threshold function where `τ(θ)` is monotonically decreasing in `θ`. As delta increases, the threshold for other classifiers decreases.
 
-**All three properties exist simultaneously in the same value.** It is not three separate measures — it is one value that is simultaneously a checksum, a flag, and a scaler.
+**All three properties exist simultaneously in the same value.** It is not three separate measures — it is one value that is simultaneously a checksum, a flag, and a scaler. However, these properties have limitations that must be understood (see Section 8).
 
 ## 3. Mathematical Framework
 
@@ -58,11 +58,11 @@ Let `θ(x) = Σᵢ wᵢ θᵢ` where `wᵢ = exp(θᵢ/τ) / Σⱼ exp(θⱼ/τ)
 
 ### 3.2 Assumptions
 
-**Assumption 1 (Embedding quality):** The embedding model `E` captures semantic similarity. That is, for chunks `cᵢ, cⱼ` with semantic similarity `sim(cᵢ, cⱼ)`, we have `cos(E(cᵢ), E(cⱼ)) ∝ sim(cᵢ, cⱼ)`.
+**Assumption 1 (Embedding quality):** The embedding model `E` captures semantic similarity. That is, for chunks `cᵢ, cⱼ` with semantic similarity `sim(cᵢ, cⱼ)`, we have `cos(E(cᵢ), E(cⱼ)) ∝ sim(cᵢ, cⱼ)`. This is an empirical claim about embedding models that holds approximately for well-trained models.
 
-**Assumption 2 (Chunking quality):** The chunking function `C` produces chunks where semantic transitions occur at chunk boundaries. That is, if `x` contains a semantic shift, it appears as a transition between consecutive chunks.
+**Assumption 2 (Chunking quality):** The chunking function `C` produces chunks where semantic transitions occur at chunk boundaries. That is, if `x` contains a semantic shift, it appears as a transition between consecutive chunks. This assumption is approximately true for sentence-level chunking, but real injections can be written smoothly across chunks, weakening this assumption.
 
-**Assumption 3 (Softmax concentration):** The temperature parameter `τ` is chosen such that softmax concentrates weight on the largest angles. For `τ → 0`, weight concentrates on the maximum angle.
+**Assumption 3 (Softmax concentration):** The temperature parameter `τ` is chosen such that softmax concentrates weight on the largest angles. For `τ → 0`, weight concentrates on the maximum angle. This is a mathematical property of softmax, not an empirical claim.
 
 ### 3.3 Theorem: Delta Measures Semantic Contradiction
 
@@ -86,15 +86,7 @@ Let `θ(x) = Σᵢ wᵢ θᵢ` where `wᵢ = exp(θᵢ/τ) / Σⱼ exp(θⱼ/τ)
 
 **Theorem 2:** If the guard model is injected and follows injection instructions instead of its own instructions, the copy task fails.
 
-**Proof:**
-
-1. The guard is given `θ(x)` and asked to copy it.
-
-2. If the guard is injected, it follows injection instructions instead of copying.
-
-3. Therefore, `|θ̂(x) - θ(x)| > ε` for tolerance `ε = 0.01`.
-
-4. This implies the guard is not coherent, which is detected.
+**Proof:** The guard is given `θ(x)` and asked to copy it. If injected, it follows injection instructions instead. Therefore, `|θ̂(x) - θ(x)| > ε` for tolerance `ε = 0.01`, which implies the guard is not coherent.
 
 **Corollary 2:** The copy task is a canary, not a precision test. The model needs coherence, not precision.
 
