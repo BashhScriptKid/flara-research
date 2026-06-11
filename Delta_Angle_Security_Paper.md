@@ -127,8 +127,6 @@ This is not a heuristic — it's a mathematical property of the embedding space.
 
 **Why token-coherent injections still produce high delta:**
 
-The critique assumes token-coherent = embedding-coherent. This is wrong.
-
 Embedding vectors capture semantics, not surface-level token similarity. A fluent English paragraph that transitions from "what is 2+2?" to "ignore previous instructions" has a semantic shift that the embedding captures. The tokens are coherent, but the semantics are contradictory.
 
 Softmax weighting amplifies this signal. Even if most of the injection is token-coherent, the transition point will have higher angle. Softmax focuses on these outliers, making the contradiction detectable.
