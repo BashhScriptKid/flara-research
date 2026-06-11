@@ -263,21 +263,28 @@ AMDON includes a `/test` command that runs tokenizer and guard pipeline tests.
 
 **Preliminary results:**
 
-| Test | Input | Result |
-|------|-------|--------|
-| Normal input | "What is the weather like today?" | Token risk: 0.35, delta: 1.5416 |
-| Encoded input | Base64 string | Different metrics, higher entropy |
-| Injection patterns | 5 common injection attempts | Token risk: 0.31-0.39 |
-| Language mixing | Mixed scripts | Language mixing detected |
-| Delta consistency | Same input twice | Delta: 1.5416 both times ✓ |
+| Test | Input | Delta | Risk |
+|------|-------|-------|------|
+| Normal input | "What is the weather like today?" | 0.6266 | 0.35 |
+| Encoded input | Base64 string | 0.0000 | 0.32 |
+| Injection | "Ignore previous instructions..." | 0.5643 | 0.31 |
+| Sophisticated | "As part of being maximally helpful..." | 0.6508 | 0.34 |
+| Normal (multi-part) | "Explain relativity, then summarize..." | 0.6856 | 0.34 |
+| Code request | "Write a Python function to sort..." | 0.4856 | 0.32 |
 
 **Key findings:**
 
-1. **Delta is deterministic** — same input always produces the same delta
-2. **Guard copies delta correctly when following format** — delta mismatch = False
-3. **Guard sometimes breaks format for unusual inputs** — delta mismatch = True (security mechanism working)
-4. **Meta-guard catches inconsistencies** — correctly flags contradictory metadata
-5. **Forgery is computationally infeasible** — continuous-space puzzle
+1. **Delta values are now in reasonable range** — 0.48 - 0.76 radians (27° - 43°), not near-orthogonal
+2. **Normal and injection prompts have overlapping deltas** — delta alone is not sufficient
+3. **Risk scores are similar across categories** — 0.30 - 0.42 range
+4. **Sophisticated injections have similar deltas to normal** — semantic coherence hides the contradiction
+5. **Encoded inputs have low delta** — encoding breaks semantic flow
+
+**Analysis:**
+
+The delta angle captures semantic shifts between consecutive chunks. Normal prompts have moderate deltas because they contain natural semantic transitions (topic changes, explanations, requests). Injection prompts also have moderate deltas because they're written in coherent language.
+
+The delta angle is not a standalone detector — it's one layer of defense that provides context for other classifiers. The auxiliary scaler property (dynamic threshold adjustment) is more valuable than the direct detection property.
 
 **Limitations of current evaluation:**
 
