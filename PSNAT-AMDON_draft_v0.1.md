@@ -805,7 +805,7 @@ AMDON includes a `/test` command that runs tokenizer and guard pipeline tests.
 - `TokenBoundaryBreaks` — transitions between character types (letter→digit→space→symbol)
 - `RepeatedPatterns` — substring repetition frequency
 - `LanguageMixing` — Unicode script diversity
-- `AverageAngleDelta` — embedding vector angle consistency
+- `AverageAngleDelta` — softmax-weighted mean of embedding vector angles (τ=0.5)
 - `TokenRisk` — composite score (weighted sum of above)
 
 `GuardPipeline.cs` updated with:

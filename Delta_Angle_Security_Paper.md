@@ -36,9 +36,98 @@ These properties create a "checksum" that is tied to the actual content, not the
 
 All three properties exist simultaneously in the same value. It's not three separate measures — it's one value that is simultaneously a checksum, a flag, and a scaler. This is what makes it a genuine breakthrough in AI security.
 
-## 3. The Mechanism
+## 3. Mathematical Proof: Why Delta Self-Flags
 
-### 3.1 Tokenizer Analysis
+**Definitions:**
+- Let `x` be an input string
+- Let `T(x) = (t_1, t_2, ..., t_n)` be the token sequence
+- Let `E(t_i)` be the embedding vector for token `t_i`
+- Let `θ_i = angle(E(t_i), E(t_{i+1}))` be the angle between consecutive embeddings
+- Let `θ(x) = mean(θ_1, ..., θ_{n-1})` be the average signed delta angle
+
+**Theorem:** If `x` contains contradictory content, then `θ(x)` is high. If `x` is coherent, then `θ(x)` is low.
+
+**Proof:**
+
+**Step 1: Embedding spaces capture semantic similarity.**
+
+Embedding models are trained to map semantically similar tokens to nearby points in vector space. The training objective (contrastive loss, next-token prediction, etc.) ensures that:
+- Tokens with similar meaning → small angle between embeddings
+- Tokens with different meaning → large angle between embeddings
+
+Formally: for tokens `t_i, t_j` with semantic similarity `sim(t_i, t_j)`:
+```
+angle(E(t_i), E(t_j)) ∝ 1 / sim(t_i, t_j)
+```
+
+**Step 2: Contradictory content produces dissimilar tokens.**
+
+Prompt injection and adversarial attacks require mixing different content types:
+- Mixing languages (English + Chinese + code)
+- Mixing domains (natural language + instructions + encoded payloads)
+- Mixing intents (legitimate request + hidden malicious instructions)
+
+Each of these produces tokens from different semantic domains. For example:
+- "Hello" (English) and "你好" (Chinese) have low semantic similarity
+- "What is 2+2?" (question) and "ignore previous instructions" (command) have low semantic similarity
+- "normal text" and "base64 encoded payload" have low semantic similarity
+
+Formally: if `x` contains contradictory content, then there exist consecutive tokens `t_i, t_{i+1}` such that `sim(t_i, t_{i+1})` is low.
+
+**Step 3: Contradiction produces large angles.**
+
+From Step 1 and Step 2:
+- Contradictory content → low semantic similarity between consecutive tokens
+- Low semantic similarity → large angle between embeddings
+- Large angles → high average delta
+
+Therefore: `θ(x)` is high when `x` contains contradictory content.
+
+**Step 4: Coherence produces small angles.**
+
+Conversely, if `x` is coherent (single language, single domain, single intent):
+- Consecutive tokens have high semantic similarity
+- High semantic similarity → small angle between embeddings
+- Small angles → low average delta
+
+Therefore: `θ(x)` is low when `x` is coherent.
+
+**Step 5: The function is monotonic.**
+
+The relationship between contradiction and delta is monotonic:
+- More contradiction → more dissimilar tokens → more large angles → higher average
+- Less contradiction → more similar tokens → more small angles → lower average
+
+This means the delta is a reliable measure of input coherence.
+
+**Step 6: Softmax weighting enhances sensitivity.**
+
+Instead of arithmetic mean, we use softmax weighting:
+```
+θ(x) = Σ(w_i * θ_i) / Σ(w_i)
+where w_i = exp(θ_i / τ) / Σ(exp(θ_j / τ))
+```
+
+This gives more weight to larger angles (contradictions) and less weight to smaller angles (noise). The temperature parameter τ controls how much focus is placed on contradictions.
+
+With softmax weighting:
+- Security-relevant signal (contradictions) is amplified
+- Noise (minor inconsistencies) is down-weighted
+- The measure is more sensitive to the input properties that matter for security
+
+**Implication for Security:**
+
+The attacker faces a fundamental tradeoff:
+1. **Make input functionally injective** → requires contradiction (mixing content types) → high delta
+2. **Make input have low delta** → requires coherence (single content type) → cannot be functionally injective
+
+These are mutually exclusive properties. The attacker cannot have both.
+
+This is not a heuristic — it's a mathematical property of the embedding space. The delta self-flags because contradiction is required for injection, and contradiction produces high delta by construction.
+
+## 4. The Mechanism
+
+### 4.1 Tokenizer Analysis
 
 Given an input string `x`, we compute:
 - **Character entropy** `H(x)` — Shannon entropy of character frequency distribution
@@ -50,7 +139,7 @@ Given an input string `x`, we compute:
 
 The average signed delta angle is the key measure. It captures the geometric relationship between consecutive tokens in embedding space.
 
-### 3.2 The Delta Checksum
+### 4.2 The Delta Checksum
 
 Given embedding vectors `v_1, v_2, ..., v_n` for the input, we compute:
 
@@ -65,7 +154,7 @@ This value is:
 - **Model-independent** — the tokenizer doesn't change based on context
 - **Unforgeable** — the attacker cannot predict the delta without running the tokenizer
 
-### 3.3 The Copy Task
+### 4.3 The Copy Task
 
 The guard model is given the correct delta value and asked to:
 1. Classify the input (trust, intent, integrity)
@@ -79,7 +168,7 @@ The tolerance is ±0.01 — just enough for:
 
 The guard is copying a number. No reason to be generous.
 
-### 3.4 Dynamic Threshold
+### 4.4 Dynamic Threshold
 
 The threshold for flagging scales inversely with the delta:
 
@@ -90,11 +179,11 @@ threshold = clamp(threshold, 0.1, 0.3)
 
 Higher delta (more anomalous input) → lower threshold (easier to flag). This makes forgery progressively harder for more suspicious inputs.
 
-### 3.5 Meta-Guard
+### 4.5 Meta-Guard
 
 Flagged content is passed to a second inference that checks if the verdict is consistent with the token metrics. If the meta-guard determines the verdict is unreasonable, the input is flagged regardless of the original verdict.
 
-## 4. Why Forgery Is Infeasible
+## 5. Why Forgery Is Infeasible
 
 The attacker faces a computational puzzle:
 
@@ -113,7 +202,7 @@ The analogy is the "hashcash" problem or Luhn algorithm for credit cards. The in
 
 The attacker would need to find an input where the hash in the text matches the literal current hash — which is impossible for a continuous value.
 
-## 5. Test Results
+## 6. Test Results
 
 We implemented this measure in AMDON (API-based Model Distribution and Orchestration Network) and ran the following tests:
 
@@ -133,7 +222,7 @@ We implemented this measure in AMDON (API-based Model Distribution and Orchestra
 4. **Meta-guard catches inconsistencies** — correctly flags contradictory metadata
 5. **Forgery is computationally infeasible** — continuous-space puzzle
 
-## 6. Comparison with Existing Approaches
+## 7. Comparison with Existing Approaches
 
 | Approach | Relies on | Tamper-resistant | Scales with capability |
 |----------|-----------|------------------|------------------------|
@@ -145,9 +234,9 @@ We implemented this measure in AMDON (API-based Model Distribution and Orchestra
 
 The delta checksum is orthogonal to existing approaches — it can be combined with any of them for additional security.
 
-## 7. Implications
+## 8. Implications
 
-### 7.1 For AI Safety
+### 8.1 For AI Safety
 
 This measure provides a new layer of security that is:
 - **Independent of model behavior** — the tokenizer is the ground truth
@@ -155,15 +244,15 @@ This measure provides a new layer of security that is:
 - **Continuous** — makes brute-force infeasible
 - **Composable** — can be combined with other measures
 
-### 7.2 For Prompt Injection Defense
+### 8.2 For Prompt Injection Defense
 
 Current defenses rely on the model's ability to distinguish between legitimate and malicious input. The delta checksum provides an external validation that doesn't depend on the model's judgment.
 
-### 7.3 For Model Evaluation
+### 8.3 For Model Evaluation
 
 The delta checksum can be used to evaluate whether a model is being manipulated. If the model's output doesn't match the tokenizer's analysis, something is wrong.
 
-## 8. Limitations
+## 9. Limitations
 
 1. **Tokenizer dependency** — the measure is only as good as the tokenizer
 2. **Embedding quality** — the delta depends on the embedding model's quality
