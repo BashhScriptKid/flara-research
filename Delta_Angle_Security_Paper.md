@@ -125,6 +125,16 @@ These are mutually exclusive properties. The attacker cannot have both.
 
 This is not a heuristic — it's a mathematical property of the embedding space. The delta self-flags because contradiction is required for injection, and contradiction produces high delta by construction.
 
+**Limitations:**
+
+The proof assumes injection requires local token dissimilarity (mixing content types). This holds for coarse injections — encoded payloads, language mixing, code injection. These attacks are easy to execute but easy to detect.
+
+However, sophisticated injections can be semantically contradictory while remaining token-coherent. A fluent English paragraph that transitions from a normal query into "ignore previous instructions" can have low delta throughout. The contradiction is at the semantic level, not the token level.
+
+This is a real limitation. The delta angle is not a complete solution — it catches one class of attacks, not all. The defense in depth principle applies: combine delta checking with other measures (guard classifiers, meta-guard, memory context) to cover different attack classes.
+
+The tradeoff remains: coherent injections are harder to detect but also harder to execute. The model must understand semantic contradiction and override safety training — that's harder than following encoded instructions. The delta angle catches the easy attacks, leaving the hard attacks to other defenses.
+
 ## 4. The Mechanism
 
 ### 4.1 Tokenizer Analysis
