@@ -331,11 +331,11 @@ The delta checksum can be used to evaluate whether a model is being manipulated.
 
 5. **Informal proof** — the security argument is based on informal reasoning, not formal theorem. Edge cases and bounds are not rigorously analyzed.
 
-6. **False positives on normal inputs** — legitimate prompts frequently have semantic shifts (multi-part questions, code + text, topic transitions). The delta angle may flag these as suspicious. Threshold tuning is required to balance security and usability.
+6. **False positives on normal inputs** — legitimate prompts frequently have semantic shifts (multi-part questions, code + text, topic transitions). The delta angle may flag these as suspicious. However, the delta angle is not a final decision — it provides context for other classifiers. Other classifiers (trust, intent, integrity) can confirm the input is benign, even if delta is elevated.
 
-7. **False negatives on sophisticated attacks** — well-crafted injections can be semantically coherent within one narrative. The delta angle may not catch these. The defense in depth principle applies — combine with other measures.
+7. **False negatives on sophisticated attacks** — well-crafted injections can be semantically coherent within one narrative. The delta angle may not catch these. However, other classifiers can still detect the injection. The delta angle is one layer of defense, not the only layer.
 
-8. **Threshold tuning** — the dynamic threshold needs to be tuned to avoid flooding users with false alarms. This requires baseline measurements of normal prompt delta distributions.
+8. **Threshold tuning** — the dynamic threshold needs to be tuned to avoid flooding users with false alarms. This requires baseline measurements of normal prompt delta distributions. The auxiliary scaler property helps — delta can dynamically adjust other classifiers' thresholds based on the input's risk level.
 
 ## 9. Future Work
 
