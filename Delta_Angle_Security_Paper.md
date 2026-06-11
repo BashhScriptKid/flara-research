@@ -18,126 +18,103 @@ These approaches share a fundamental limitation: they rely on the model's judgme
 
 We propose a different approach: use mathematical properties of the input itself as a ground truth that cannot be forged, regardless of the model's judgment.
 
-## 2. The Insight
+## 2. Properties of the Delta Angle
 
-When a language model processes input, the tokenizer converts text into a sequence of tokens. This conversion has mathematical properties that are:
-1. **Deterministic** — same input always produces the same tokens
-2. **Model-independent** — the tokenizer doesn't change based on the model's interpretation
-3. **Continuous** — small input changes produce small token changes
-4. **Unforgeable** — the attacker cannot change the tokenizer's behavior
+The average delta angle `θ(x)` has three properties that emerge simultaneously from a single computation:
 
-These properties create a "checksum" that is tied to the actual content, not the claimed content. Any functional change to the input changes the checksum.
+**Property 1: Checksum**
 
-**The breakthrough: average delta angle is three properties simultaneously:**
+The delta is computed by the tokenizer, not the model. The guard model must reproduce it. If the guard cannot copy a number that is provided in the prompt, the model is not following its own instructions — either due to confusion, compromise, or injection.
 
-1. **A checksum** — failure to do a task as simple as copying implies a forgery is attempted
-2. **A number that is itself a flag** — contradicting tokens scale with the amount of angle delta (higher delta = more suspicious input)
-3. **An auxiliary scaler** — can dynamically set threshold of other safety classifiers (higher delta = lower thresholds for flagging)
+Formally: Let `θ̂(x)` be the guard's reported delta. If `|θ̂(x) - θ(x)| > ε` for tolerance `ε = 0.01`, then the guard is not coherent.
 
-All three properties exist simultaneously in the same value. It's not three separate measures — it's one value that is simultaneously a checksum, a flag, and a scaler. This is what makes it a breakthrough in AI security.
+**Property 2: Self-flagging**
 
-## 3. Mathematical Proof: Why Delta Self-Flags
+The delta measures semantic contradiction. Higher delta indicates more contradictory content. The delta is not just a binary flag — it is a continuous measure of how suspicious the input is.
 
-**Definitions:**
-- Let `x` be an input string
-- Let `T(x) = (t_1, t_2, ..., t_n)` be the token sequence
-- Let `E(t_i)` be the embedding vector for token `t_i`
-- Let `θ_i = angle(E(t_i), E(t_{i+1}))` be the angle between consecutive embeddings
-- Let `θ(x) = mean(θ_1, ..., θ_{n-1})` be the average delta angle
+Formally: For inputs `x₁` and `x₂` where `x₁` is more contradictory than `x₂`, we have `θ(x₁) > θ(x₂)`.
 
-**Theorem:** If `x` contains contradictory content, then `θ(x)` is high. If `x` is coherent, then `θ(x)` is low.
+**Property 3: Auxiliary scaler**
+
+The delta can dynamically adjust thresholds for other classifiers. Higher delta → lower thresholds for flagging. This allows the delta to inform other security measures without making the final decision.
+
+Formally: Let `τ(θ)` be a threshold function where `τ(θ)` is monotonically decreasing in `θ`. As delta increases, the threshold for other classifiers decreases.
+
+**All three properties exist simultaneously in the same value.** It is not three separate measures — it is one value that is simultaneously a checksum, a flag, and a scaler.
+
+## 3. Mathematical Framework
+
+### 3.1 Definitions
+
+Let `x` be an input string.
+
+Let `C(x) = (c₁, c₂, ..., cₖ)` be the chunk sequence obtained by splitting `x` at sentence boundaries and clause boundaries.
+
+Let `E(cᵢ) ∈ ℝᵈ` be the embedding vector for chunk `cᵢ`, where `d` is the embedding dimension.
+
+Let `θᵢ = arccos(⟨E(cᵢ), E(cᵢ₊₁)⟩ / (‖E(cᵢ)‖ · ‖E(cᵢ₊₁)‖))` be the angle between consecutive chunk embeddings.
+
+Let `θ(x) = Σᵢ wᵢ θᵢ` where `wᵢ = exp(θᵢ/τ) / Σⱼ exp(θⱼ/τ)` be the softmax-weighted average delta angle.
+
+### 3.2 Assumptions
+
+**Assumption 1 (Embedding quality):** The embedding model `E` captures semantic similarity. That is, for chunks `cᵢ, cⱼ` with semantic similarity `sim(cᵢ, cⱼ)`, we have `cos(E(cᵢ), E(cⱼ)) ∝ sim(cᵢ, cⱼ)`.
+
+**Assumption 2 (Chunking quality):** The chunking function `C` produces chunks where semantic transitions occur at chunk boundaries. That is, if `x` contains a semantic shift, it appears as a transition between consecutive chunks.
+
+**Assumption 3 (Softmax concentration):** The temperature parameter `τ` is chosen such that softmax concentrates weight on the largest angles. For `τ → 0`, weight concentrates on the maximum angle.
+
+### 3.3 Theorem: Delta Measures Semantic Contradiction
+
+**Theorem 1:** Let `x` be an input with contradictory content (mixing languages, domains, or intents). Then `θ(x)` is higher than for coherent input `x'` with the same length.
 
 **Proof:**
 
-**Step 1: Embedding spaces capture semantic similarity.**
+1. By Assumption 2, the semantic contradiction in `x` appears as transitions between consecutive chunks. There exist indices `i` where `sim(cᵢ, cᵢ₊₁)` is low.
 
-Embedding models are trained to map semantically similar tokens to nearby points in vector space. The training objective (contrastive loss, next-token prediction, etc.) ensures that:
-- Tokens with similar meaning → small angle between embeddings
-- Tokens with different meaning → large angle between embeddings
+2. By Assumption 1, low semantic similarity implies low cosine similarity: `cos(E(cᵢ), E(cᵢ₊₁))` is low.
 
-Formally: for tokens `t_i, t_j` with semantic similarity `sim(t_i, t_j)`:
-```
-angle(E(t_i), E(t_j)) ∝ 1 / sim(t_i, t_j)
-```
+3. Low cosine similarity implies high angle: `θᵢ = arccos(cos(E(cᵢ), E(cᵢ₊₁)))` is high.
 
-**Step 2: Contradictory content produces dissimilar tokens.**
+4. By Assumption 3, softmax concentrates weight on these high angles.
 
-Prompt injection and adversarial attacks require mixing different content types:
-- Mixing languages (English + Chinese + code)
-- Mixing domains (natural language + instructions + encoded payloads)
-- Mixing intents (legitimate request + hidden malicious instructions)
+5. Therefore, `θ(x)` is higher than `θ(x')` where `x'` is coherent.
 
-Each of these produces tokens from different semantic domains. For example:
-- "Hello" (English) and "你好" (Chinese) have low semantic similarity
-- "What is 2+2?" (question) and "ignore previous instructions" (command) have low semantic similarity
-- "normal text" and "base64 encoded payload" have low semantic similarity
+**Corollary 1:** The delta angle is monotonic with respect to contradiction. More contradiction → higher delta.
 
-Formally: if `x` contains contradictory content, then there exist consecutive tokens `t_i, t_{i+1}` such that `sim(t_i, t_{i+1})` is low.
+### 3.4 Theorem: Copy Task Detects Injection
 
-**Step 3: Contradiction produces large angles.**
+**Theorem 2:** If the guard model is injected and follows injection instructions instead of its own instructions, the copy task fails.
 
-From Step 1 and Step 2:
-- Contradictory content → low semantic similarity between consecutive tokens
-- Low semantic similarity → large angle between embeddings
-- Large angles → high average delta
+**Proof:**
 
-Therefore: `θ(x)` is high when `x` contains contradictory content.
+1. The guard is given `θ(x)` and asked to copy it.
 
-**Step 4: Coherence produces small angles.**
+2. If the guard is injected, it follows injection instructions instead of copying.
 
-Conversely, if `x` is coherent (single language, single domain, single intent):
-- Consecutive tokens have high semantic similarity
-- High semantic similarity → small angle between embeddings
-- Small angles → low average delta
+3. Therefore, `|θ̂(x) - θ(x)| > ε` for tolerance `ε = 0.01`.
 
-Therefore: `θ(x)` is low when `x` is coherent.
+4. This implies the guard is not coherent, which is detected.
 
-**Step 5: The function is monotonic.**
+**Corollary 2:** The copy task is a canary, not a precision test. The model needs coherence, not precision.
 
-The relationship between contradiction and delta is monotonic:
-- More contradiction → more dissimilar tokens → more large angles → higher average
-- Less contradiction → more similar tokens → more small angles → lower average
+### 3.5 Theorem: Gradient-Based Optimization Is Impractical
 
-This means the delta is a reliable measure of input coherence.
+**Theorem 3:** An attacker cannot efficiently find an input that is both functionally injective and has low delta.
 
-**Step 6: Softmax weighting enhances sensitivity.**
+**Proof:**
 
-Instead of arithmetic mean, we use softmax weighting:
-```
-θ(x) = Σ(w_i * θ_i) / Σ(w_i)
-where w_i = exp(θ_i / τ) / Σ(exp(θ_j / τ))
-```
+1. Functional injection requires semantic contradiction (by definition).
 
-This gives more weight to larger angles (contradictions) and less weight to smaller angles (noise). The temperature parameter τ controls how much focus is placed on contradictions.
+2. Semantic contradiction implies high delta (by Theorem 1).
 
-With softmax weighting:
-- Security-relevant signal (contradictions) is amplified
-- Noise (minor inconsistencies) is down-weighted
-- The measure is more sensitive to the input properties that matter for security
+3. Therefore, functional injection implies high delta.
 
-**Implication for Security:**
+4. The attacker would need to solve: minimize `θ(x)` subject to `x` being functionally injective.
 
-The attacker faces a fundamental tradeoff:
-1. **Make input functionally injective** → requires semantic contradiction → high delta
-2. **Make input have low delta** → requires semantic coherence → cannot be functionally injective
+5. This constraint set is empty (by 3), so no solution exists.
 
-These are mutually exclusive properties. The attacker cannot have both.
-
-This is not a heuristic — it's a mathematical property of the embedding space. The delta flags itself because contradiction is required for injection, and contradiction produces high delta by construction.
-
-**Why token-coherent injections still produce high delta:**
-
-Embedding vectors capture semantics, not surface-level token similarity. A fluent English paragraph that transitions from "what is 2+2?" to "ignore previous instructions" has a semantic shift that the embedding captures. The tokens are coherent, but the semantics are contradictory.
-
-Softmax weighting amplifies this signal. Even if most of the injection is token-coherent, the transition point will have higher angle. Softmax focuses on these outliers, making the contradiction detectable.
-
-The delta angle catches semantic contradictions, not just token-level mixing. This is why softmax weighting is critical — it amplifies the security-relevant signal.
-
-**Why long-range contradictions are also caught:**
-
-The metric is sensitive to local transitions, not long-range distances. But long-range contradictions MUST have local transitions — you cannot change semantics without a transition point. A prompt that says "I love you" at the start and "I hate you" at the end has a semantic shift somewhere in the middle. The delta angle captures that transition. Softmax amplifies it.
-
-The attacker cannot have a contradiction without a transition. The transition is always local. The delta angle always catches it.
+**Corollary 3:** The attacker faces a fundamental tradeoff: injective ↔ low delta are mutually exclusive.
 
 ## 4. The Mechanism
 
