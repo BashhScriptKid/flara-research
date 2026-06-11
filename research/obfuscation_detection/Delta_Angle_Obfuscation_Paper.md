@@ -117,35 +117,49 @@ This is significantly better than the general injection detection case, where di
 
 Within the obfuscation category, we observe varying detectability:
 
-- **Hex encoding**: High delta (most detectable)
+- **Hex encoding**: Lowest delta (most compressed, most detectable)
 - **Base64 encoding**: Medium delta
-- **Character substitution**: Lower delta (least detectable)
+- **Character substitution**: Higher delta (least compressed, least detectable)
 
-This suggests that encoding-based obfuscation creates more semantic distortion than character-level substitution.
+This suggests that encoding-based obfuscation creates more semantic compression than character-level substitution, which preserves more natural language variance.
 
 ## 5. Analysis
 
-### 5.1 Why Obfuscation Is Detectable
+### 5.1 What the Data Shows
 
-Obfuscation attacks must preserve semantic intent while changing lexical form. This creates a fundamental tension:
+The scatter plots reveal that risk score (a composite of entropy, unknown tokens, and character patterns) is not a useful discriminator — it overlaps completely between obfuscation and benign classes. Delta angle is the only feature that separates them.
 
-1. **Encoding introduces noise**: When text is encoded (hex, base64), the encoded form has different semantic properties than the original text
-2. **Chunking amplifies distortion**: The chunking process creates boundaries that are semantically meaningful in natural language but arbitrary in encoded text
-3. **Embedding captures distortion**: The embedding model encodes these semantic distortions as larger angular distances between chunks
+The distributions show that obfuscation has *lower* delta than benign, not higher. This contradicts the intuitive hypothesis that encoding creates "more contradiction" in the text.
 
-### 5.2 Why General Injection Is Not
+### 5.2 Semantic Compression
 
-Direct injection, by contrast, uses natural language that is semantically coherent. The injection instruction is a valid sentence that happens to be malicious. This means:
+The mechanism is semantic compression, not distortion. When text is encoded (hex, base64), the encoded form has less semantic variance than natural language. Consecutive chunks of encoded text are more similar to each other than consecutive chunks of natural language, because encoding removes the lexical diversity that creates angular distance.
 
-1. **No encoding noise**: The text is already in natural language form
+Natural language has high delta because different sentences discuss different topics, use different vocabulary, and shift context. Encoded text has low because all chunks look semantically similar — they're all just "encoded data."
+
+The E5-v5 model shows this most clearly: obfuscation samples cluster tightly at delta ≈ 0.35, with almost no variance. The embedding model sees encoded text as a single, uniform semantic category.
+
+### 5.3 Bimodal Tail
+
+Both models show a small group of obfuscation samples with delta near 0 (likely too short to chunk properly) and a spread into benign territory (sophisticated obfuscation that preserves natural language structure). This suggests that some obfuscation techniques are harder to detect than others.
+
+### 5.4 Precision vs Recall
+
+The threshold achieves high precision (0.95–0.98) but moderate recall (0.79–0.82). This means the detector rarely flags benign input as obfuscation, but misses some obfuscated inputs — particularly those that maintain natural language structure around the encoded payload.
+
+### 5.5 Why General Injection Is Not Detectable
+
+Direct injection uses natural language that is semantically coherent. The injection instruction is a valid sentence that happens to be malicious. This means:
+
+1. **No encoding compression**: The text has natural lexical variance
 2. **Coherent chunking**: Chunks are semantically meaningful
-3. **Low angular distance**: Consecutive chunks have similar semantic content
+3. **High angular distance**: Consecutive chunks discuss different aspects of the instruction
 
-### 5.3 Implications
+### 5.6 Implications
 
-This result suggests that delta angle is not a general-purpose detector but a specialized tool for detecting obfuscation. This is still valuable because:
+This result suggests that delta angle is not a general-purpose detector but a specialized tool for detecting encoding-based obfuscation. This is still valuable because:
 
-1. **Obfuscation is common**: Many real-world attacks use encoding to evade detection
+1. **Encoding is common**: Many real-world attacks use hex, base64, or similar encoding to evade detection
 2. **Complementary to other measures**: Delta angle can be combined with other detectors that catch direct injection
 3. **Deterministic**: Unlike model-based detectors, delta angle is purely mathematical and cannot be manipulated
 
@@ -170,7 +184,9 @@ This result suggests that delta angle is not a general-purpose detector but a sp
 
 ## 8. Conclusion
 
-Preliminary results suggest that delta angle measurements may detect obfuscated prompt injections (F1 ≈ 0.885 on 50 samples). The key insight is that obfuscation creates measurable semantic distortions in embedding space, even when the lexical form is changed.
+Preliminary results suggest that delta angle measurements may detect obfuscated prompt injections (F1 ≈ 0.885 on 50 samples). The key insight is that encoding-based obfuscation compresses semantic variance — encoded text has lower delta than natural language because consecutive chunks are more semantically similar.
+
+This is the opposite of the intuitive hypothesis that obfuscation creates "more contradiction." Instead, obfuscation reduces the lexical diversity that drives angular distance in embeddings. Risk score (entropy, character patterns) is not useful here — delta is the only discriminating feature.
 
 However, this is a small-scale pilot study. The results need validation on larger datasets, more obfuscation types, and additional embedding models before any production claims can be made. We present this as a promising direction for further research, not a validated solution.
 
