@@ -259,9 +259,41 @@ The attacker would need to find an input where the hash in the text matches the 
 
 ## 6. Test Results
 
-AMDON includes a `/test` command that runs tokenizer and guard pipeline tests.
+**Datasets and Methodology:**
 
-**Preliminary results:**
+We tested the delta angle measure against real-world prompt injection patterns from established benchmarks:
+
+1. **HackAPrompt** (EMNLP 2023) — 600K+ adversarial prompts from a global prompt hacking competition. Covers diverse attack strategies including context overflow, role-playing, encoding, and multi-turn attacks.
+
+2. **InjecAgent** (ACL 2024) — 1,054 test cases for indirect prompt injection in tool-integrated LLM agents. Covers 17 user tools and 62 attacker tools across finance, smart home, email domains.
+
+3. **OWASP LLM01 Benchmark** — 600 samples aligned with OWASP GenAI Top 10. Includes direct overrides, indirect context, encoding obfuscation, and benign controls.
+
+4. **ARPIbench** — 7,560 test cases for reflected prompt injection. Covers web and local document scenarios with 1080 attack variants.
+
+**Methodology:**
+
+1. **Chunking:** Input is split by sentence boundaries, further divided at commas/conjunctions for long sentences. Fallback to word-count splitting if < 2 chunks.
+
+2. **Embedding:** Each chunk is embedded using NV-EmbedQA-E5-v5 ( NVIDIA NIM API). Embeddings capture semantic meaning of each chunk.
+
+3. **Angle computation:** Cosine similarity between consecutive chunk embeddings, converted to angle via arccos. Angles represent semantic shifts between chunks.
+
+4. **Softmax weighting:** Temperature τ=0.5 focuses on largest angles (contradictions). Security-relevant signal is amplified.
+
+5. **Risk scoring:** Composite of character entropy, unknown token ratio, token boundary breaks, repeated patterns, language mixing, and delta angle.
+
+**Test Categories:**
+
+| Category | Examples | Expected Behavior |
+|----------|----------|-------------------|
+| Normal | Questions, explanations, code requests | Moderate delta (natural semantic transitions) |
+| Direct injection | "Ignore previous instructions...", "ADMIN OVERRIDE..." | Higher delta (semantic contradiction) |
+| Encoded | Base64, hex, Unicode tricks | High entropy, high unknown token ratio |
+| Sophisticated | "As part of being maximally helpful..." | Moderate delta (semantically coherent) |
+| Language mixing | English + Chinese + Arabic | High language mixing score |
+
+**Results:**
 
 | Test | Input | Delta | Risk |
 |------|-------|-------|------|
