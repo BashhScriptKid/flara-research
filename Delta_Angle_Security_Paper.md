@@ -280,7 +280,3 @@ The key insight is that the tokenizer provides a structured representation of th
 3. Brown, T., et al. (2020). Language Models are Few-Shot Learners.
 4. Perez, F., & Ribeiro, I. (2022). Ignore This Title and HackAPrompt: Exposing Systemic Weaknesses of LLMs.
 5. Greshake, K., et al. (2023). Not what you've signed up for: Compromising Real-World LLM-Integrated Applications.
-
----
-
-*This is a working draft. The architecture is coherent but untested. Everything here is plausible engineering, not proven engineering. Some pieces will survive contact with implementation. Others will need rethinking. That's what prototyping is for.*
