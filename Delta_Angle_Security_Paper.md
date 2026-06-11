@@ -194,6 +194,35 @@ The delta is placed at the front of the prompt, not hidden. The attacker can see
 
 The copy task is a simple coherence check. Failure to copy implies something is wrong with the model's behavior — either confusion, compromise, or injection.
 
+**Why the copy task is not circular.**
+
+The critique assumes the defense requires the guard to be trustworthy. This is wrong. The defense requires the guard to be COHERENT. There's a difference:
+- Trustworthy: the guard correctly classifies the input
+- Coherent: the guard can follow its own instructions
+
+If the guard is injected, it stops following its own instructions. The copy task detects this — the guard fails to copy because it's following injection instructions instead. This is not circular — it's a coherence check.
+
+The attacker faces a dilemma:
+1. **Make the guard follow injection instructions** → guard stops following its own instructions → copy fails
+2. **Make the guard copy correctly** → guard follows its own instructions → injection fails
+
+The attacker cannot have both. The copy task detects injection by checking if the guard is still following its own instructions.
+
+**Why gradient-based optimization is impractical.**
+
+The critique suggests attackers could optimize inputs to have low delta while remaining malicious. This requires:
+1. Access to the tokenizer (model-specific, not public)
+2. Access to the embedding model (separate from guard model)
+3. Ability to run gradient-based optimization (computationally expensive)
+4. Knowledge of the exact delta value the system computes
+
+Even with all four, the optimization is constrained:
+- The input must be semantically coherent (low delta)
+- The input must be functionally injective (requires semantic contradiction)
+- These are contradictory requirements
+
+The continuous space makes this optimization hard — small input changes → unpredictable delta changes. The attacker would need to solve a continuous-space optimization problem with contradictory constraints.
+
 ### 4.4 Dynamic Threshold
 
 The threshold for flagging scales inversely with the delta:
