@@ -174,13 +174,25 @@ The guard model is given the correct delta value and asked to:
 1. Classify the input (trust, intent, integrity)
 2. Copy the delta value exactly
 
-If the guard cannot accurately copy the delta, something is wrong — either the guard is compromised, or the input is manipulating the guard's output.
-
 The tolerance is ±0.01 — just enough for:
 - Floating point error (~1e-6)
 - Model reinterpretation (~1e-2)
 
 The guard is copying a number. No reason to be generous.
+
+**The copy task is a canary, not a precision test.**
+
+The model is not expected to be perfectly precise. It's expected to be coherent. If it can't copy a number that's right in front of it, something is wrong:
+- Confusion → meta-flag (model doesn't understand the task)
+- Compromise → delta mismatch (model is being manipulated)
+- Injection → failure to copy (model is executing malicious instructions instead of copying)
+
+The delta is placed at the front of the prompt, not hidden. The attacker can see it. But the attacker can't use this information because:
+- The delta is computed by the tokenizer (algorithmic, can't be forged)
+- The attacker would need to predict what delta their input will produce
+- That requires running the tokenizer, which they don't have access to
+
+The copy task is a simple coherence check. Failure to copy implies something is wrong with the model's behavior — either confusion, compromise, or injection.
 
 ### 4.4 Dynamic Threshold
 
