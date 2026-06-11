@@ -1,5 +1,6 @@
 ﻿using System.Text.Json;
 using AmDon;
+using AmDon.Benchmark;
 using AmDon.Tests;
 using ConsoleInk;
 
@@ -335,6 +336,18 @@ while (true)
         await guardTests.RunAllTests();
         
         Console.WriteLine("  Tests complete.\n");
+        continue;
+    }
+
+    if (input.Equals("/benchmark", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine("\n  Running benchmark analysis...\n");
+        
+        var tokenAnalyzer = new TokenAnalyzer(nim, router.Resolve(ModelRole.Embedding));
+        var benchmarkAnalyzer = new BenchmarkAnalyzer(tokenAnalyzer, nim, router.Resolve(ModelRole.Embedding));
+        await benchmarkAnalyzer.RunAnalysis();
+        
+        Console.WriteLine("  Benchmark complete.\n");
         continue;
     }
 
