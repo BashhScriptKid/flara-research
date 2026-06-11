@@ -166,11 +166,21 @@ This result suggests that delta angle is not a general-purpose detector but a sp
 
 ## 6. Related Work
 
-Embedding-based detection has been explored for various NLP tasks. Perplexity-based detectors (Gehman et al., 2020) use language model uncertainty to flag machine-generated text. Entropy-based methods measure token-level randomness. Keyword filtering remains common in production systems.
+Existing approaches to detecting obfuscated inputs fall into three categories:
 
-Delta angle differs by measuring *structural* semantic properties rather than surface-level features. It operates on embedding geometry, not token probabilities. This makes it complementary to existing approaches — it could be combined with perplexity or entropy for multi-feature detection.
+**Pattern matching** (ATR-2026-00080, PromptShield, Vexscan): Regex rules detect known encoding patterns (base64, hex, unicode escapes), decode them, and rescan for injection keywords. Fast and deterministic, but requires maintaining a library of known patterns. Novel encoding schemes bypass detection.
 
-However, we do not compare with these baselines in this work. Such comparison is necessary to establish whether delta angle provides independent signal beyond what existing methods already capture.
+**Normalization + decode** (Hart, 2026): Strip zero-width characters, decode base64/hex payloads, normalize unicode, then scan for injection keywords. More thorough than pure regex, but expensive (decode everything) and high false positive rate on legitimate encoded content (code snippets, data URIs, internationalized domain names).
+
+**Semantic intent detection** (WitnessAI, 2026): ML-based analysis of conversational intent, not just surface patterns. Catches novel attacks that pattern matching misses, but requires full LLM inference — expensive at scale and introduces latency.
+
+**Entropy analysis** (Vexscan): High character entropy may indicate encrypted or compressed content. Simple but noisy — legitimate text (code, URLs, technical documentation) also has high entropy.
+
+Delta angle occupies a middle ground. It does not require known encoding patterns (unlike regex), does not decode content (unlike normalization), and does not require full LLM inference (unlike semantic intent detection). It measures *embedding geometry* — the structural relationship between consecutive chunks — which captures semantic compression without analyzing content.
+
+The trade-off: delta angle is cheaper than semantic intent detection (~100ms for embedding vs ~1s for LLM inference), more general than regex (works on any encoding), and less noisy than entropy (measures structure, not randomness). But it cannot identify *which* encoding was used (unlike regex), and it is less powerful than full semantic analysis (unlike intent detection).
+
+We do not compare directly with these baselines in this work. Such comparison is necessary to establish whether delta angle provides independent signal beyond what existing methods already capture.
 
 ## 7. Computational Cost
 
@@ -241,6 +251,15 @@ We present this as a direction for further research, not a validated solution.
 
 ### Scatter: Nemotron
 ![Nemotron Scatter](https://i.imgur.com/WvT1UaI.png)
+
+### ROC Curves
+![ROC Curves](https://i.imgur.com/48gJPrv.png)
+
+### Precision-Recall Curves
+![PR Curves](https://i.imgur.com/UGWQCjQ.png)
+
+### Threshold Analysis
+![Threshold Analysis](https://i.imgur.com/X7CptPx.png)
 
 ## Appendix B: Reproduction
 
