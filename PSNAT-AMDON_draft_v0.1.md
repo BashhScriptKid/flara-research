@@ -787,6 +787,8 @@ AMDON includes a `/test` command that runs tokenizer and guard pipeline tests.
 
 5. **Forgery is computationally infeasible** — The attacker would need to find an input where the hash in the text matches the literal current hash. Delta space is continuous → brute-force takes infinite time.
 
+6. **Tolerance is tight** — ±0.01 accounts for floating point error and model reinterpretation only. The guard is copying a number — no reason to be generous.
+
 **Implementation details:**
 
 `TokenAnalyzer.cs` computes:
