@@ -12,11 +12,18 @@ This folder contains research on using delta angle measurements to detect obfusc
 ## Files
 
 - `Delta_Angle_Obfuscation_Paper.md` — Research paper
+- `benchmark_standalone.py` — Standalone benchmark (no AMDON dependency)
 - `obf_graphs.py` — Analysis and graph generation script
 - `data/` — Benchmark results and statistics
 - `graphs/` — Generated visualizations
 
 ## Reproduction
 
-1. Run `/benchmark-obf` in AMDON CLI
-2. Run `python3 obf_graphs.py` to generate analysis
+```bash
+# Standalone (no AMDON required)
+python3 benchmark_standalone.py
+
+# Or with AMDON CLI
+/benchmark-obf
+python3 obf_graphs.py
+```
