@@ -92,18 +92,20 @@ We evaluate on two production embedding models:
 
 ### 4.3 Results
 
-| Model | Obfuscation Δ | Benign Δ | Gap | F1 | AUC-ROC | Threshold |
-|-------|---------------|----------|-----|-----|---------|-----------|
-| nv-embedqa-e5-v5 | 0.387 ± 0.177 | 0.707 ± 0.146 | 0.320 | 0.864 | 0.901 | 0.567 |
-| llama-nemotron-embed-1b-v2 | 0.585 ± 0.207 | 0.924 ± 0.212 | 0.339 | 0.889 | 0.895 | 0.629 |
+| Model | Obfuscation Δ | Benign Δ | AUC-ROC | F1 | Recall @ 5% FPR | p-value | Cohen's d |
+|-------|---------------|----------|---------|-----|-----------------|---------|-----------|
+| nv-embedqa-e5-v5 | 0.161 ± 0.227 | 0.704 ± 0.123 | 0.958 [0.927, 0.984] | 0.911 | 0.920 | 7.4e-39 | 2.975 |
+| llama-nemotron-embed-1b-v2 | 0.251 ± 0.326 | 0.893 ± 0.211 | 0.941 [0.904, 0.975] | 0.905 | 0.910 | 4.0e-36 | 2.339 |
+
+Evaluation on 100 obfuscation + 200 benign samples. AUC-ROC and confidence intervals computed via bootstrap (500 iterations).
 
 **Key findings:**
 
-1. **Consistent separation**: Both models show a gap of ~0.33 between obfuscation and benign distributions
-2. **AUC-ROC**: 0.895–0.901, indicating good discriminative ability
-3. **High precision**: 0.95–0.98 (rarely flags benign as obfuscation)
-4. **Moderate recall**: 0.79–0.82 (misses some obfuscation)
-5. **Model agreement**: Per-sample correlation of r≈0.76 between models
+1. **High AUC-ROC**: 0.941–0.958 with tight confidence intervals
+2. **Strong recall at low FPR**: 91–92% recall at 5% false positive rate
+3. **Statistical significance**: p < 1e-36 for both models (Mann-Whitney U test)
+4. **Large effect size**: Cohen's d = 2.34–2.98 (very large separation)
+5. **Consistent across models**: Both embedding models show similar performance
 
 ### 4.4 Distribution Analysis
 
@@ -267,23 +269,17 @@ We present this as a direction for further research, not a validated solution.
 ### Scatter: Nemotron
 ![Nemotron Scatter](https://i.imgur.com/WvT1UaI.png)
 
-### ROC Curves
-![ROC Curves](https://i.imgur.com/48gJPrv.png)
+### ROC Curves (N=300)
+![ROC Curves](https://i.imgur.com/7L4ToQs.png)
 
-### Precision-Recall Curves
-![PR Curves](https://i.imgur.com/UGWQCjQ.png)
+### Delta Distribution (N=300)
+![Distribution](https://i.imgur.com/AuQ9Wmp.png)
 
-### Threshold Analysis
-![Threshold Analysis](https://i.imgur.com/X7CptPx.png)
+### FPR-FNR Tradeoff (N=300)
+![FPR-FNR](https://i.imgur.com/2vl5XLL.png)
 
-### FPR-FNR Comparison
-![FPR-FNR Comparison](graphs/fpr_fnr_comparison.png)
-
-### Recall at 5% FPR
-![Recall at FPR 5%](graphs/recall_at_fpr5.png)
-
-### Feature Correlation
-![Feature Correlation](graphs/feature_correlation.png)
+### Recall at Fixed FPR (N=300)
+![Recall Comparison](https://i.imgur.com/iWnpOPI.png)
 
 ## Appendix B: Reproduction
 
