@@ -1,0 +1,36 @@
+[package]
+name = "jumping-seedling"
+version = "0.1.0"
+edition = "2024"
+description = "Fydel Jumping Seedling — CPU-native 1B transformer"
+
+[lib]
+name = "fydel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "train"
+path = "src/main.rs"
+
+[dependencies]
+rustfft = "6"
+rayon = "1"
+half = "2"
+bytemuck = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+num-complex = { version = "0.4", features = ["serde"] }
+# Data pipeline (HF dataset + tokenizer). tokenizers without default features
+# avoids the oniguruma (onig) C dependency; ureq is a small blocking HTTP client
+# used to pull the tokenizer.json + dataset file directly from Hugging Face hub URLs.
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+ureq = "2"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
