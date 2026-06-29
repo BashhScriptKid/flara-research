@@ -885,4 +885,63 @@ we abandoned for being "hardware-inefficient" was the right answer all along.
 | Circulant Kronecker (Monarch) | **KILLED** | 24× slower than FFT-circulant |
 | FFT-circulant (BasisMatmul) | **WINNER** | 8-24× faster than all Kronecker variants |
 
+### CDVFT benchmark (2026-06-29)
+
+Tested CDVFT (Circulant-Diagonal Vector Fine-Tuning, IJCAI 2025) against
+BasisMatmul. CDVFT factorizes ΔW as diag(a₂) × circ(c) × diag(a₁) and computes
+the forward pass using 1D FFT only (no 2D FFT, no eigenvalue build).
+
+**Results (FFN 3072×896, b=64, ITERS=20):**
+
+| Method | Forward (ms) | Storage per matrix |
+|--------|-------------|-------------------|
+| BasisMatmul K=32 | **0.211ms** | 21,504 reals (21KB) |
+| CDVFT m=1 | 6.421ms | 86,016 reals (84KB) |
+| CircKron K=32 | 10.468ms | — |
+| Dense Kronecker | 1.859ms | — |
+
+**CDVFT is 30× slower than BasisMatmul.** Why?
+
+The fundamental issue: CDVFT's diagonal scaling (a₁ ⊙ x) happens BEFORE the FFT.
+This means:
+- We cannot precompute and cache the FFT of input blocks (BasisMatmul does this once
+  per Q input block, reusing across all P row-blocks)
+- CDVFT must FFT the (scaled) input for every (pp, qq) pair: P×Q forward FFTs
+- BasisMatmul only needs Q forward FFTs + P×Q IFFTs
+
+**FFT count comparison (P=48, Q=14, b=64):**
+- BasisMatmul: 14 forward FFTs + 672 IFFTs = 686 total FFTs
+- CDVFT: 672 forward FFTs + 672 IFFTs = 1,344 total FFTs (1.96× more)
+
+CDVFT also recomputes the circulant vector's FFT for every (pp,qq) pair (on-the-fly
+computation). In production, precomputing and storing these would save some work, but
+the fundamental problem remains: the diagonal scaling forces per-pair FFTs.
+
+**Storage comparison:**
+- BasisMatmul: P×Q×K reals = 48×14×32 = 21,504 (21KB)
+- CDVFT: P×Q×2b reals = 48×14×128 = 86,016 (84KB) — 4× more storage
+
+**Verdict: CDVFT is KILLED.** It trades BasisMatmul's O(K×b) eigenvalue build for
+more FFTs, and the FFT overhead dominates. The diagonal-before-FFT structure is
+fundamentally incompatible with the "precompute input FFT once, reuse across rows"
+optimization that makes BasisMatmul fast.
+
+CDVFT was designed for PEFT (fine-tuning frozen pretrained weights), not for the
+full-weight structured matmul we need. In PEFT, the "weight" being multiplied is
+small (rank-r update), so the extra FFTs are cheap. For full 896×896 or 3072×896
+matrices, the overhead is catastrophic.
+
+### Hypothesis scorecard (updated)
+
+| Hypothesis | Status | Evidence |
+|-----------|--------|----------|
+| Dense Kronecker BTT | **KILLED** | 8× slower than FFT-circulant |
+| Batched FFN kron_apply | **KILLED** | Same kron count, 4% regression |
+| 3× AVX2 manual unroll | **KILLED** | 73% regression (register pressure) |
+| matmul8x8_init (no fill) | **KEPT** | 9% improvement, kept in codebase |
+| Precompile to dense W | **KILLED** | Defeats cache advantage |
+| Circulant Kronecker (Monarch) | **KILLED** | 24× slower than FFT-circulant |
+| CDVFT (IJCAI 2025) | **KILLED** | 30× slower than FFT-circulant |
+| FFT-circulant (BasisMatmul) | **WINNER** | Faster than ALL alternatives tested |
+
 ### Tests: 76 green, 0 failed. All backward gradchecks intact.

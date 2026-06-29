@@ -135,6 +135,48 @@ fn bench_circ_kron(name: &str, out_dim: usize, in_dim: usize, mf: usize, k: usiz
     eprintln!("{name:40}  out={out_dim:>5} in={in_dim:>5} P={p:>2} Q={q:>2} K={k:>2}  fwd={fwd_ms:>8.3}ms", name=name);
 }
 
+/// Benchmark the CDVFT forward (circulant-diagonal vector fine-tuning, m=1).
+fn bench_cdvft(name: &str, out_dim: usize, in_dim: usize, b: usize, iters: usize) {
+    use fydel::kernels::btt::cdvft_forward;
+
+    let p = out_dim / b;
+    let q = in_dim / b;
+
+    // Generate random parameters: a1, circ_vector, a2 for each (pp,qq) block pair
+    let n_block_pairs = p * q;
+    let n_per_param = n_block_pairs * b;
+    let mut rng_state: u64 = 0xCD01_F7;
+    let next_f32 = |state: &mut u64| -> f32 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*state >> 40) as f32 / (1u64 << 23) as f32) - 0.5
+    };
+
+    let a1_coeffs: Vec<f32> = (0..n_per_param).map(|_| next_f32(&mut rng_state)).collect();
+    let circ_coeffs: Vec<f32> = (0..n_per_param).map(|_| next_f32(&mut rng_state)).collect();
+    let a2_coeffs: Vec<f32> = (0..n_per_param).map(|_| next_f32(&mut rng_state)).collect();
+
+    let x: Vec<f32> = (0..in_dim).map(|i| (i as f32 * 0.013).sin()).collect();
+    let mut out = vec![0.0f32; out_dim];
+
+    // Warmup
+    for _ in 0..2 {
+        cdvft_forward(b, p, q, &a1_coeffs, &circ_coeffs, &a2_coeffs, &x, &mut out);
+    }
+
+    // Forward
+    let mut t_fwd = 0.0f64;
+    for _ in 0..iters {
+        let a = std::time::Instant::now();
+        cdvft_forward(b, p, q, &a1_coeffs, &circ_coeffs, &a2_coeffs, &x, &mut out);
+        t_fwd += a.elapsed().as_secs_f64();
+    }
+    let fwd_ms = t_fwd / iters as f64 * 1e3;
+
+    // Storage: 3 vectors of length b per block pair = 3*b*P*Q reals
+    let storage = 3 * b * n_block_pairs;
+    eprintln!("{name:40}  out={out_dim:>5} in={in_dim:>5} P={p:>2} Q={q:>2}  fwd={fwd_ms:>8.3}ms  storage={storage:>8} reals ({:>5.1}KB)", storage as f64 / 1024.0);
+}
+
 fn main() {
     let iters: usize = std::env::var("ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
 
@@ -163,6 +205,32 @@ fn main() {
 
     bench_circ_kron("CircKron AttnProj 896x896 K=32", 896, 896, mf, 32, iters);
     bench_circ_kron("CircKron FFN 3072x896 K=32", 3072, 896, mf, 32, iters);
+
+    // === CDVFT (Circulant-Diagonal Vector Fine-Tuning) ===
+    eprintln!("\n=== CDVFT (m=1) forward (iters={iters}) ===\n");
+
+    bench_cdvft("CDVFT AttnProj 896x896", 896, 896, block, iters);
+    bench_cdvft("CDVFT FFN 3072x896", 3072, 896, block, iters);
+
+    // === Storage comparison ===
+    eprintln!("\n=== Storage per matrix (AttnProj 896x896, b=64) ===\n");
+    let p14 = 896 / block;
+    let q14 = 896 / block;
+    let basis_attn = p14*q14*k;
+    let cdvft_attn = p14*q14*2*block;
+    eprintln!("BasisMatmul:  P×Q×K = {}×{}×{} = {} reals ({:.1}KB)", p14, q14, k, basis_attn, basis_attn as f64/1024.0);
+    eprintln!("CDVFT (m=1):  P×Q×2b = {}×{}×{} = {} reals ({:.1}KB)", p14, q14, 2*block, cdvft_attn, cdvft_attn as f64/1024.0);
+    let p48 = 3072 / block;
+    eprintln!("\nStorage per matrix (FFN 3072x896, b=64)\n");
+    let basis_ffn = p48*q14*k;
+    let cdvft_ffn = p48*q14*2*block;
+    eprintln!("BasisMatmul:  P×Q×K = {}×{}×{} = {} reals ({:.1}KB)", p48, q14, k, basis_ffn, basis_ffn as f64/1024.0);
+    eprintln!("CDVFT (m=1):  P×Q×2b = {}×{}×{} = {} reals ({:.1}KB)", p48, q14, 2*block, cdvft_ffn, cdvft_ffn as f64/1024.0);
+
+    // === Head-to-head comparison ===
+    eprintln!("\n=== Head-to-head: BasisMatmul vs CDVFT (FFN 3072x896) ===\n");
+    bench_fft_circ("BasisMatmul K=32", 3072, 896, block, 32, iters);
+    bench_cdvft("CDVFT m=1", 3072, 896, block, iters);
 
     // === Scale test: vary K ===
     eprintln!("\n=== Scale test (FFN 3072x896) ===\n");

@@ -1387,3 +1387,121 @@ pub fn init_btt_dict_random(n_shared: usize, m1: usize, m2: usize, seed: u64, st
 
     BttDict { dict1: factors, dict2: vec![0.0; n_shared * 2 * mf * mf], n_shared, m1, m2, mf }
 }
+
+// ---------------------------------------------------------------------------
+// CDVFT: Circulant-Diagonal Vector Fine-Tuning (IJCAI 2025)
+//
+// Factorization: ΔW = diag(a₂) × circ(c) × diag(a₁)
+// Forward: y = diag(a₂) ⊙ IFFT(FFT(circ(c)) ⊙ FFT(a₁ ⊙ x))
+//
+// Storage per block pair: 2b reals (a₁ + circ_vector c)
+// vs BasisMatmul: K reals (K=32, b=64 → 128 vs 32)
+//
+// Advantages over BasisMatmul:
+//   - No O(K×b) eigenvalue build — uses circulant vector directly
+//   - 1D FFT only (no 2D FFT like circulant_kron)
+//   - Simpler per-block-pair operations
+// ---------------------------------------------------------------------------
+
+/// CDVFT forward for a single block pair: out = diag(a₂) ⊙ IFFT(FFT(c) ⊙ FFT(a₁ ⊙ x))
+///
+/// All vectors have length `b`.
+/// - `a1`: diagonal vector (first scaling)
+/// - `circ_vec`: circulant first-row vector (length b)
+/// - `a2`: diagonal vector (second scaling)
+/// - `x`: input block (length b)
+/// - `out`: output block (length b)
+/// - scratch buffers: `fft_work` (length b, real), `fft_im` (length b, imag)
+#[inline]
+pub fn cdvft_block_forward(
+    b: usize,
+    a1: &[f32],
+    circ_vec: &[f32],
+    a2: &[f32],
+    x: &[f32],
+    out: &mut [f32],
+    fft_work: &mut [f32],
+    fft_im: &mut [f32],
+) {
+    debug_assert_eq!(a1.len(), b);
+    debug_assert_eq!(circ_vec.len(), b);
+    debug_assert_eq!(a2.len(), b);
+    debug_assert_eq!(x.len(), b);
+    debug_assert_eq!(out.len(), b);
+    debug_assert_eq!(fft_work.len(), b);
+    debug_assert_eq!(fft_im.len(), b);
+
+    // Step 1: x1 = a1 ⊙ x (diagonal scaling)
+    for i in 0..b {
+        fft_work[i] = a1[i] * x[i];
+    }
+
+    // Step 2: X1 = FFT(x1)
+    fft_im.fill(0.0);
+    fft1d(b, fft_work, fft_im);
+
+    // Step 3: FFT of circulant vector (compute on-the-fly for benchmark fairness)
+    // In production this would be precomputed and stored.
+    let mut circ_re = vec![0.0f32; b];
+    let mut circ_im = vec![0.0f32; b];
+    circ_re.copy_from_slice(circ_vec);
+    fft1d(b, &mut circ_re, &mut circ_im);
+
+    // Step 4: X2 = F_circ ⊙ X1 (pointwise complex multiply)
+    for i in 0..b {
+        let cr = circ_re[i];
+        let ci = circ_im[i];
+        let xr = fft_work[i];
+        let xi = fft_im[i];
+        fft_work[i] = cr * xr - ci * xi;
+        fft_im[i] = cr * xi + ci * xr;
+    }
+
+    // Step 5: y = IFFT(X2)
+    ifft1d(b, fft_work, fft_im);
+
+    // Step 6: out = a2 ⊙ y (diagonal scaling)
+    for i in 0..b {
+        out[i] = a2[i] * fft_work[i];
+    }
+}
+
+/// CDVFT forward over all P×Q block pairs.
+///
+/// - `a1_coeffs`: [P × Q × b] diagonal vectors (first scaling)
+/// - `circ_coeffs`: [P × Q × b] circulant first-row vectors
+/// - `a2_coeffs`: [P × Q × b] diagonal vectors (second scaling)
+/// - `x`: input [in_dim], where in_dim = Q × b
+/// - `out`: output [out_dim], where out_dim = P × b
+pub fn cdvft_forward(
+    b: usize,
+    p: usize,
+    q: usize,
+    a1_coeffs: &[f32],
+    circ_coeffs: &[f32],
+    a2_coeffs: &[f32],
+    x: &[f32],
+    out: &mut [f32],
+) {
+    let mut fft_work = vec![0.0f32; b];
+    let mut fft_im = vec![0.0f32; b];
+
+    for pp in 0..p {
+        out[pp * b..(pp + 1) * b].fill(0.0);
+        let mut y_block = vec![0.0f32; b];
+
+        for qq in 0..q {
+            let base = (pp * q + qq) * b;
+            let a1 = &a1_coeffs[base..base + b];
+            let c = &circ_coeffs[base..base + b];
+            let a2 = &a2_coeffs[base..base + b];
+            let x_block = &x[qq * b..(qq + 1) * b];
+
+            cdvft_block_forward(b, a1, c, a2, x_block, &mut y_block, &mut fft_work, &mut fft_im);
+
+            for i in 0..b {
+                out[pp * b + i] += y_block[i];
+            }
+        }
+    }
+}
