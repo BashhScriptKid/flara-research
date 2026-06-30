@@ -12,6 +12,9 @@ use fydel::kernels::fft::BasisMatmul;
 use fydel::kernels::gemm;
 use rustfft::num_complex::Complex32;
 
+#[cfg(target_arch = "x86_64")]
+use core::arch::x86_64::*;
+
 // ---------------------------------------------------------------------------
 // LCG rng
 // ---------------------------------------------------------------------------
@@ -27,6 +30,222 @@ impl Lcg {
     }
     fn vec_scaled(&mut self, n: usize, s: f32) -> Vec<f32> {
         (0..n).map(|_| self.f() * s).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AVX2 kernels for forward_block (m=8 specialisation)
+// ---------------------------------------------------------------------------
+
+/// dst[0..64] = alpha * src[0..64], 8 YMM multiply lanes (no accumulate — replaces fill+axpy).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn axpy64_init_avx2(dst: *mut f32, src: *const f32, alpha: f32) {
+    let av = _mm256_set1_ps(alpha);
+    for i in 0..8 {
+        let s = _mm256_loadu_ps(src.add(i * 8));
+        _mm256_storeu_ps(dst.add(i * 8), _mm256_mul_ps(av, s));
+    }
+}
+
+/// dst[0..64] += alpha * src[0..64], 8 YMM FMA lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn axpy64_avx2(dst: *mut f32, src: *const f32, alpha: f32) {
+    let av = _mm256_set1_ps(alpha);
+    for i in 0..8 {
+        let s = _mm256_loadu_ps(src.add(i * 8));
+        let d = _mm256_loadu_ps(dst.add(i * 8));
+        _mm256_storeu_ps(dst.add(i * 8), _mm256_fmadd_ps(av, s, d));
+    }
+}
+
+/// out[0..8] = mat[0..64] @ vec[0..8], row-major mat, 2-rows-per-hadd-sequence.
+/// h0 = vhaddps(p0,p1): lo=[a01,a23,b01,b23], hi=[a45,a67,b45,b67]
+/// h1 = vhaddps(h0,h0): lo=[a0123,b0123,...], hi=[a4567,b4567,...]
+/// add(lo128, hi128) → [a_sum, b_sum, ...] in lanes 0, 1.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn matvec8_avx2(out: *mut f32, mat: *const f32, vec: *const f32) {
+    let v = _mm256_loadu_ps(vec);
+    for pair in 0..4 {
+        let r0 = pair * 2;
+        let p0 = _mm256_mul_ps(_mm256_loadu_ps(mat.add(r0 * 8)), v);
+        let p1 = _mm256_mul_ps(_mm256_loadu_ps(mat.add((r0 + 1) * 8)), v);
+        let h0 = _mm256_hadd_ps(p0, p1);
+        let h1 = _mm256_hadd_ps(h0, h0);
+        let lo = _mm256_castps256_ps128(h1);
+        let hi = _mm256_extractf128_ps(h1, 1);
+        let s  = _mm_add_ps(lo, hi);
+        *out.add(r0)     = _mm_cvtss_f32(s);
+        *out.add(r0 + 1) = _mm_cvtss_f32(_mm_shuffle_ps(s, s, 0x01));
+    }
+}
+
+/// out[0..8] += mat[0..64] @ vec[0..8] — accumulates rather than overwrites.
+/// Used for the stage-2 output which sums contributions from all qq blocks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn matvec8_accum_avx2(out: *mut f32, mat: *const f32, vec: *const f32) {
+    let v = _mm256_loadu_ps(vec);
+    for pair in 0..4 {
+        let r0 = pair * 2;
+        let p0 = _mm256_mul_ps(_mm256_loadu_ps(mat.add(r0 * 8)), v);
+        let p1 = _mm256_mul_ps(_mm256_loadu_ps(mat.add((r0 + 1) * 8)), v);
+        let h0 = _mm256_hadd_ps(p0, p1);
+        let h1 = _mm256_hadd_ps(h0, h0);
+        let lo = _mm256_castps256_ps128(h1);
+        let hi = _mm256_extractf128_ps(h1, 1);
+        let s  = _mm_add_ps(lo, hi);
+        *out.add(r0)     += _mm_cvtss_f32(s);
+        *out.add(r0 + 1) += _mm_cvtss_f32(_mm_shuffle_ps(s, s, 0x01));
+    }
+}
+
+/// forward_block for m=8, any nd. All inner loops have compile-time trip counts
+/// Horizontal dot of two 8-element f32 vectors.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn dot8_avx2(a: *const f32, b: *const f32) -> f32 {
+    let va   = _mm256_loadu_ps(a);
+    let vb   = _mm256_loadu_ps(b);
+    let prod = _mm256_mul_ps(va, vb);
+    let lo   = _mm256_castps256_ps128(prod);
+    let hi   = _mm256_extractf128_ps(prod, 1);
+    let s4   = _mm_add_ps(lo, hi);
+    let s2   = _mm_hadd_ps(s4, s4);
+    _mm_cvtss_f32(_mm_hadd_ps(s2, s2))
+}
+
+/// dst[0..8] += alpha * src[0..8], single YMM FMA.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn axpy8_avx2(dst: *mut f32, src: *const f32, alpha: f32) {
+    let av = _mm256_set1_ps(alpha);
+    _mm256_storeu_ps(dst, _mm256_fmadd_ps(av, _mm256_loadu_ps(src), _mm256_loadu_ps(dst)));
+}
+
+/// (B=64 for AXPY, M=8 for transpose) so LLVM can fully unroll alongside the
+/// explicit AVX2 intrinsics.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn forward_block_avx2(
+    d1: &[f32], d2: &[f32], a1_blk: &[f32], a2_blk: &[f32],
+    x_blk: &[f32], nd: usize,
+    y1: &mut [f32], z: &mut [f32], out: &mut [f32],
+    eff: &mut [f32],
+) {
+    const M: usize = 8;
+    const B: usize = 64;
+
+    // Stage 1: init from first atom (avoids fill(0.0) + first axpy), then accumulate rest.
+    for i in 0..M {
+        axpy64_init_avx2(eff.as_mut_ptr(), d1.as_ptr().add(0), *a1_blk.get_unchecked(i * nd));
+        for d in 1..nd {
+            axpy64_avx2(eff.as_mut_ptr(), d1.as_ptr().add(d * B), *a1_blk.get_unchecked(i * nd + d));
+        }
+        matvec8_avx2(y1.as_mut_ptr().add(i * M), eff.as_ptr(), x_blk.as_ptr().add(i * M));
+    }
+
+    // Transpose y1 → z
+    for i in 0..M {
+        for j in 0..M {
+            *z.get_unchecked_mut(j * M + i) = *y1.get_unchecked(i * M + j);
+        }
+    }
+
+    // Stage 2: same init trick; output accumulates into out (= ypp, summed across qq).
+    for j in 0..M {
+        axpy64_init_avx2(eff.as_mut_ptr(), d2.as_ptr().add(0), *a2_blk.get_unchecked(j * nd));
+        for d in 1..nd {
+            axpy64_avx2(eff.as_mut_ptr(), d2.as_ptr().add(d * B), *a2_blk.get_unchecked(j * nd + d));
+        }
+        matvec8_accum_avx2(out.as_mut_ptr().add(j * M), eff.as_ptr(), z.as_ptr().add(j * M));
+    }
+}
+
+/// Backward pass for m=8, any nd. Computes da1, da2, dd1, dd2.
+/// dx (input grad) is omitted — add when wiring into full transformer.
+/// dd1/dd2 are global accumulators; caller keeps backward sequential over blocks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn backward_block_avx2(
+    d1: *const f32, d2: *const f32,
+    a1_blk: *const f32, a2_blk: *const f32,
+    x_blk: *const f32, z: *const f32,
+    dout_pp: *const f32, // [M*M] grad into this pp row
+    nd: usize,
+    da1: *mut f32, da2: *mut f32, // [M*nd] each, offset to this block
+    dd1: *mut f32, dd2: *mut f32, // [nd*B] each, global accumulators
+) {
+    const M: usize = 8;
+    const B: usize = 64;
+    let mut eff = [0.0f32; B];
+    let mut dz  = [0.0f32; B];
+    let mut dy1 = [0.0f32; B];
+
+    // Stage 2 backward
+    for j in 0..M {
+        let zj     = z.add(j * M);
+        let dout_j = dout_pp.add(j * M);
+
+        // eff_j = Σ_d a2[j,d]*D2[d] (same as forward)
+        axpy64_init_avx2(eff.as_mut_ptr(), d2.add(0), *a2_blk.add(j * nd));
+        for d in 1..nd {
+            axpy64_avx2(eff.as_mut_ptr(), d2.add(d * B), *a2_blk.add(j * nd + d));
+        }
+
+        // dz[j,:] = eff_j^T @ dout_j  via row-AXPY: dz_j += dout_j[r] * eff_j[r,:]
+        let dz_j = dz.as_mut_ptr().add(j * M);
+        for r in 0..M {
+            axpy8_avx2(dz_j, eff.as_ptr().add(r * M), *dout_j.add(r));
+        }
+
+        // da2[j,d] += Σ_r dout_j[r] * dot8(D2[d,r,:], z_j)
+        // dd2[d,r,:] += dout_j[r] * a2[j,d] * z_j
+        for r in 0..M {
+            let dy = *dout_j.add(r);
+            for d in 0..nd {
+                let a     = *a2_blk.add(j * nd + d);
+                let d2row = d2.add((d * M + r) * M);
+                *da2.add(j * nd + d) += dy * dot8_avx2(d2row, zj);
+                axpy8_avx2(dd2.add((d * M + r) * M), zj, dy * a);
+            }
+        }
+    }
+
+    // Transpose dz → dy1
+    for i in 0..M {
+        for j in 0..M {
+            dy1[i * M + j] = dz[j * M + i];
+        }
+    }
+
+    // Stage 1 backward
+    for i in 0..M {
+        let xi    = x_blk.add(i * M);
+        let dy1_i = dy1.as_ptr().add(i * M);
+
+        axpy64_init_avx2(eff.as_mut_ptr(), d1.add(0), *a1_blk.add(i * nd));
+        for d in 1..nd {
+            axpy64_avx2(eff.as_mut_ptr(), d1.add(d * B), *a1_blk.add(i * nd + d));
+        }
+
+        for r in 0..M {
+            let d_y = *dy1_i.add(r);
+            for d in 0..nd {
+                let a     = *a1_blk.add(i * nd + d);
+                let d1row = d1.add((d * M + r) * M);
+                *da1.add(i * nd + d) += d_y * dot8_avx2(d1row, xi);
+                axpy8_avx2(dd1.add((d * M + r) * M), xi, d_y * a);
+            }
+        }
     }
 }
 
@@ -99,17 +318,30 @@ impl SharedMonarchMatmul {
         d1: &[f32], d2: &[f32], a1_blk: &[f32], a2_blk: &[f32],
         x_blk: &[f32], m: usize, nd: usize,
         y1: &mut [f32], z: &mut [f32], out: &mut [f32],
+        eff: &mut [f32], // scratch m*m — avoids per-call allocation
     ) {
-        // Stage 1
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if m == 8 {
+            unsafe {
+                forward_block_avx2(d1, d2, a1_blk, a2_blk, x_blk, nd, y1, z, out, eff);
+            }
+            return;
+        }
+        let b = m * m;
+        // Stage 1: build effective m×m matrix per block-row via AXPY, then apply.
+        // All loops are scalar with fixed trip counts — LLVM auto-vectorizes both
+        // the AXPY accumulation and the m×m mat-vec without function call boundaries.
         for i in 0..m {
             let xi = &x_blk[i * m..(i + 1) * m];
+            eff[..b].fill(0.0);
+            for d in 0..nd {
+                let a = a1_blk[i * nd + d];
+                let atom = &d1[d * b..d * b + b];
+                for e in 0..b { eff[e] += a * atom[e]; }
+            }
             for r in 0..m {
                 let mut acc = 0.0f32;
-                for d in 0..nd {
-                    let a = a1_blk[i * nd + d];
-                    let drow = &d1[(d * m + r) * m..(d * m + r) * m + m];
-                    acc += a * gemm::dot(drow, xi);
-                }
+                for c in 0..m { acc += eff[r * m + c] * xi[c]; }
                 y1[i * m + r] = acc;
             }
         }
@@ -119,52 +351,55 @@ impl SharedMonarchMatmul {
                 z[j * m + i] = y1[i * m + j];
             }
         }
-        // Stage 2
+        // Stage 2: same pattern over z
         for j in 0..m {
             let zj = &z[j * m..(j + 1) * m];
+            eff[..b].fill(0.0);
+            for d in 0..nd {
+                let a = a2_blk[j * nd + d];
+                let atom = &d2[d * b..d * b + b];
+                for e in 0..b { eff[e] += a * atom[e]; }
+            }
             for r in 0..m {
                 let mut acc = 0.0f32;
-                for d in 0..nd {
-                    let a = a2_blk[j * nd + d];
-                    let drow = &d2[(d * m + r) * m..(d * m + r) * m + m];
-                    acc += a * gemm::dot(drow, zj);
-                }
-                out[j * m + r] = acc;
+                for c in 0..m { acc += eff[r * m + c] * zj[c]; }
+                out[j * m + r] += acc;  // accumulate: caller passes ypp (pre-zeroed)
             }
         }
     }
 
     fn forward(&self, x: &[f32]) -> (Vec<f32>, FwdCache) {
+        use rayon::prelude::*;
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
-        let nblocks = p * q;
 
-        let mut y = vec![0.0f32; p * b];
-        let mut cache = FwdCache {
-            y1s: vec![0.0f32; nblocks * b],
-            zs:  vec![0.0f32; nblocks * b],
-        };
-        let mut blk_out = vec![0.0f32; b];
+        let mut y   = vec![0.0f32; p * b];
+        let mut y1s = vec![0.0f32; p * q * b];
+        let mut zs  = vec![0.0f32; p * q * b];
 
-        for pp in 0..p {
+        // Collect disjoint per-pp mutable slice triples, then parallelize.
+        // Each pp writes to y[pp*b..(pp+1)*b] and cache rows [pp*q*b..(pp+1)*q*b] only.
+        let pp_data: Vec<(&mut [f32], &mut [f32], &mut [f32])> = y.chunks_mut(b)
+            .zip(y1s.chunks_mut(q * b))
+            .zip(zs.chunks_mut(q * b))
+            .map(|((ypp, y1pp), zpp)| (ypp, y1pp, zpp))
+            .collect();
+
+        pp_data.into_par_iter().enumerate().for_each(|(pp, (ypp, y1s_pp, zs_pp))| {
+            let mut eff = vec![0.0f32; b];
             for qq in 0..q {
-                let bk = pp * q + qq;
-                let y1 = &mut cache.y1s[bk * b..(bk + 1) * b];
-                let z  = &mut cache.zs[bk * b..(bk + 1) * b];
-                blk_out.fill(0.0);
-
+                let y1 = &mut y1s_pp[qq * b..(qq + 1) * b];
+                let z  = &mut zs_pp[qq * b..(qq + 1) * b];
                 Self::forward_block(
                     &self.d1, &self.d2,
                     self.a1_blk(pp, qq), self.a2_blk(pp, qq),
                     &x[qq * b..(qq + 1) * b],
-                    m, nd, y1, z, &mut blk_out,
+                    m, nd, y1, z, ypp, &mut eff,
                 );
-
-                let ypp = &mut y[pp * b..(pp + 1) * b];
-                for e in 0..b { ypp[e] += blk_out[e]; }
             }
-        }
-        (y, cache)
+        });
+
+        (y, FwdCache { y1s, zs })
     }
 
     // Returns (dd1, dd2, da1, da2). Input grad skipped (not needed for isolated proj test).
@@ -179,8 +414,10 @@ impl SharedMonarchMatmul {
             da2: vec![0.0f32; p * q * m * nd],
         };
 
-        let mut dz  = vec![0.0f32; b];
-        let mut dy1 = vec![0.0f32; b];
+        let mut dz    = vec![0.0f32; b];
+        let mut dy1   = vec![0.0f32; b];
+        let mut eff_j = vec![0.0f32; b];
+        let mut eff_i = vec![0.0f32; b];
 
         for pp in 0..p {
             let dout_pp = &dout[pp * b..(pp + 1) * b];
@@ -193,23 +430,57 @@ impl SharedMonarchMatmul {
                 let da2_blk_base = bk * m * nd;
                 let da1_blk_base = bk * m * nd;
 
-                // Stage 2 backward → da2, dd2, dz
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                if m == 8 {
+                    unsafe {
+                        let dd1_ptr = g.dd1.as_mut_ptr();
+                        let dd2_ptr = g.dd2.as_mut_ptr();
+                        let da1_ptr = g.da1.as_mut_ptr().add(da1_blk_base);
+                        let da2_ptr = g.da2.as_mut_ptr().add(da2_blk_base);
+                        backward_block_avx2(
+                            self.d1.as_ptr(), self.d2.as_ptr(),
+                            self.a1_blk(pp, qq).as_ptr(), self.a2_blk(pp, qq).as_ptr(),
+                            x_blk.as_ptr(), z.as_ptr(),
+                            dout_pp.as_ptr(), nd,
+                            da1_ptr, da2_ptr, dd1_ptr, dd2_ptr,
+                        );
+                    }
+                    continue;
+                }
+
+                // Stage 2 backward → da2, dd2, dz.
+                // For each block-row j: effective eff_j = Σ_d a2[j,d]*D2[d] (same as fwd).
+                // dz[j,:] += eff_j^T @ dout[j,:]
+                // da2[j,d] += dout[j,:] · (D2[d] @ z_j) = dot(dout_j, D2[d] @ z_j)
+                //           = dot(D2[d]^T @ dout_j, z_j)   (rearranged for efficiency)
+                // dd2[d,r,:] += dout[j,r] * a2[j,d] * z_j
                 dz.fill(0.0);
                 for j in 0..m {
                     let zj = &z[j * m..(j + 1) * m];
+                    let dout_j = &dout_pp[j * m..(j + 1) * m];
+                    // Build effective matrix for this block-row
+                    eff_j.fill(0.0);
+                    for d in 0..nd {
+                        let a = self.a2_blk(pp, qq)[j * nd + d];
+                        let atom = &self.d2[d * b..d * b + b];
+                        for e in 0..b { eff_j[e] += a * atom[e]; }
+                    }
+                    // dz[j,:] += eff_j^T @ dout_j  (inline, no call boundary)
                     for r in 0..m {
-                        let dy2 = dout_pp[j * m + r];
-                        if dy2 == 0.0 { continue; }
+                        let dy = dout_j[r];
+                        for c in 0..m { dz[j * m + c] += eff_j[r * m + c] * dy; }
+                    }
+                    // da2 and dd2 via outer product dout_j ⊗ z_j, weighted by atom rows
+                    for r in 0..m {
+                        let dy = dout_j[r];
+                        if dy == 0.0 { continue; }
                         for d in 0..nd {
                             let a = self.a2_blk(pp, qq)[j * nd + d];
                             let drow = &self.d2[(d * m + r) * m..(d * m + r) * m + m];
                             let u = gemm::dot(drow, zj);
-                            g.da2[da2_blk_base + j * nd + d] += dy2 * u;
+                            g.da2[da2_blk_base + j * nd + d] += dy * u;
                             let dd2row = &mut g.dd2[(d * m + r) * m..(d * m + r) * m + m];
-                            for c in 0..m {
-                                dd2row[c] += dy2 * a * zj[c];
-                                dz[j * m + c] += dy2 * a * drow[c];
-                            }
+                            for c in 0..m { dd2row[c] += dy * a * zj[c]; }
                         }
                     }
                 }
@@ -222,11 +493,19 @@ impl SharedMonarchMatmul {
                     }
                 }
 
-                // Stage 1 backward → da1, dd1
+                // Stage 1 backward → da1, dd1 (same pattern as stage 2)
                 for i in 0..m {
                     let xi = &x_blk[i * m..(i + 1) * m];
+                    let dy1_i = &dy1[i * m..(i + 1) * m];
+                    eff_i.fill(0.0);
+                    for d in 0..nd {
+                        let a = self.a1_blk(pp, qq)[i * nd + d];
+                        let atom = &self.d1[d * b..d * b + b];
+                        for e in 0..b { eff_i[e] += a * atom[e]; }
+                    }
+                    // No dx needed (isolated proj test), but da1 and dd1:
                     for r in 0..m {
-                        let d_y = dy1[i * m + r];
+                        let d_y = dy1_i[r];
                         if d_y == 0.0 { continue; }
                         for d in 0..nd {
                             let a = self.a1_blk(pp, qq)[i * nd + d];
@@ -234,9 +513,7 @@ impl SharedMonarchMatmul {
                             let u = gemm::dot(drow, xi);
                             g.da1[da1_blk_base + i * nd + d] += d_y * u;
                             let dd1row = &mut g.dd1[(d * m + r) * m..(d * m + r) * m + m];
-                            for c in 0..m {
-                                dd1row[c] += d_y * a * xi[c];
-                            }
+                            for c in 0..m { dd1row[c] += d_y * a * xi[c]; }
                         }
                     }
                 }
@@ -330,6 +607,14 @@ fn bench(out_dim: usize, in_dim: usize, b: usize, nd: usize, k: usize, iters: us
     }
     let mon_us = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
 
+    // backward timing
+    let dout: Vec<f32> = rng.vec(out_dim);
+    let (_, cache) = mm.forward(&x);
+    for _ in 0..200 { let _ = std::hint::black_box(mm.backward(&x, &cache, &dout)); }
+    let t = Instant::now();
+    for _ in 0..iters { let _ = std::hint::black_box(mm.backward(&x, &cache, &dout)); }
+    let mon_bwd_us = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
+
     // BasisMatmul baseline
     let basis = BasisMatmul::new(out_dim, in_dim, b, k);
     let n_dict = k * b;
@@ -350,8 +635,8 @@ fn bench(out_dim: usize, in_dim: usize, b: usize, nd: usize, k: usize, iters: us
     let mon_params = nd * b * 2 + p * q * m * nd * 2;
     let basis_params = k * b * 2 + p * q * k; // complex dict counts as 2 reals
     eprintln!(
-        "  {out_dim}x{in_dim}  SharedMonarch(nd={nd}): {:>8.2}µs  BasisMatmul(K={k}): {:>8.2}µs  speedup={:.1}×  params={}(M)/{}(B)",
-        mon_us, basis_us, basis_us / mon_us, mon_params, basis_params
+        "  {out_dim}x{in_dim}  SharedMonarch(nd={nd}): fwd={:>7.2}µs  bwd={:>7.2}µs  BasisMatmul(K={k}): {:>7.2}µs  speedup={:.1}×",
+        mon_us, mon_bwd_us, basis_us, basis_us / mon_us
     );
 }
 
