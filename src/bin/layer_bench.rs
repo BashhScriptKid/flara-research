@@ -122,28 +122,25 @@ impl MonarchLayer {
     fn forward_prefill(&self, tokens: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let seq = tokens.len();
 
-        // Precompute all Q, K, V for all tokens first (parallel per-token via monarch's rayon)
-        let qs: Vec<Vec<f32>> = tokens.iter().map(|h| {
+        // Precompute Q, K, V — one norm per token, three projections, parallel over tokens.
+        use rayon::prelude::*;
+        let qkv: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = tokens.par_iter().map(|h| {
             let mut n = vec![0.0f32; HIDDEN];
             norm::forward(h, &self.attn_norm_gain, 1e-5, &mut n);
-            self.wq.forward_inference(&n)
+            let q = self.wq.forward_inference(&n);
+            let k = self.wk.forward_inference(&n);
+            let v = self.wv.forward_inference(&n);
+            (q, k, v)
         }).collect();
-        let ks: Vec<Vec<f32>> = tokens.iter().map(|h| {
-            let mut n = vec![0.0f32; HIDDEN];
-            norm::forward(h, &self.attn_norm_gain, 1e-5, &mut n);
-            self.wk.forward_inference(&n)
-        }).collect();
-        let vs: Vec<Vec<f32>> = tokens.iter().map(|h| {
-            let mut n = vec![0.0f32; HIDDEN];
-            norm::forward(h, &self.attn_norm_gain, 1e-5, &mut n);
-            self.wv.forward_inference(&n)
-        }).collect();
+        let (qs, ks, vs): (Vec<_>, Vec<_>, Vec<_>) = qkv.into_iter()
+            .map(|(q, k, v)| (q, k, v))
+            .fold((Vec::with_capacity(seq), Vec::with_capacity(seq), Vec::with_capacity(seq)),
+                |(mut qa, mut ka, mut va), (q, k, v)| { qa.push(q); ka.push(k); va.push(v); (qa, ka, va) });
 
         // Attention: O(seq² × head_dim) — causal, parallel over t (disjoint output rows).
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
         let mut attn_outs: Vec<Vec<f32>> = vec![vec![0.0f32; HIDDEN]; seq];
         {
-            use rayon::prelude::*;
             attn_outs.par_iter_mut().enumerate().for_each(|(t, ao_t)| {
                 for h_idx in 0..N_HEADS {
                     let qt = &qs[t][h_idx * HEAD_DIM..(h_idx + 1) * HEAD_DIM];
@@ -167,9 +164,9 @@ impl MonarchLayer {
             });
         }
 
-        // Output projection + FFN for each token
-        let mut out: Vec<Vec<f32>> = Vec::with_capacity(seq);
-        for t in 0..seq {
+        // Output projection + FFN — parallel over tokens (each token is independent).
+        let mut out: Vec<Vec<f32>> = vec![vec![0.0f32; HIDDEN]; seq];
+        out.par_iter_mut().enumerate().for_each(|(t, out_t)| {
             let o_proj = self.wo.forward_inference(&attn_outs[t]);
             let mut h2: Vec<f32> = tokens[t].iter().zip(&o_proj).map(|(a, b)| a + b).collect();
 
@@ -183,8 +180,8 @@ impl MonarchLayer {
                 .collect();
             let down = self.w_down.forward_inference(&act);
             for i in 0..HIDDEN { h2[i] += down[i]; }
-            out.push(h2);
-        }
+            *out_t = h2;
+        });
         out
     }
 }
