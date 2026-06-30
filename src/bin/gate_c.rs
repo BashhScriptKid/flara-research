@@ -59,7 +59,8 @@ fn gradcheck(p: usize, q: usize, m: usize, nd: usize, rng: &mut Lcg) -> bool {
     let eps = 1e-3f32;
     let (out, cache) = mm.forward(&x);
     let dloss = mse_grad(&out, &target);
-    let grads = mm.backward(&x, &cache, &dloss);
+    let mut _dx = vec![0.0f32; in_dim];
+    let grads = mm.backward(&x, &cache, &dloss, &mut _dx);
 
     let mut max_err = 0.0f32;
     let mut checked = 0usize;
@@ -113,9 +114,10 @@ fn bench(out_dim: usize, in_dim: usize, b: usize, nd: usize, k: usize, iters: us
 
     let dout: Vec<f32> = rng.vec(out_dim);
     let (_, cache) = mm.forward(&x);
-    for _ in 0..200 { let _ = std::hint::black_box(mm.backward(&x, &cache, &dout)); }
+    let mut dx_bench = vec![0.0f32; in_dim];
+    for _ in 0..200 { dx_bench.fill(0.0); let _ = std::hint::black_box(mm.backward(&x, &cache, &dout, &mut dx_bench)); }
     let t = Instant::now();
-    for _ in 0..iters { let _ = std::hint::black_box(mm.backward(&x, &cache, &dout)); }
+    for _ in 0..iters { dx_bench.fill(0.0); let _ = std::hint::black_box(mm.backward(&x, &cache, &dout, &mut dx_bench)); }
     let mon_bwd_us = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
 
     let basis = BasisMatmul::new(out_dim, in_dim, b, k);
@@ -210,7 +212,8 @@ fn train(p: usize, q: usize, m: usize, nd: usize, rng: &mut Lcg) {
             eprintln!("    step {:>5}  loss={:.6}", step, loss);
         }
         let dloss = mse_grad(&out, &target);
-        let g = student.backward(&x, &cache, &dloss);
+        let mut _dx = vec![0.0f32; in_dim];
+        let g = student.backward(&x, &cache, &dloss, &mut _dx);
         let lr = cosine_lr(step, lr_max, t_max);
         opt_d1.step(&mut student.d1, &g.dd1, lr);
         opt_d2.step(&mut student.d2, &g.dd2, lr);

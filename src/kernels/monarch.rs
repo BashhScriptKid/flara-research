@@ -129,6 +129,7 @@ unsafe fn bwd_block_avx2(
     dout_pp: *const f32, nd: usize,
     da1: *mut f32, da2: *mut f32,
     dd1: *mut f32, dd2: *mut f32,
+    dx: *mut f32,
 ) {
     const M: usize = 8;
     const B: usize = 64;
@@ -165,6 +166,8 @@ unsafe fn bwd_block_avx2(
                 *da1.add(i * nd + d) += d_y * dot8(d1.add((d * M + r) * M), xi);
                 axpy8(dd1.add((d * M + r) * M), xi, d_y * a);
             }
+            // dx[i,:] += dy1[i,r] * eff1[i][r,:]  — transpose matmul, one row per axpy8
+            axpy8(dx.add(i * M), eff.as_ptr().add(r * M), d_y);
         }
     }
 }
@@ -345,7 +348,7 @@ impl SharedMonarchMatmul {
         y
     }
 
-    pub fn backward(&self, x: &[f32], cache: &FwdCache, dout: &[f32]) -> Grads {
+    pub fn backward(&self, x: &[f32], cache: &FwdCache, dout: &[f32], dx: &mut [f32]) -> Grads {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let mut g = Grads {
@@ -374,12 +377,14 @@ impl SharedMonarchMatmul {
                         let dd2_ptr = g.dd2.as_mut_ptr();
                         let da1_ptr = g.da1.as_mut_ptr().add(da_base);
                         let da2_ptr = g.da2.as_mut_ptr().add(da_base);
+                        let dx_ptr  = dx.as_mut_ptr().add(qq * b);
                         bwd_block_avx2(
                             self.d1.as_ptr(), self.d2.as_ptr(),
                             self.a1_blk(pp, qq).as_ptr(), self.a2_blk(pp, qq).as_ptr(),
                             x_blk.as_ptr(), z.as_ptr(),
                             dout_pp.as_ptr(), nd,
                             da1_ptr, da2_ptr, dd1_ptr, dd2_ptr,
+                            dx_ptr,
                         );
                     }
                     continue;
@@ -435,6 +440,8 @@ impl SharedMonarchMatmul {
                             let dd1row = &mut g.dd1[(d * m + r) * m..(d * m + r) * m + m];
                             for c in 0..m { dd1row[c] += d_y * a * xi[c]; }
                         }
+                        let dx_i = &mut dx[qq * b + i * m..qq * b + (i + 1) * m];
+                        for c in 0..m { dx_i[c] += d_y * eff_i[r * m + c]; }
                     }
                 }
             }
