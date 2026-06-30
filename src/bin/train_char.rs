@@ -14,6 +14,8 @@ const HIDDEN:   usize = 256;   // 896 for full scale  (must be multiple of 64)
 const FFN_DIM:  usize = 1024;  // 3072 for full scale (must be multiple of 64)
 const N_HEADS:  usize = 4;     // HIDDEN / 64         (14 for full scale)
 const N_LAYERS: usize = 2;     // 96 for full scale
+const ACCUM_STEPS: usize = 4;  // sequences per opt-step — reduces gradient variance 4×
+const LR_WARMUP:   usize = 100; // linear warmup opt-steps before cosine decay
 
 const VOCAB:    usize = 128;   // printable ASCII
 const SEQ_LEN:  usize = 128;
@@ -647,6 +649,78 @@ fn clip_grads(g: &mut ModelGrads, max_norm: f32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// LR schedule: linear warmup → cosine decay
+// ---------------------------------------------------------------------------
+fn schedule_lr(opt_step: usize, n_opt_steps: usize, lr_max: f32) -> f32 {
+    if opt_step < LR_WARMUP {
+        lr_max * opt_step as f32 / LR_WARMUP as f32
+    } else {
+        let t = (opt_step - LR_WARMUP) as f32 / (n_opt_steps - LR_WARMUP).max(1) as f32;
+        lr_max * 0.5 * (1.0 + (std::f32::consts::PI * t).cos())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gradient accumulation helpers
+// ---------------------------------------------------------------------------
+fn zero_model_grads(model: &Model) -> ModelGrads {
+    ModelGrads {
+        d_embed:    vec![0.0f32; VOCAB * HIDDEN],
+        d_out_gain: vec![0.0f32; HIDDEN],
+        layer_grads: model.layers.iter().map(|l| LayerGrads {
+            wq_g: zero_grads(&l.wq), wk_g: zero_grads(&l.wk),
+            wv_g: zero_grads(&l.wv), wo_g: zero_grads(&l.wo),
+            w_up_g: zero_grads(&l.w_up), w_gate_g: zero_grads(&l.w_gate),
+            w_down_g: zero_grads(&l.w_down),
+            d_attn_gain: vec![0.0f32; HIDDEN],
+            d_ffn_gain:  vec![0.0f32; HIDDEN],
+        }).collect(),
+    }
+}
+
+fn reset_model_grads(g: &mut ModelGrads) {
+    fn zv(v: &mut Vec<f32>) { v.fill(0.0); }
+    fn zg(g: &mut Grads) { zv(&mut g.dd1); zv(&mut g.dd2); zv(&mut g.da1); zv(&mut g.da2); }
+    zv(&mut g.d_embed); zv(&mut g.d_out_gain);
+    for lg in &mut g.layer_grads {
+        zg(&mut lg.wq_g); zg(&mut lg.wk_g); zg(&mut lg.wv_g); zg(&mut lg.wo_g);
+        zg(&mut lg.w_up_g); zg(&mut lg.w_gate_g); zg(&mut lg.w_down_g);
+        zv(&mut lg.d_attn_gain); zv(&mut lg.d_ffn_gain);
+    }
+}
+
+fn add_model_grads(dst: &mut ModelGrads, src: &ModelGrads) {
+    fn av(a: &mut Vec<f32>, b: &[f32]) { a.iter_mut().zip(b).for_each(|(x, y)| *x += y); }
+    fn ag(a: &mut Grads, b: &Grads) {
+        av(&mut a.dd1, &b.dd1); av(&mut a.dd2, &b.dd2);
+        av(&mut a.da1, &b.da1); av(&mut a.da2, &b.da2);
+    }
+    av(&mut dst.d_embed, &src.d_embed);
+    av(&mut dst.d_out_gain, &src.d_out_gain);
+    for (dl, sl) in dst.layer_grads.iter_mut().zip(&src.layer_grads) {
+        ag(&mut dl.wq_g, &sl.wq_g); ag(&mut dl.wk_g, &sl.wk_g);
+        ag(&mut dl.wv_g, &sl.wv_g); ag(&mut dl.wo_g, &sl.wo_g);
+        ag(&mut dl.w_up_g, &sl.w_up_g); ag(&mut dl.w_gate_g, &sl.w_gate_g);
+        ag(&mut dl.w_down_g, &sl.w_down_g);
+        av(&mut dl.d_attn_gain, &sl.d_attn_gain);
+        av(&mut dl.d_ffn_gain, &sl.d_ffn_gain);
+    }
+}
+
+fn scale_model_grads(g: &mut ModelGrads, s: f32) {
+    fn sv(v: &mut Vec<f32>, s: f32) { for x in v { *x *= s; } }
+    fn sg(g: &mut Grads, s: f32) {
+        sv(&mut g.dd1, s); sv(&mut g.dd2, s); sv(&mut g.da1, s); sv(&mut g.da2, s);
+    }
+    sv(&mut g.d_embed, s); sv(&mut g.d_out_gain, s);
+    for lg in &mut g.layer_grads {
+        sg(&mut lg.wq_g, s); sg(&mut lg.wk_g, s); sg(&mut lg.wv_g, s); sg(&mut lg.wo_g, s);
+        sg(&mut lg.w_up_g, s); sg(&mut lg.w_gate_g, s); sg(&mut lg.w_down_g, s);
+        sv(&mut lg.d_attn_gain, s); sv(&mut lg.d_ffn_gain, s);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Checkpoint: write/read raw f32 slices
 // ---------------------------------------------------------------------------
 fn save_checkpoint(path: &str, m: &Model, step: usize) {
@@ -682,9 +756,10 @@ fn main() {
     let data_path = std::env::args().nth(1)
         .unwrap_or_else(|| "data/input.txt".to_string());
     let ckpt_path = "checkpoint.bin";
-    let n_steps: usize = std::env::args().nth(2)
+    // n_steps = number of optimizer steps (each does ACCUM_STEPS forward passes)
+    let n_opt_steps: usize = std::env::args().nth(2)
         .and_then(|s| s.parse().ok()).unwrap_or(3000);
-    let lr: f32 = 3e-4;
+    let lr_max: f32 = 3e-4;
     let max_grad_norm: f32 = 1.0;
 
     let dataset = Dataset::load(&data_path);
@@ -696,32 +771,53 @@ fn main() {
                heads={N_HEADS}  seq={SEQ_LEN}  vocab={VOCAB}");
     eprintln!("Params: {}K   data: {} tokens",
         model.param_count() / 1000, dataset.data.len());
-    eprintln!("Running {n_steps} steps  lr={lr}  grad_clip={max_grad_norm}");
+    eprintln!("Opt-steps: {n_opt_steps}  accum={ACCUM_STEPS}  \
+               lr_max={lr_max}  warmup={LR_WARMUP}  grad_clip={max_grad_norm}");
     eprintln!("─────────────────────────────────────────────────");
 
+    let mut accum      = zero_model_grads(&model);
+    let mut accum_loss = 0.0f32;
     let t0 = Instant::now();
-    for step in 0..n_steps {
-        let (inp, tgt) = dataset.sample(&mut rng);
-        let (logits, cache) = model.forward(&inp);
-        let (loss, dlogits) = cross_entropy(&logits, &tgt);
-        let mut grads = model.backward(&cache, &dlogits);
-        let gnorm = clip_grads(&mut grads, max_grad_norm);
-        opt.step(&mut model, &grads, lr);
 
-        if step % 100 == 0 || step < 10 {
-            let elapsed = t0.elapsed().as_secs_f32();
-            let ms_per_step = if step > 0 { elapsed / step as f32 * 1000.0 } else { 0.0 };
-            eprintln!("step {:>5}  loss={:.4}  gnorm={:.3}  {:.0}ms/step",
-                step, loss, gnorm, ms_per_step);
+    for opt_step in 0..n_opt_steps {
+        // ACCUM_STEPS forward+backward passes, sum gradients
+        for _ in 0..ACCUM_STEPS {
+            let (inp, tgt) = dataset.sample(&mut rng);
+            let (logits, cache) = model.forward(&inp);
+            let (loss, dlogits) = cross_entropy(&logits, &tgt);
+            let grads = model.backward(&cache, &dlogits);
+            add_model_grads(&mut accum, &grads);
+            accum_loss += loss;
         }
-        if step > 0 && step % 500 == 0 {
-            save_checkpoint(ckpt_path, &model, step);
+
+        // Average, clip, step
+        scale_model_grads(&mut accum, 1.0 / ACCUM_STEPS as f32);
+        let gnorm = clip_grads(&mut accum, max_grad_norm);
+        let lr = schedule_lr(opt_step, n_opt_steps, lr_max);
+        opt.step(&mut model, &accum, lr);
+
+        let avg_loss = accum_loss / ACCUM_STEPS as f32;
+        reset_model_grads(&mut accum);
+        accum_loss = 0.0;
+
+        if opt_step % 100 == 0 || opt_step < 10 {
+            let elapsed = t0.elapsed().as_secs_f32();
+            let fwd_done = (opt_step + 1) * ACCUM_STEPS;
+            let ms_per_opt = if opt_step > 0 {
+                elapsed / opt_step as f32 * 1000.0
+            } else { 0.0 };
+            eprintln!("step {:>5}  loss={:.4}  gnorm={:.3}  lr={:.2e}  {:.0}ms/step",
+                opt_step, avg_loss, gnorm, lr, ms_per_opt);
+            let _ = fwd_done;
+        }
+        if opt_step > 0 && opt_step % 500 == 0 {
+            save_checkpoint(ckpt_path, &model, opt_step);
         }
     }
 
     let total = t0.elapsed().as_secs_f32();
     eprintln!("─────────────────────────────────────────────────");
-    eprintln!("done  {n_steps} steps  {:.1}s  ({:.0}ms/step)",
-        total, total / n_steps as f32 * 1000.0);
-    save_checkpoint(ckpt_path, &model, n_steps);
+    eprintln!("done  {n_opt_steps} opt-steps  {:.1}s  ({:.0}ms/opt-step)",
+        total, total / n_opt_steps as f32 * 1000.0);
+    save_checkpoint(ckpt_path, &model, n_opt_steps);
 }
