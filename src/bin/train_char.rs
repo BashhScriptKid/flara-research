@@ -4,8 +4,90 @@
 //! Change the four CONFIG constants to run at full Fydel-1B scale.
 
 use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use fydel::kernels::monarch::{SharedMonarchMatmul, FwdCache, Grads};
 use fydel::kernels::norm;
+use fydel::kernels::fastmath;
+
+// ---------------------------------------------------------------------------
+// Tree-shaped phase profiling (investigation only — PROFILE=1 env var to
+// enable). RAII spans: `let _s = span("name");` times until the guard drops.
+// Nested spans accumulate under their caller's path, so the printed tree
+// shows inclusive time per node (a parent's total includes its children's).
+// Single-threaded harness, so plain thread_local + RefCell, no locking.
+// ---------------------------------------------------------------------------
+static PROFILE_ON: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    static SPAN_STACK: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+    static SPAN_TIMES: RefCell<BTreeMap<Vec<&'static str>, u64>> = RefCell::new(BTreeMap::new());
+}
+
+struct Span { active: bool, name: &'static str, t0: Instant }
+
+#[inline]
+fn span(name: &'static str) -> Span {
+    if PROFILE_ON.load(Ordering::Relaxed) {
+        SPAN_STACK.with(|s| s.borrow_mut().push(name));
+        Span { active: true, name, t0: Instant::now() }
+    } else {
+        Span { active: false, name, t0: Instant::now() }
+    }
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        if !self.active { return; }
+        let elapsed = self.t0.elapsed().as_nanos() as u64;
+        SPAN_STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            stack.pop(); // remove self
+            let mut key: Vec<&'static str> = stack.clone();
+            key.push(self.name);
+            drop(stack);
+            SPAN_TIMES.with(|m| *m.borrow_mut().entry(key).or_insert(0) += elapsed);
+        });
+    }
+}
+
+fn enable_profiling() {
+    PROFILE_ON.store(true, Ordering::Relaxed);
+}
+
+fn print_profile_summary() {
+    struct Node { own_ns: u64, children: BTreeMap<&'static str, Node> }
+    impl Node {
+        fn new() -> Self { Node { own_ns: 0, children: BTreeMap::new() } }
+    }
+    let mut root = Node::new();
+    SPAN_TIMES.with(|m| {
+        for (path, ns) in m.borrow().iter() {
+            let mut cur = &mut root;
+            for seg in path {
+                cur = cur.children.entry(seg).or_insert_with(Node::new);
+            }
+            cur.own_ns += ns;
+        }
+    });
+    fn print_node(name: &str, node: &Node, depth: usize, parent_ns: u64) {
+        let ns = node.own_ns;
+        let ms = ns as f64 / 1e6;
+        let pct = if parent_ns > 0 { 100.0 * ns as f64 / parent_ns as f64 } else { 100.0 };
+        let indent = "  ".repeat(depth);
+        eprintln!("{indent}{name:<24} {ms:>10.1} ms   {pct:>5.1}%");
+        for (cname, child) in &node.children {
+            print_node(cname, child, depth + 1, ns);
+        }
+    }
+    eprintln!("\n─── phase profile (tree, inclusive time, sum over all layers/steps) ───");
+    let total: u64 = root.children.values().map(|n| n.own_ns).sum();
+    for (name, node) in &root.children {
+        print_node(name, node, 0, total);
+    }
+    eprintln!("{:<26} {:>10.1} ms   100.0%", "total (tracked)", total as f64 / 1e6);
+}
 
 // ---------------------------------------------------------------------------
 // Config — the only lines you need to change for scale experiments
@@ -172,7 +254,12 @@ fn acc_grads(acc: &mut Grads, g: Grads) {
 }
 
 fn monarch_new(in_dim: usize, out_dim: usize, seed: u64) -> SharedMonarchMatmul {
-    SharedMonarchMatmul::new(out_dim / B, in_dim / B, M, ND, seed)
+    let mut mm = SharedMonarchMatmul::new(out_dim / B, in_dim / B, M, ND, seed);
+    // Depth-scale atoms so Var(output) = 1/(2·N_LAYERS). Var ∝ s_atom⁴, so
+    // multiply atom values by (1/(2·N_LAYERS))^(1/4).
+    let depth_factor = 1.0_f32 / (2.0 * N_LAYERS as f32).powf(0.25);
+    for v in mm.d1.iter_mut().chain(mm.d2.iter_mut()) { *v *= depth_factor; }
+    mm
 }
 
 // ---------------------------------------------------------------------------
@@ -231,17 +318,19 @@ struct LayerCache {
     h_attn:   Vec<f32>,          // [S*H] after attn norm
     attn_r:   Vec<f32>,          // [S] RMSNorm r
     q: Vec<f32>, k: Vec<f32>, v: Vec<f32>, // each [S*H]
-    q_fc: Vec<FwdCache>, k_fc: Vec<FwdCache>, v_fc: Vec<FwdCache>,
+    // batched caches: forward_batch's cache covers all S tokens in one
+    // FwdCache; use `proj.zs_at(&cache, t)` to get a single token's slice.
+    q_fc: FwdCache, k_fc: FwdCache, v_fc: FwdCache,
     probs:    Vec<f32>,           // [H*S*S]
     attn_out: Vec<f32>,           // [S*H]
-    o_fc:     Vec<FwdCache>,
+    o_fc:     FwdCache,
     h_mid:    Vec<f32>,           // [S*H] after attn residual
     h_ffn:    Vec<f32>,           // [S*H] after ffn norm
     ffn_r:    Vec<f32>,           // [S]
     up: Vec<f32>, gate: Vec<f32>, // each [S*F]
-    up_fc: Vec<FwdCache>, gate_fc: Vec<FwdCache>,
+    up_fc: FwdCache, gate_fc: FwdCache,
     act:      Vec<f32>,           // [S*F] SwiGLU output
-    down_fc:  Vec<FwdCache>,
+    down_fc:  FwdCache,
 }
 
 struct LayerGrads {
@@ -285,63 +374,62 @@ impl Layer {
         let s = SEQ_LEN;
         let mut h_attn  = vec![0.0f32; s * HIDDEN];
         let mut attn_r  = vec![0.0f32; s];
-        let mut q = vec![0.0f32; s * HIDDEN];
-        let mut k = vec![0.0f32; s * HIDDEN];
-        let mut v = vec![0.0f32; s * HIDDEN];
-        let mut q_fc = Vec::with_capacity(s);
-        let mut k_fc = Vec::with_capacity(s);
-        let mut v_fc = Vec::with_capacity(s);
-
-        for t in 0..s {
-            let xt = &x[t * HIDDEN..(t + 1) * HIDDEN];
-            let hat = &mut h_attn[t * HIDDEN..(t + 1) * HIDDEN];
-            attn_r[t] = norm::forward(xt, &self.attn_gain, 1e-5, hat);
-            let (qt, qc) = self.wq.forward(hat);
-            let (kt, kc) = self.wk.forward(hat);
-            let (vt, vc) = self.wv.forward(hat);
-            q[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&qt);
-            k[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&kt);
-            v[t * HIDDEN..(t + 1) * HIDDEN].copy_from_slice(&vt);
-            q_fc.push(qc); k_fc.push(kc); v_fc.push(vc);
+        {
+            let _s = span("norm_fwd");
+            for t in 0..s {
+                let xt = &x[t * HIDDEN..(t + 1) * HIDDEN];
+                let hat = &mut h_attn[t * HIDDEN..(t + 1) * HIDDEN];
+                attn_r[t] = norm::forward(xt, &self.attn_gain, 1e-5, hat);
+            }
         }
 
-        let (attn_out, probs) = attn_forward(&q, &k, &v);
+        // One batched call per projection (all S tokens at once) instead of
+        // S separate rayon dispatches — amortizes rayon's per-call dispatch
+        // overhead across the whole sequence.
+        let (q, q_fc);
+        let (k, k_fc);
+        let (v, v_fc);
+        {
+            let _s = span("qkv_proj_fwd");
+            (q, q_fc) = { let _s = span("wq_fwd"); self.wq.forward_batch(&h_attn, s) };
+            (k, k_fc) = { let _s = span("wk_fwd"); self.wk.forward_batch(&h_attn, s) };
+            (v, v_fc) = { let _s = span("wv_fwd"); self.wv.forward_batch(&h_attn, s) };
+        }
+
+        let (attn_out, probs) = { let _s = span("attn_core_fwd"); attn_forward(&q, &k, &v) };
 
         let mut h_mid = vec![0.0f32; s * HIDDEN];
-        let mut o_fc  = Vec::with_capacity(s);
-        for t in 0..s {
-            let ao = &attn_out[t * HIDDEN..(t + 1) * HIDDEN];
-            let (ot, oc) = self.wo.forward(ao);
-            for i in 0..HIDDEN { h_mid[t * HIDDEN + i] = x[t * HIDDEN + i] + ot[i]; }
-            o_fc.push(oc);
+        let o_fc;
+        {
+            let _s = span("wo_proj_fwd");
+            let (ot, oc) = self.wo.forward_batch(&attn_out, s);
+            for i in 0..(s * HIDDEN) { h_mid[i] = x[i] + ot[i]; }
+            o_fc = oc;
         }
 
         let mut h_ffn   = vec![0.0f32; s * HIDDEN];
         let mut ffn_r   = vec![0.0f32; s];
-        let mut up      = vec![0.0f32; s * FFN_DIM];
-        let mut gate    = vec![0.0f32; s * FFN_DIM];
-        let mut act     = vec![0.0f32; s * FFN_DIM];
-        let mut up_fc   = Vec::with_capacity(s);
-        let mut gate_fc = Vec::with_capacity(s);
-        let mut down_fc = Vec::with_capacity(s);
-        let mut out = vec![0.0f32; s * HIDDEN];
-
-        for t in 0..s {
-            let hm = &h_mid[t * HIDDEN..(t + 1) * HIDDEN];
-            let hf = &mut h_ffn[t * HIDDEN..(t + 1) * HIDDEN];
-            ffn_r[t] = norm::forward(hm, &self.ffn_gain, 1e-5, hf);
-            let (up_t, uc)   = self.w_up.forward(hf);
-            let (gate_t, gc) = self.w_gate.forward(hf);
-            let act_t = &mut act[t * FFN_DIM..(t + 1) * FFN_DIM];
-            for i in 0..FFN_DIM {
-                let g = gate_t[i];
-                act_t[i] = up_t[i] * g / (1.0 + (-g).exp()); // SwiGLU
+        {
+            let _s = span("norm_fwd");
+            for t in 0..s {
+                let hm = &h_mid[t * HIDDEN..(t + 1) * HIDDEN];
+                let hf = &mut h_ffn[t * HIDDEN..(t + 1) * HIDDEN];
+                ffn_r[t] = norm::forward(hm, &self.ffn_gain, 1e-5, hf);
             }
-            let (down_t, dc) = self.w_down.forward(act_t);
-            for i in 0..HIDDEN { out[t * HIDDEN + i] = h_mid[t * HIDDEN + i] + down_t[i]; }
-            up[t * FFN_DIM..(t + 1) * FFN_DIM].copy_from_slice(&up_t);
-            gate[t * FFN_DIM..(t + 1) * FFN_DIM].copy_from_slice(&gate_t);
-            up_fc.push(uc); gate_fc.push(gc); down_fc.push(dc);
+        }
+
+        let (up, up_fc);
+        let (gate, gate_fc);
+        let mut act = vec![0.0f32; s * FFN_DIM];
+        let (down, down_fc);
+        let mut out = vec![0.0f32; s * HIDDEN];
+        {
+            let _s = span("ffn_block_fwd");
+            (up, up_fc)     = { let _s = span("up_proj_fwd");   self.w_up.forward_batch(&h_ffn, s) };
+            (gate, gate_fc) = { let _s = span("gate_proj_fwd"); self.w_gate.forward_batch(&h_ffn, s) };
+            { let _s = span("swiglu_fwd"); fastmath::swiglu_forward(&up, &gate, &mut act); }
+            (down, down_fc) = { let _s = span("down_proj_fwd"); self.w_down.forward_batch(&act, s) };
+            for i in 0..(s * HIDDEN) { out[i] = h_mid[i] + down[i]; }
         }
 
         (out, LayerCache {
@@ -361,84 +449,115 @@ impl Layer {
         let mut w_gate_g = zero_grads(&self.w_gate);
 
         // --- FFN backward ---
-        for t in 0..s {
-            let dout_t  = &dout[t * HIDDEN..(t + 1) * HIDDEN];
-            // residual into d_h_mid
-            for i in 0..HIDDEN { d_h_mid[t * HIDDEN + i] += dout_t[i]; }
+        // Each token's contribution is computed independently (in parallel,
+        // via rayon) and collected into a Vec that preserves token order
+        // (par_chunks_mut/into_par_iter are indexed iterators), then merged
+        // sequentially in that fixed order below — same math, same
+        // summation order as the old per-token loop, just the independent
+        // per-token compute now runs on multiple cores. No profiling spans
+        // inside the parallel closure: each rayon worker has its own
+        // thread-local span stack, so per-op spans recorded there would be
+        // invisible to print_profile_summary (which only reads the calling
+        // thread's stack) — the outer span still gives an accurate total.
+        {
+            let _s = span("ffn_block_bwd");
+            use rayon::prelude::*;
+            struct FfnTokGrad { w_down_g: Grads, w_up_g: Grads, w_gate_g: Grads, d_ffn_gain: Vec<f32> }
+            let per_token: Vec<FfnTokGrad> = dout.par_chunks(HIDDEN)
+                .zip(d_h_mid.par_chunks_mut(HIDDEN))
+                .enumerate()
+                .map(|(t, (dout_t, d_h_mid_t))| {
+                    for i in 0..HIDDEN { d_h_mid_t[i] += dout_t[i]; }
 
-            // w_down backward → d_act[t]
-            let mut d_act_t = vec![0.0f32; FFN_DIM];
-            let g = self.w_down.backward(
-                &c.act[t * FFN_DIM..(t + 1) * FFN_DIM],
-                &c.down_fc[t], dout_t, &mut d_act_t);
-            acc_grads(&mut w_down_g, g);
+                    let mut d_act_t = vec![0.0f32; FFN_DIM];
+                    let w_down_g = self.w_down.backward(
+                        &c.act[t * FFN_DIM..(t + 1) * FFN_DIM],
+                        self.w_down.zs_at(&c.down_fc, t), dout_t, &mut d_act_t);
 
-            // SwiGLU backward
-            let up_t   = &c.up[t * FFN_DIM..(t + 1) * FFN_DIM];
-            let gate_t = &c.gate[t * FFN_DIM..(t + 1) * FFN_DIM];
-            let mut d_up_t   = vec![0.0f32; FFN_DIM];
-            let mut d_gate_t = vec![0.0f32; FFN_DIM];
-            for i in 0..FFN_DIM {
-                let g = gate_t[i];
-                let sig = 1.0 / (1.0 + (-g).exp());
-                d_up_t[i]   = d_act_t[i] * g * sig;
-                d_gate_t[i] = d_act_t[i] * up_t[i] * sig * (1.0 + g * (1.0 - sig));
+                    let up_t   = &c.up[t * FFN_DIM..(t + 1) * FFN_DIM];
+                    let gate_t = &c.gate[t * FFN_DIM..(t + 1) * FFN_DIM];
+                    let mut d_up_t   = vec![0.0f32; FFN_DIM];
+                    let mut d_gate_t = vec![0.0f32; FFN_DIM];
+                    fastmath::swiglu_backward(up_t, gate_t, &d_act_t, &mut d_up_t, &mut d_gate_t);
+
+                    let hf = &c.h_ffn[t * HIDDEN..(t + 1) * HIDDEN];
+                    let mut dx_up   = vec![0.0f32; HIDDEN];
+                    let mut dx_gate = vec![0.0f32; HIDDEN];
+                    let w_up_g   = self.w_up.backward(hf, self.w_up.zs_at(&c.up_fc, t), &d_up_t, &mut dx_up);
+                    let w_gate_g = self.w_gate.backward(hf, self.w_gate.zs_at(&c.gate_fc, t), &d_gate_t, &mut dx_gate);
+
+                    let mut d_hf = vec![0.0f32; HIDDEN];
+                    for i in 0..HIDDEN { d_hf[i] = dx_up[i] + dx_gate[i]; }
+                    let mut d_ffn_gain_t = vec![0.0f32; HIDDEN];
+                    norm::backward(&c.h_mid[t * HIDDEN..(t + 1) * HIDDEN],
+                        &self.ffn_gain, &d_hf, c.ffn_r[t],
+                        d_h_mid_t, &mut d_ffn_gain_t);
+
+                    FfnTokGrad { w_down_g, w_up_g, w_gate_g, d_ffn_gain: d_ffn_gain_t }
+                })
+                .collect();
+
+            for tg in per_token {
+                acc_grads(&mut w_down_g, tg.w_down_g);
+                acc_grads(&mut w_up_g, tg.w_up_g);
+                acc_grads(&mut w_gate_g, tg.w_gate_g);
+                for i in 0..HIDDEN { d_ffn_gain[i] += tg.d_ffn_gain[i]; }
             }
-
-            // w_up / w_gate backward → accumulate into h_ffn gradient
-            let hf = &c.h_ffn[t * HIDDEN..(t + 1) * HIDDEN];
-            let mut dx_up   = vec![0.0f32; HIDDEN];
-            let mut dx_gate = vec![0.0f32; HIDDEN];
-            let g_up   = self.w_up.backward(hf, &c.up_fc[t],   &d_up_t,   &mut dx_up);
-            let g_gate = self.w_gate.backward(hf, &c.gate_fc[t], &d_gate_t, &mut dx_gate);
-            acc_grads(&mut w_up_g, g_up);
-            acc_grads(&mut w_gate_g, g_gate);
-
-            // RMSNorm backward (ffn) → d_h_mid
-            let mut d_hf = vec![0.0f32; HIDDEN];
-            for i in 0..HIDDEN { d_hf[i] = dx_up[i] + dx_gate[i]; }
-            norm::backward(&c.h_mid[t * HIDDEN..(t + 1) * HIDDEN],
-                &self.ffn_gain, &d_hf, c.ffn_r[t],
-                &mut d_h_mid[t * HIDDEN..(t + 1) * HIDDEN],
-                &mut d_ffn_gain);
         }
 
         // --- Attention output projection backward ---
         let mut d_attn_out = vec![0.0f32; s * HIDDEN];
         let mut wo_g = zero_grads(&self.wo);
-        for t in 0..s {
-            let dh_mid = &d_h_mid[t * HIDDEN..(t + 1) * HIDDEN];
-            // residual: dx[t] += d_h_mid[t]
-            for i in 0..HIDDEN { dx[t * HIDDEN + i] += dh_mid[i]; }
-            let g = self.wo.backward(
-                &c.attn_out[t * HIDDEN..(t + 1) * HIDDEN],
-                &c.o_fc[t], dh_mid,
-                &mut d_attn_out[t * HIDDEN..(t + 1) * HIDDEN]);
-            acc_grads(&mut wo_g, g);
+        {
+            let _s = span("wo_proj_bwd");
+            use rayon::prelude::*;
+            for i in 0..(s * HIDDEN) { dx[i] += d_h_mid[i]; }
+            let per_token: Vec<Grads> = c.attn_out.par_chunks(HIDDEN)
+                .zip(d_h_mid.par_chunks(HIDDEN))
+                .zip(d_attn_out.par_chunks_mut(HIDDEN))
+                .enumerate()
+                .map(|(t, ((ao, dh_mid), d_attn_out_t))| {
+                    self.wo.backward(ao, self.wo.zs_at(&c.o_fc, t), dh_mid, d_attn_out_t)
+                })
+                .collect();
+            for g in per_token { acc_grads(&mut wo_g, g); }
         }
 
         // --- Attention QKV backward ---
-        let (dq, dk, dv) = attn_backward(&c.q, &c.k, &c.v, &c.probs, &d_attn_out);
+        let (dq, dk, dv) = { let _s = span("attn_core_bwd"); attn_backward(&c.q, &c.k, &c.v, &c.probs, &d_attn_out) };
 
         let mut d_h_attn    = vec![0.0f32; s * HIDDEN];
         let mut d_attn_gain = vec![0.0f32; HIDDEN];
         let mut wq_g = zero_grads(&self.wq);
         let mut wk_g = zero_grads(&self.wk);
         let mut wv_g = zero_grads(&self.wv);
-        for t in 0..s {
-            let hat = &c.h_attn[t * HIDDEN..(t + 1) * HIDDEN];
-            let dh  = &mut d_h_attn[t * HIDDEN..(t + 1) * HIDDEN];
-            let gq = self.wq.backward(hat, &c.q_fc[t], &dq[t*HIDDEN..(t+1)*HIDDEN], dh);
-            let gk = self.wk.backward(hat, &c.k_fc[t], &dk[t*HIDDEN..(t+1)*HIDDEN], dh);
-            let gv = self.wv.backward(hat, &c.v_fc[t], &dv[t*HIDDEN..(t+1)*HIDDEN], dh);
-            acc_grads(&mut wq_g, gq);
-            acc_grads(&mut wk_g, gk);
-            acc_grads(&mut wv_g, gv);
-            // RMSNorm backward (attn) → dx
-            norm::backward(&c.x_in[t * HIDDEN..(t + 1) * HIDDEN],
-                &self.attn_gain, dh, c.attn_r[t],
-                &mut dx[t * HIDDEN..(t + 1) * HIDDEN],
-                &mut d_attn_gain);
+        {
+            let _s = span("qkv_proj_bwd");
+            use rayon::prelude::*;
+            struct QkvTokGrad { wq_g: Grads, wk_g: Grads, wv_g: Grads, d_attn_gain: Vec<f32> }
+            let per_token: Vec<QkvTokGrad> = c.h_attn.par_chunks(HIDDEN)
+                .zip(dq.par_chunks(HIDDEN)).zip(dk.par_chunks(HIDDEN)).zip(dv.par_chunks(HIDDEN))
+                .zip(d_h_attn.par_chunks_mut(HIDDEN))
+                .zip(dx.par_chunks_mut(HIDDEN))
+                .enumerate()
+                .map(|(t, (((((hat, dq_t), dk_t), dv_t), dh), dx_t))| {
+                    let wq_g = self.wq.backward(hat, self.wq.zs_at(&c.q_fc, t), dq_t, dh);
+                    let wk_g = self.wk.backward(hat, self.wk.zs_at(&c.k_fc, t), dk_t, dh);
+                    let wv_g = self.wv.backward(hat, self.wv.zs_at(&c.v_fc, t), dv_t, dh);
+                    let mut d_attn_gain_t = vec![0.0f32; HIDDEN];
+                    norm::backward(&c.x_in[t * HIDDEN..(t + 1) * HIDDEN],
+                        &self.attn_gain, dh, c.attn_r[t],
+                        dx_t, &mut d_attn_gain_t);
+                    QkvTokGrad { wq_g, wk_g, wv_g, d_attn_gain: d_attn_gain_t }
+                })
+                .collect();
+
+            for tg in per_token {
+                acc_grads(&mut wq_g, tg.wq_g);
+                acc_grads(&mut wk_g, tg.wk_g);
+                acc_grads(&mut wv_g, tg.wv_g);
+                for i in 0..HIDDEN { d_attn_gain[i] += tg.d_attn_gain[i]; }
+            }
         }
 
         (dx, LayerGrads {
@@ -749,13 +868,75 @@ fn save_checkpoint(path: &str, m: &Model, step: usize) {
     eprintln!("  checkpoint saved → {path}  (step {step})");
 }
 
+fn load_checkpoint(path: &str, m: &mut Model) -> usize {
+    use std::io::Read as IoRead;
+    let mut f = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("cannot open {path}: {e}"));
+    let mut step_bytes = [0u8; 8];
+    f.read_exact(&mut step_bytes).unwrap();
+    let step = u64::from_le_bytes(step_bytes) as usize;
+    let read_vec = |f: &mut std::fs::File, v: &mut Vec<f32>| {
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4)
+        };
+        f.read_exact(bytes).unwrap();
+    };
+    read_vec(&mut f, &mut m.embed);
+    read_vec(&mut f, &mut m.out_gain);
+    for l in &mut m.layers {
+        for v in [&mut l.wq.d1, &mut l.wq.d2, &mut l.wq.a1, &mut l.wq.a2,
+                  &mut l.wk.d1, &mut l.wk.d2, &mut l.wk.a1, &mut l.wk.a2,
+                  &mut l.wv.d1, &mut l.wv.d2, &mut l.wv.a1, &mut l.wv.a2,
+                  &mut l.wo.d1, &mut l.wo.d2, &mut l.wo.a1, &mut l.wo.a2,
+                  &mut l.w_up.d1, &mut l.w_up.d2, &mut l.w_up.a1, &mut l.w_up.a2,
+                  &mut l.w_gate.d1, &mut l.w_gate.d2, &mut l.w_gate.a1, &mut l.w_gate.a2,
+                  &mut l.w_down.d1, &mut l.w_down.d2, &mut l.w_down.a1, &mut l.w_down.a2,
+                  &mut l.attn_gain, &mut l.ffn_gain] {
+            read_vec(&mut f, v);
+        }
+    }
+    step
+}
+
+// Average cross-entropy over n_windows forward-only passes with a fixed seed.
+// 500 windows = 64K tokens → σ ≈ 0.013 nats.
+fn eval_loss(model: &Model, dataset: &Dataset, n_windows: usize) -> f32 {
+    let mut rng = 0xEEEE_1234_5678_9ABCu64;
+    let mut total = 0.0f32;
+    for _ in 0..n_windows {
+        let (inp, tgt) = dataset.sample(&mut rng);
+        let (logits, _) = model.forward(&inp);
+        let (loss, _) = cross_entropy(&logits, &tgt);
+        total += loss;
+    }
+    total / n_windows as f32
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 fn main() {
+    if std::env::var("PROFILE").ok().as_deref() == Some("1") {
+        enable_profiling();
+    }
     let data_path = std::env::args().nth(1)
         .unwrap_or_else(|| "data/input.txt".to_string());
     let ckpt_path = "checkpoint.bin";
+
+    if std::env::args().nth(2).as_deref() == Some("--eval") {
+        let dataset = Dataset::load(&data_path);
+        let mut model = Model::new(0xFEED_BEEF_1234_5678);
+        let step = load_checkpoint(ckpt_path, &mut model);
+        eprintln!("checkpoint: step {step}");
+        let n_eval = 500;
+        eprintln!("running eval over {n_eval} windows ({} tokens) …",
+            n_eval * SEQ_LEN);
+        let t0 = Instant::now();
+        let loss = eval_loss(&model, &dataset, n_eval);
+        eprintln!("eval loss: {loss:.4}  ({:.1}s)", t0.elapsed().as_secs_f32());
+        return;
+    }
+
     // n_steps = number of optimizer steps (each does ACCUM_STEPS forward passes)
     let n_opt_steps: usize = std::env::args().nth(2)
         .and_then(|s| s.parse().ok()).unwrap_or(3000);
@@ -820,4 +1001,7 @@ fn main() {
     eprintln!("done  {n_opt_steps} opt-steps  {:.1}s  ({:.0}ms/opt-step)",
         total, total / n_opt_steps as f32 * 1000.0);
     save_checkpoint(ckpt_path, &model, n_opt_steps);
+    if std::env::var("PROFILE").ok().as_deref() == Some("1") {
+        print_profile_summary();
+    }
 }
