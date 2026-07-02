@@ -30,6 +30,28 @@ pub fn load(path: impl AsRef<Path>) -> std::io::Result<(Model, ModelOptState)> {
     Ok((Model::from_checkpoint(&ckpt), opt))
 }
 
+/// Sidecar path for the step counter — the checkpoint proper has no step field
+/// (it's a snapshot of *parameters*, not training progress), so the step this
+/// checkpoint was saved at is tracked alongside it instead.
+fn step_path(ckpt_path: &Path) -> std::path::PathBuf {
+    ckpt_path.with_extension("step")
+}
+
+/// Write the step counter alongside a checkpoint, for resume.
+pub fn save_step(ckpt_path: impl AsRef<Path>, step: usize) -> std::io::Result<()> {
+    std::fs::write(step_path(ckpt_path.as_ref()), step.to_string())
+}
+
+/// Read the step counter saved alongside a checkpoint. `Ok(0)` if no sidecar
+/// exists (e.g. a checkpoint saved before this feature existed).
+pub fn load_step(ckpt_path: impl AsRef<Path>) -> std::io::Result<usize> {
+    match std::fs::read_to_string(step_path(ckpt_path.as_ref())) {
+        Ok(s) => s.trim().parse().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

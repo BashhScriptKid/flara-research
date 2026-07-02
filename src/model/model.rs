@@ -15,13 +15,12 @@
 //! increment) backward can run without recomputation. Activation checkpointing —
 //! trading that storage for recompute — is a deferred memory optimization.
 
-use crate::kernels::fft::{init_coeffs_random, init_dict_random};
+use crate::kernels::fft::init_coeffs_random;
 use crate::kernels::norm;
 use crate::kernels::rope::Rope;
 use crate::model::config::ModelConfig;
 use crate::kernels::optimizer::{AdaFactor, AdaFactorState};
 use crate::model::layer::{LayerCheckpoint, LayerForward, LayerGrads, LayerOptState, TransformerLayer};
-use rustfft::num_complex::Complex32;
 
 /// Cached forward state for the whole model, consumed by the backward pass.
 pub struct ModelForward {
@@ -39,26 +38,42 @@ pub struct ModelForward {
     pub rinv_final: Vec<f32>,
 }
 
-/// Per-parameter gradients for the whole model. `d_embed` and `d_dict` are the
-/// tied/shared tensors (the embedding-cum-LM-head and the dictionary); `layers`
-/// holds the per-layer grads in forward order. Each layer's own `d_dict` is
-/// subsumed by the model-level `d_dict` sum and should be ignored by the optimizer.
+/// Per-parameter gradients for the whole model. `d_embed` is the tied/shared
+/// tensor (the embedding-cum-LM-head); `layers` holds the per-layer grads in
+/// forward order. Each layer's own dict-gradient copies are subsumed by the
+/// model-level sums here and should be ignored by the optimizer.
 pub struct ModelGrads {
     pub d_embed: Vec<f32>,
-    pub d_dict: Vec<Complex32>,
+    /// Shared Monarch attention dictionary contribution, summed across every
+    /// layer's wq/wk/wv/wo.
+    pub d_mono_d1: Vec<f32>,
+    pub d_mono_d2: Vec<f32>,
+    /// Shared Monarch FFN dictionary contribution, summed across every
+    /// layer's up/gate/down.
+    pub d_ffn_mono_d1: Vec<f32>,
+    pub d_ffn_mono_d2: Vec<f32>,
     pub d_final_norm_gain: Vec<f32>,
     pub layers: Vec<LayerGrads>,
 }
 
 impl ModelGrads {
     /// Accumulate another micro-batch's gradients into `self`. Model-level tensors
-    /// (embed, dict, final norm) share fixed parameter shapes across micro-batches,
+    /// (embed, dicts, final norm) share fixed parameter shapes across micro-batches,
     /// so they sum elementwise; per-layer accumulation defers to [`LayerGrads::add`].
     pub fn add(&mut self, other: &ModelGrads) {
         for (a, b) in self.d_embed.iter_mut().zip(&other.d_embed) {
             *a += *b;
         }
-        for (a, b) in self.d_dict.iter_mut().zip(&other.d_dict) {
+        for (a, b) in self.d_mono_d1.iter_mut().zip(&other.d_mono_d1) {
+            *a += *b;
+        }
+        for (a, b) in self.d_mono_d2.iter_mut().zip(&other.d_mono_d2) {
+            *a += *b;
+        }
+        for (a, b) in self.d_ffn_mono_d1.iter_mut().zip(&other.d_ffn_mono_d1) {
+            *a += *b;
+        }
+        for (a, b) in self.d_ffn_mono_d2.iter_mut().zip(&other.d_ffn_mono_d2) {
             *a += *b;
         }
         for (a, b) in self.d_final_norm_gain.iter_mut().zip(&other.d_final_norm_gain) {
@@ -75,8 +90,17 @@ impl ModelGrads {
         for x in self.d_embed.iter_mut() {
             *x *= f;
         }
-        for x in self.d_dict.iter_mut() {
-            *x = Complex32::new(x.re * f, x.im * f);
+        for x in self.d_mono_d1.iter_mut() {
+            *x *= f;
+        }
+        for x in self.d_mono_d2.iter_mut() {
+            *x *= f;
+        }
+        for x in self.d_ffn_mono_d1.iter_mut() {
+            *x *= f;
+        }
+        for x in self.d_ffn_mono_d2.iter_mut() {
+            *x *= f;
         }
         for x in self.d_final_norm_gain.iter_mut() {
             *x *= f;
@@ -88,12 +112,15 @@ impl ModelGrads {
 }
 
 /// Optimizer state for the whole model, mirroring [`ModelGrads`]. `embed` factors
-/// as `[vocab, hidden]`; `dict` is a full second moment over the `2·K·b` real
-/// components of the complex dictionary; per-layer state lives in `layers`.
+/// as `[vocab, hidden]`; the two shared Monarch dictionaries (attention and
+/// FFN) each get a full second moment; per-layer state lives in `layers`.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ModelOptState {
     pub embed: AdaFactorState,
-    pub dict: AdaFactorState,
+    /// Shared Monarch attention dictionary (`d1`, `d2` concatenated).
+    pub mono_dict: AdaFactorState,
+    /// Shared Monarch FFN dictionary (`d1`, `d2` concatenated).
+    pub ffn_mono_dict: AdaFactorState,
     pub final_norm: AdaFactorState,
     pub layers: Vec<LayerOptState>,
 }
@@ -103,8 +130,14 @@ pub struct ModelOptState {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     pub cfg: ModelConfig,
-    /// The complex dictionary `G`, `K×b` complex (= `2·K·b` reals for the optimizer).
-    pub dict: Vec<Complex32>,
+    /// Shared real Monarch atom dictionary for the attention projections,
+    /// `nd×b` each.
+    pub mono_d1: Vec<f32>,
+    pub mono_d2: Vec<f32>,
+    /// Shared real Monarch atom dictionary for the FFN projections (separate
+    /// from the attention one above), `nd×b` each.
+    pub ffn_mono_d1: Vec<f32>,
+    pub ffn_mono_d2: Vec<f32>,
     pub embed: Vec<f32>,
     pub final_norm_gain: Vec<f32>,
     pub layers: Vec<LayerCheckpoint>,
@@ -115,7 +148,10 @@ impl Model {
     pub fn to_checkpoint(&self) -> Checkpoint {
         Checkpoint {
             cfg: self.cfg.clone(),
-            dict: self.dict.clone(),
+            mono_d1: self.mono_d1.clone(),
+            mono_d2: self.mono_d2.clone(),
+            ffn_mono_d1: self.ffn_mono_d1.clone(),
+            ffn_mono_d2: self.ffn_mono_d2.clone(),
             embed: self.embed.clone(),
             final_norm_gain: self.final_norm_gain.clone(),
             layers: self.layers.iter().map(|l| l.to_checkpoint()).collect(),
@@ -126,7 +162,10 @@ impl Model {
     /// from `cfg`, then overwrite every learned tensor.
     pub fn from_checkpoint(c: &Checkpoint) -> Model {
         let mut m = Model::new(c.cfg.clone(), 0);
-        m.dict = c.dict.clone();
+        m.mono_d1 = c.mono_d1.clone();
+        m.mono_d2 = c.mono_d2.clone();
+        m.ffn_mono_d1 = c.ffn_mono_d1.clone();
+        m.ffn_mono_d2 = c.ffn_mono_d2.clone();
         m.embed = c.embed.clone();
         m.final_norm_gain = c.final_norm_gain.clone();
         for (layer, lc) in m.layers.iter_mut().zip(&c.layers) {
@@ -167,8 +206,14 @@ pub fn cross_entropy(logits: &[f32], vocab: usize, targets: &[usize]) -> (f32, V
 /// Fydel Jumping Seedling — the assembled model.
 pub struct Model {
     cfg: ModelConfig,
-    /// Shared dictionary `G`, `K×b` complex, row-major.
-    dict: Vec<Complex32>,
+    /// Shared real Monarch atom dictionary for the attention projections
+    /// (wq/wk/wv/wo), `nd×b` each, row-major.
+    mono_d1: Vec<f32>,
+    mono_d2: Vec<f32>,
+    /// Shared real Monarch atom dictionary for the FFN projections
+    /// (up/gate/down) — separate from the attention one above.
+    ffn_mono_d1: Vec<f32>,
+    ffn_mono_d2: Vec<f32>,
     /// Tied token embedding `E`, `[vocab, hidden]` row-major.
     embed: Vec<f32>,
     final_norm_gain: Vec<f32>,
@@ -180,14 +225,16 @@ impl Model {
     /// Build a model from a (validated) config with reproducible random init.
     pub fn new(cfg: ModelConfig, seed: u64) -> Self {
         cfg.validate();
-        let dict = init_dict_random(cfg.dict_k, cfg.block, seed ^ 0xD1C7, 1.0);
+        let mono_m = (cfg.block as f64).sqrt() as usize;
+        let (mono_d1, mono_d2) = crate::kernels::monarch::init_shared_atoms(cfg.dict_k, mono_m, seed ^ 0xA7A7);
+        let (ffn_mono_d1, ffn_mono_d2) = crate::kernels::monarch::init_shared_atoms(cfg.dict_k, mono_m, seed ^ 0xB8B8);
         let embed = init_coeffs_random(cfg.vocab * cfg.hidden, seed ^ 0xE3BE, 0.02);
         let layers = (0..cfg.n_layers)
             .map(|i| TransformerLayer::new(&cfg, i, seed.wrapping_add(i as u64 * 0x9E37)))
             .collect();
         let rope = Rope::new(cfg.head_dim, cfg.max_seq, cfg.rope_base);
         let final_norm_gain = vec![1.0; cfg.hidden];
-        Self { cfg, dict, embed, final_norm_gain, rope, layers }
+        Self { cfg, mono_d1, mono_d2, ffn_mono_d1, ffn_mono_d2, embed, final_norm_gain, rope, layers }
     }
 
     #[inline]
@@ -215,7 +262,7 @@ impl Model {
 
         let mut layer_fwds = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            let lf = layer.forward(&self.dict, &self.rope, &x, t);
+            let lf = layer.forward(&self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2, &self.rope, &x, t);
             x = lf.out.clone();
             layer_fwds.push(lf);
         }
@@ -366,10 +413,13 @@ impl Model {
             }
         }
 
-        // --- layer stack, in reverse; the shared dictionary grad sums across layers ---
+        // --- layer stack, in reverse; the shared dictionary grads sum across layers ---
         let embed_x = self.embed_lookup(&fwd.token_ids);
         let mut d_x = d_final_x;
-        let mut d_dict: Vec<Complex32> = Vec::new();
+        let mut d_mono_d1: Vec<f32> = Vec::new();
+        let mut d_mono_d2: Vec<f32> = Vec::new();
+        let mut d_ffn_mono_d1: Vec<f32> = Vec::new();
+        let mut d_ffn_mono_d2: Vec<f32> = Vec::new();
         let mut layer_grads_rev = Vec::with_capacity(self.layers.len());
         for l in (0..self.layers.len()).rev() {
             // Layer l's forward input is the previous layer's output (or the embedding).
@@ -378,11 +428,23 @@ impl Model {
                 let s = p[l].as_slice();
                 (!s.is_empty()).then_some(s)
             });
-            let lg = self.layers[l].backward(&self.dict, &self.rope, input, &fwd.layer_fwds[l], &d_x, lpp, t);
-            if d_dict.is_empty() {
-                d_dict = lg.d_dict.clone();
+            let lg = self.layers[l].backward(
+                &self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2,
+                &self.rope, input, &fwd.layer_fwds[l], &d_x, lpp, t,
+            );
+            if d_mono_d1.is_empty() {
+                d_mono_d1 = lg.d_mono_d1.clone();
+                d_mono_d2 = lg.d_mono_d2.clone();
             } else {
-                for (a, b) in d_dict.iter_mut().zip(&lg.d_dict) { *a += *b; }
+                for (a, b) in d_mono_d1.iter_mut().zip(&lg.d_mono_d1) { *a += *b; }
+                for (a, b) in d_mono_d2.iter_mut().zip(&lg.d_mono_d2) { *a += *b; }
+            }
+            if d_ffn_mono_d1.is_empty() {
+                d_ffn_mono_d1 = lg.d_ffn_mono_d1.clone();
+                d_ffn_mono_d2 = lg.d_ffn_mono_d2.clone();
+            } else {
+                for (a, b) in d_ffn_mono_d1.iter_mut().zip(&lg.d_ffn_mono_d1) { *a += *b; }
+                for (a, b) in d_ffn_mono_d2.iter_mut().zip(&lg.d_ffn_mono_d2) { *a += *b; }
             }
             d_x = lg.d_hidden.clone();
             layer_grads_rev.push(lg);
@@ -399,43 +461,54 @@ impl Model {
             }
         }
 
-        ModelGrads { d_embed, d_dict, d_final_norm_gain, layers: layer_grads_rev }
+        ModelGrads {
+            d_embed, d_mono_d1, d_mono_d2, d_ffn_mono_d1, d_ffn_mono_d2, d_final_norm_gain,
+            layers: layer_grads_rev,
+        }
     }
 
     /// Allocate optimizer state for every parameter in the model.
     pub fn init_opt(&self) -> ModelOptState {
-        let dict_len = self.dict.len() * 2; // complex → real pairs for optimizer state
+        let mono_len = self.mono_d1.len() + self.mono_d2.len();
+        let ffn_mono_len = self.ffn_mono_d1.len() + self.ffn_mono_d2.len();
         ModelOptState {
             embed: AdaFactorState::matrix(self.cfg.vocab, self.cfg.hidden, false),
-            dict: AdaFactorState::vector(dict_len, false),
+            mono_dict: AdaFactorState::vector(mono_len, false),
+            ffn_mono_dict: AdaFactorState::vector(ffn_mono_len, false),
             final_norm: AdaFactorState::vector(self.cfg.hidden, false),
             layers: self.layers.iter().map(|l| l.init_opt()).collect(),
         }
     }
 
     /// Apply one AdaFactor step to every parameter from a (possibly accumulated)
-    /// gradient bundle. The shared dictionary steps once from the model-level
-    /// summed `d_dict`; the per-layer `d_dict` copies are ignored.
+    /// gradient bundle. Each shared dictionary steps once from its model-level
+    /// summed gradient; the per-layer copies are ignored.
     pub fn apply_grad(&mut self, g: &ModelGrads, st: &mut ModelOptState, af: &AdaFactor, lr: f32) {
         af.step(&mut self.embed, &g.d_embed, &mut st.embed, lr);
 
-        // Interleave complex dict as [re0, im0, re1, im1, ...] for the optimizer,
-        // then deinterleave back.
-        let n = self.dict.len();
-        let mut p = vec![0.0f32; 2 * n];
-        for i in 0..n {
-            p[2 * i] = self.dict[i].re;
-            p[2 * i + 1] = self.dict[i].im;
-        }
-        let mut dg = vec![0.0f32; 2 * n];
-        for i in 0..g.d_dict.len().min(n) {
-            dg[2 * i] = g.d_dict[i].re;
-            dg[2 * i + 1] = g.d_dict[i].im;
-        }
-        af.step(&mut p, &dg, &mut st.dict, lr);
-        for i in 0..n {
-            self.dict[i] = Complex32::new(p[2 * i], p[2 * i + 1]);
-        }
+        // Shared Monarch attention dictionary: d1 then d2 concatenated for the optimizer.
+        let n1 = self.mono_d1.len();
+        let mut mp = Vec::with_capacity(n1 + self.mono_d2.len());
+        mp.extend_from_slice(&self.mono_d1);
+        mp.extend_from_slice(&self.mono_d2);
+        let mut mdg = vec![0.0f32; mp.len()];
+        mdg[..g.d_mono_d1.len()].copy_from_slice(&g.d_mono_d1);
+        mdg[n1..n1 + g.d_mono_d2.len()].copy_from_slice(&g.d_mono_d2);
+        af.step(&mut mp, &mdg, &mut st.mono_dict, lr);
+        self.mono_d1.copy_from_slice(&mp[..n1]);
+        self.mono_d2.copy_from_slice(&mp[n1..]);
+
+        // Shared Monarch FFN dictionary, same scheme.
+        let fn1 = self.ffn_mono_d1.len();
+        let mut fmp = Vec::with_capacity(fn1 + self.ffn_mono_d2.len());
+        fmp.extend_from_slice(&self.ffn_mono_d1);
+        fmp.extend_from_slice(&self.ffn_mono_d2);
+        let mut fmdg = vec![0.0f32; fmp.len()];
+        fmdg[..g.d_ffn_mono_d1.len()].copy_from_slice(&g.d_ffn_mono_d1);
+        fmdg[fn1..fn1 + g.d_ffn_mono_d2.len()].copy_from_slice(&g.d_ffn_mono_d2);
+        af.step(&mut fmp, &fmdg, &mut st.ffn_mono_dict, lr);
+        self.ffn_mono_d1.copy_from_slice(&fmp[..fn1]);
+        self.ffn_mono_d2.copy_from_slice(&fmp[fn1..]);
 
         af.step(&mut self.final_norm_gain, &g.d_final_norm_gain, &mut st.final_norm, lr);
         for (l, layer) in self.layers.iter_mut().enumerate() {

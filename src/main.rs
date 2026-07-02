@@ -53,7 +53,7 @@ fn main() {
     };
 
     eprintln!("training for {total_steps} steps (checkpoint every 1000) …");
-    let hist = train(&mut model, &mut opt, &mut reader, &train_cfg, Some((1_000, &ckpt_path)));
+    let hist = train(&mut model, &mut opt, &mut reader, &train_cfg, Some((1_000, &ckpt_path)), 25, 0);
 
     if let Some(last) = hist.last() {
         eprintln!("done: final ce {:.4} at step {}", last.ce, last.step);

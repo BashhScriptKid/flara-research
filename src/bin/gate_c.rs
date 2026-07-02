@@ -60,7 +60,7 @@ fn gradcheck(p: usize, q: usize, m: usize, nd: usize, rng: &mut Lcg) -> bool {
     let (out, cache) = mm.forward(&x);
     let dloss = mse_grad(&out, &target);
     let mut _dx = vec![0.0f32; in_dim];
-    let grads = mm.backward(&x, &cache, &dloss, &mut _dx);
+    let grads = mm.backward(&x, &cache.zs, &dloss, &mut _dx);
 
     let mut max_err = 0.0f32;
     let mut checked = 0usize;
@@ -107,17 +107,20 @@ fn bench(out_dim: usize, in_dim: usize, b: usize, nd: usize, k: usize, iters: us
     let mm = SharedMonarchMatmul::new(p, q, m, nd, rng.next_seed());
     let x: Vec<f32> = rng.vec(in_dim);
 
-    for _ in 0..200 { let _ = std::hint::black_box(mm.forward(&x)); }
+    // forward_inference (not forward) — BasisMatmul::forward below writes no
+    // backward cache, so timing SharedMonarch's cache-writing `forward` would
+    // unfairly tax it for work the comparison isn't asking for.
+    for _ in 0..200 { let _ = std::hint::black_box(mm.forward_inference(&x)); }
     let t = Instant::now();
-    for _ in 0..iters { let _ = std::hint::black_box(mm.forward(&x)); }
+    for _ in 0..iters { let _ = std::hint::black_box(mm.forward_inference(&x)); }
     let mon_us = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
 
     let dout: Vec<f32> = rng.vec(out_dim);
     let (_, cache) = mm.forward(&x);
     let mut dx_bench = vec![0.0f32; in_dim];
-    for _ in 0..200 { dx_bench.fill(0.0); let _ = std::hint::black_box(mm.backward(&x, &cache, &dout, &mut dx_bench)); }
+    for _ in 0..200 { dx_bench.fill(0.0); let _ = std::hint::black_box(mm.backward(&x, &cache.zs, &dout, &mut dx_bench)); }
     let t = Instant::now();
-    for _ in 0..iters { dx_bench.fill(0.0); let _ = std::hint::black_box(mm.backward(&x, &cache, &dout, &mut dx_bench)); }
+    for _ in 0..iters { dx_bench.fill(0.0); let _ = std::hint::black_box(mm.backward(&x, &cache.zs, &dout, &mut dx_bench)); }
     let mon_bwd_us = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
 
     let basis = BasisMatmul::new(out_dim, in_dim, b, k);
@@ -133,10 +136,9 @@ fn bench(out_dim: usize, in_dim: usize, b: usize, nd: usize, k: usize, iters: us
     let mon_params = nd * b * 2 + p * q * m * nd * 2;
     let basis_params = k * b * 2 + p * q * k;
     eprintln!(
-        "  {out_dim}x{in_dim}  SharedMonarch(nd={nd}): fwd={:>7.2}µs  bwd={:>7.2}µs  BasisMatmul(K={k}): {:>7.2}µs  speedup={:.1}×",
+        "  {out_dim}x{in_dim}  SharedMonarch(nd={nd}, params={mon_params}): fwd={:>7.2}µs  bwd={:>7.2}µs  BasisMatmul(K={k}, params={basis_params}): {:>7.2}µs  speedup={:.1}×",
         mon_us, mon_bwd_us, basis_us, basis_us / mon_us
     );
-    let _ = (mon_params, basis_params);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +215,7 @@ fn train(p: usize, q: usize, m: usize, nd: usize, rng: &mut Lcg) {
         }
         let dloss = mse_grad(&out, &target);
         let mut _dx = vec![0.0f32; in_dim];
-        let g = student.backward(&x, &cache, &dloss, &mut _dx);
+        let g = student.backward(&x, &cache.zs, &dloss, &mut _dx);
         let lr = cosine_lr(step, lr_max, t_max);
         opt_d1.step(&mut student.d1, &g.dd1, lr);
         opt_d2.step(&mut student.d2, &g.dd2, lr);
@@ -245,6 +247,43 @@ fn main() {
     eprintln!("\n=== Timing (iters={iters}) ===");
     bench(896, 3072, 64, 8, 32, iters, &mut rng);
     bench(896, 896,  64, 8, 32, iters, &mut rng);
+
+    // train_small_lod's actual attention-projection shapes (hidden=256, block=64,
+    // dict_k=8) — SharedMonarch(nd=8) is what AttnProj now uses; BasisMatmul(k=8)
+    // is what it used before the swap. Same nd/k so the comparison isolates the
+    // kernel, not a compression-ratio difference.
+    eprintln!("\n=== Timing @ train_small_lod attention-projection shapes (iters={iters}) ===");
+    bench(256, 256, 64, 8, 8, iters, &mut rng); // wq / wo
+    bench(64,  256, 64, 8, 8, iters, &mut rng); // wk / wv
+
+    // Crossover search: square P×Q grids at nd=k=8, block=64, between the two
+    // known points (256x256 loses at 0.2x, 896x896 wins at 1.3x).
+    eprintln!("\n=== Crossover search: square grids, nd=k=8 (iters={iters}) ===");
+    bench(384, 384, 64, 8, 8, iters, &mut rng); // P=Q=6
+    bench(512, 512, 64, 8, 8, iters, &mut rng); // P=Q=8
+    bench(640, 640, 64, 8, 8, iters, &mut rng); // P=Q=10
+    bench(768, 768, 64, 8, 8, iters, &mut rng); // P=Q=12
+    bench(832, 832, 64, 8, 8, iters, &mut rng); // P=Q=13
+    bench(896, 896, 64, 8, 8, iters, &mut rng); // P=Q=14, k=8 (isolate grid size from the k=32 default)
+
+    eprintln!("\n=== nd/k matched at production grid size (896x896, iters={iters}) ===");
+    bench(896, 896, 64, 16, 16, iters, &mut rng);
+    bench(896, 896, 64, 32, 32, iters, &mut rng); // matches the original "1.3x win" comparison's k, but with nd=k this time
+    bench(256, 256, 64, 32, 32, iters, &mut rng); // does bumping nd=k=32 flip the toy-scale result too?
+
+    // True equal-capacity comparison (Opus-derived): SharedMonarch has 2·m·nd
+    // coeffs/block-pair vs BasisMatmul's K, so equal params needs K=2·m·nd=16·nd
+    // at m=8. K=64 is the equal-*FLOP* point instead (BasisMatmul unpadded,
+    // ratio m·nd/K=1) — both matter since equal-param can pad BasisMatmul past
+    // its expressibility ceiling. nd anchored at 8 (monarch.rs: full-rank needs
+    // nd≥8).
+    eprintln!("\n=== Equal-capacity comparison, nd=8 (iters={iters}) ===");
+    eprintln!("-- K=128 (equal param count) --");
+    bench(896, 3072, 64, 8, 128, iters, &mut rng);
+    bench(896, 896,  64, 8, 128, iters, &mut rng);
+    eprintln!("-- K=64 (equal FLOPs, BasisMatmul unpadded) --");
+    bench(896, 3072, 64, 8, 64, iters, &mut rng);
+    bench(896, 896,  64, 8, 64, iters, &mut rng);
 
     eprintln!("\n=== Training (same-family overfit, nd=8) ===");
     train(4, 4, 8, 8, &mut rng);

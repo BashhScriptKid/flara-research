@@ -65,17 +65,24 @@ pub struct StepMetrics {
 ///
 /// `checkpoint` optionally saves model + optimizer state every `n` steps to a path,
 /// so a long run survives interruption (see [`crate::train::checkpoint`]).
+/// `log_every` (0 = disabled) prints a lightweight progress line every `n` steps
+/// without saving — independent of `checkpoint`'s cadence, so a long run doesn't
+/// go silent between (typically much less frequent) checkpoint saves.
+/// `start_step` resumes the LR/curriculum schedule from a prior run (0 for a
+/// fresh run) — see [`crate::train::checkpoint::load_step`].
 pub fn train<B: BatchSource>(
     model: &mut Model,
     opt: &mut Optimizer,
     src: &mut B,
     cfg: &TrainConfig,
     checkpoint: Option<(usize, &std::path::Path)>,
+    log_every: usize,
+    start_step: usize,
 ) -> Vec<StepMetrics> {
     let vocab = model.config().vocab;
-    let mut history = Vec::with_capacity(cfg.total_steps);
+    let mut history = Vec::with_capacity(cfg.total_steps.saturating_sub(start_step));
 
-    for step in 0..cfg.total_steps {
+    for step in start_step..cfg.total_steps {
         let seq_len = cfg.seq_len(step);
         let probe_coeff = cfg.probe_coeff(step);
 
@@ -123,10 +130,14 @@ pub fn train<B: BatchSource>(
             probe_bce: probe_sum / nb as f32,
         });
 
+        let mut did_checkpoint = false;
         if let Some((every, path)) = checkpoint {
             if every > 0 && (step + 1) % every == 0 {
+                did_checkpoint = true;
                 let m = *history.last().unwrap();
-                match crate::train::checkpoint::save(model, opt.state(), path) {
+                match crate::train::checkpoint::save(model, opt.state(), path)
+                    .and_then(|()| crate::train::checkpoint::save_step(path, step + 1))
+                {
                     Ok(()) => eprintln!(
                         "step {:>7} | lr {:.3e} | ce {:.4} | probe {:.4} | saved {}",
                         m.step,
@@ -138,6 +149,10 @@ pub fn train<B: BatchSource>(
                     Err(e) => eprintln!("checkpoint save failed at step {}: {e}", m.step),
                 }
             }
+        }
+        if !did_checkpoint && log_every > 0 && (step + 1) % log_every == 0 {
+            let m = *history.last().unwrap();
+            eprintln!("step {:>7} | lr {:.3e} | ce {:.4} | probe {:.4}", m.step, m.lr, m.ce, m.probe_bce);
         }
     }
 
@@ -205,7 +220,7 @@ mod tests {
             probe_anneal_steps: 40,
         };
 
-        let hist = train(&mut model, &mut opt, &mut src, &cfg, None);
+        let hist = train(&mut model, &mut opt, &mut src, &cfg, None, 0, 0);
         assert_eq!(hist.len(), 120);
         let first = hist[0].ce;
         let last = hist.last().unwrap().ce;

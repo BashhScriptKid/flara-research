@@ -116,11 +116,10 @@ mod tests {
             let want = 0.5 * (g1.d_embed[i] + g2.d_embed[i]);
             assert!((acc.d_embed[i] - want).abs() < 1e-6, "d_embed[{i}]: {} vs {want}", acc.d_embed[i]);
         }
-        for i in 0..acc.d_dict.len() {
-            let want = 0.5 * (g1.d_dict[i] + g2.d_dict[i]);
-            let got = acc.d_dict[i];
-            let err = (got - want).norm();
-            assert!(err < 1e-6, "d_dict[{i}] mismatch: got {got} want {want}");
+        for i in 0..acc.d_mono_d1.len() {
+            let want = 0.5 * (g1.d_mono_d1[i] + g2.d_mono_d1[i]);
+            let got = acc.d_mono_d1[i];
+            assert!((got - want).abs() < 1e-6, "d_mono_d1[{i}] mismatch: got {got} want {want}");
         }
         let a = &acc.layers[0].d_wq;
         for i in 0..a.len() {

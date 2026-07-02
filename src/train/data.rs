@@ -16,6 +16,7 @@ use crate::train::r#loop::BatchSource;
 /// A flat token stream served as next-token-prediction windows. The cursor wraps to
 /// the start when fewer than `seq_len + 1` tokens remain, so a fixed-size corpus
 /// drives an arbitrary number of training steps.
+#[derive(Clone)]
 pub struct CorpusReader {
     tokens: Vec<u32>,
     pos: usize,
@@ -32,6 +33,16 @@ impl CorpusReader {
 
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
+    }
+
+    /// Split off a held-out tail: the last `val_frac` fraction of tokens becomes a
+    /// second reader, the rest stays in `self`. Used to get a validation split that
+    /// never overlaps training windows.
+    pub fn split_val(mut self, val_frac: f32) -> (CorpusReader, CorpusReader) {
+        let val_n = ((self.tokens.len() as f32) * val_frac) as usize;
+        let split_at = self.tokens.len() - val_n;
+        let val_tokens = self.tokens.split_off(split_at);
+        (self, CorpusReader::new(val_tokens))
     }
 }
 
@@ -181,7 +192,7 @@ mod tests {
             probe_anneal_steps: 40,
         };
 
-        let hist = train(&mut model, &mut opt, &mut reader, &cfg, None);
+        let hist = train(&mut model, &mut opt, &mut reader, &cfg, None, 0, 0);
         assert_eq!(hist.len(), 120);
         let first = hist[0].ce;
         let last = hist.last().unwrap().ce;

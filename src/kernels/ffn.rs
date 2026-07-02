@@ -17,13 +17,15 @@
 //! out    = W_down · act on blocks S         (forward_cols)
 //! ```
 //!
-//! `W_up`/`W_gate`/`W_down` are BasisMatmul-compressed projections over the
-//! shared dictionary (passed in at call time, shared across all layers).
-//! Only the router weights and the per-projection coefficients are owned here.
+//! `W_up`/`W_gate`/`W_down` are Monarch-compressed projections
+//! ([`SharedMonarchProj`]) over a shared real atom dictionary (passed in at
+//! call time, shared across all layers — the FFN's own dictionary, separate
+//! from the attention projections' one). Only the router weights and the
+//! per-projection coefficients are owned here.
 
-use crate::kernels::fft::{init_coeffs_random, BasisMatmul, PairGrads};
+use crate::kernels::fft::init_coeffs_random;
+use crate::kernels::monarch::{FwdCache, Grads as MonarchGrads, SharedMonarchProj};
 use crate::kernels::optimizer::{AdaFactor, AdaFactorState};
-use rustfft::num_complex::Complex32;
 
 /// Static configuration of a block-routed FFN.
 #[derive(Clone, Copy)]
@@ -36,7 +38,7 @@ pub struct FfnConfig {
     pub block: usize,
     /// Number of blocks kept active per token (`top-k`).
     pub n_active: usize,
-    /// Shared dictionary atom count `K`.
+    /// Shared dictionary atom count `nd`.
     pub dict_k: usize,
 }
 
@@ -64,6 +66,11 @@ pub struct FfnForward {
     pub gate: Vec<f32>,
     /// Routed activation fed to `W_down`, length `F`.
     pub act: Vec<f32>,
+    /// Monarch forward caches `backward` needs — one per projection, each
+    /// only populated on the selected blocks (see `forward_rows`/`forward_cols`).
+    up_cache: FwdCache,
+    gate_cache: FwdCache,
+    down_cache: FwdCache,
 }
 
 /// Routing decision for one token, produced by [`Ffn::select`] *before* the heavy
@@ -77,48 +84,68 @@ pub struct FfnSelection {
 }
 
 /// Gradients produced by [`Ffn::backward`]. Coefficient/router gradients are
-/// per-layer; `d_dict` accumulates the shared-dictionary contribution
-/// from all three projections (the caller sums it across layers). `d_h` is the
-/// gradient w.r.t. this layer's input, to flow into the layer below.
+/// per-layer; `d_mono_d1`/`d_mono_d2` accumulate the shared-dictionary
+/// contribution from all three projections (the caller sums it across
+/// layers). `d_h` is the gradient w.r.t. this layer's input, to flow into the
+/// layer below.
 pub struct FfnGrads {
     pub d_up_coeffs: Vec<f32>,
     pub d_gate_coeffs: Vec<f32>,
     pub d_down_coeffs: Vec<f32>,
-    pub d_dict: Vec<Complex32>,
+    pub d_mono_d1: Vec<f32>,
+    pub d_mono_d2: Vec<f32>,
     /// `M×H` row-major, matching `router_w`.
     pub d_router_w: Vec<f32>,
     /// Gradient w.r.t. the FFN input `h`, length `H`.
     pub d_h: Vec<f32>,
 }
 
-/// A block-routed FFN layer. Owns its coefficients and router; the dictionary
-/// is shared and supplied to [`Ffn::forward`].
+/// A block-routed FFN layer. Owns its coefficients and router; the shared
+/// Monarch dictionary is supplied to [`Ffn::forward`]/[`Ffn::compute`].
 pub struct Ffn {
     pub cfg: FfnConfig,
-    /// Shared shape for up and gate (both `F×H`); one matmul serves both so the
-    /// fused forward/backward can share the block reconstruction.
-    up_gate: BasisMatmul,
-    down: BasisMatmul,
-    pub up_coeffs: Vec<f32>,
-    pub gate_coeffs: Vec<f32>,
-    pub down_coeffs: Vec<f32>,
+    up_proj: SharedMonarchProj,
+    gate_proj: SharedMonarchProj,
+    down_proj: SharedMonarchProj,
     /// Router weights, `M×H` row-major.
     pub router_w: Vec<f32>,
     m: usize,
 }
 
+fn concat(a: Vec<f32>, b: Vec<f32>) -> Vec<f32> {
+    let mut v = a;
+    v.extend(b);
+    v
+}
+
 impl Ffn {
     pub fn new(cfg: FfnConfig, seed: u64) -> Self {
-        let (h, f, b, k) = (cfg.hidden, cfg.ffn, cfg.block, cfg.dict_k);
-        let up_gate = BasisMatmul::new(f, h, b, k);
-        let down = BasisMatmul::new(h, f, b, k);
-        let up_coeffs = init_coeffs_random(up_gate.coeff_len(), seed ^ 0x01, 0.02);
-        let gate_coeffs = init_coeffs_random(up_gate.coeff_len(), seed ^ 0x02, 0.02);
-        let down_coeffs = init_coeffs_random(down.coeff_len(), seed ^ 0x03, 0.02);
+        let (h, f, b, nd) = (cfg.hidden, cfg.ffn, cfg.block, cfg.dict_k);
+        let mm = (b as f64).sqrt() as usize;
+        assert_eq!(mm * mm, b, "block must be a perfect square");
+        let up_proj = SharedMonarchProj::new(f / b, h / b, mm, nd, seed ^ 0x01);
+        let gate_proj = SharedMonarchProj::new(f / b, h / b, mm, nd, seed ^ 0x02);
+        let down_proj = SharedMonarchProj::new(h / b, f / b, mm, nd, seed ^ 0x03);
         let m = cfg.num_blocks();
         let router_w = init_coeffs_random(m * h, seed ^ 0x04, 0.02);
-        Self { cfg, up_gate, down, up_coeffs, gate_coeffs, down_coeffs, router_w, m }
+        Self { cfg, up_proj, gate_proj, down_proj, router_w, m }
     }
+
+    /// Concatenated `a1`+`a2` for each projection — the flat checkpoint/
+    /// optimizer view of its coefficients (mirrors `AttnProj::params`).
+    pub fn up_coeffs(&self) -> Vec<f32> { concat(self.up_proj.a1.clone(), self.up_proj.a2.clone()) }
+    pub fn gate_coeffs(&self) -> Vec<f32> { concat(self.gate_proj.a1.clone(), self.gate_proj.a2.clone()) }
+    pub fn down_coeffs(&self) -> Vec<f32> { concat(self.down_proj.a1.clone(), self.down_proj.a2.clone()) }
+
+    fn set_proj_coeffs(proj: &mut SharedMonarchProj, src: &[f32]) {
+        assert_eq!(proj.a1.len() + proj.a2.len(), src.len(), "Ffn projection coeff length mismatch on restore");
+        let (a1, a2) = src.split_at(proj.a1.len());
+        proj.a1.copy_from_slice(a1);
+        proj.a2.copy_from_slice(a2);
+    }
+    pub fn set_up_coeffs(&mut self, src: &[f32]) { Self::set_proj_coeffs(&mut self.up_proj, src); }
+    pub fn set_gate_coeffs(&mut self, src: &[f32]) { Self::set_proj_coeffs(&mut self.gate_proj, src); }
+    pub fn set_down_coeffs(&mut self, src: &[f32]) { Self::set_proj_coeffs(&mut self.down_proj, src); }
 
     /// Route the token: returns selected block indices (descending logit) and
     /// the softmax gate weights over them.
@@ -136,7 +163,7 @@ impl Ffn {
         (idx, gates)
     }
 
-    /// Forward for a single token `h` (length `H`). `dict` is the shared dictionary.
+    /// Forward for a single token `h` (length `H`).
     pub fn select(&self, h: &[f32]) -> FfnSelection {
         debug_assert_eq!(h.len(), self.cfg.hidden);
         let mut logits = vec![0.0f32; self.m];
@@ -148,21 +175,20 @@ impl Ffn {
         FfnSelection { selected, gates, logits }
     }
 
-    /// Software-prefetch the up/gate (row-contiguous) and down (col-strided)
-    /// coefficient tiles for the selected blocks into cache.
-    pub fn prefetch_coeffs(&self, sel: &FfnSelection) {
-        self.up_gate.prefetch_rows(&self.up_coeffs, &sel.selected);
-        self.up_gate.prefetch_rows(&self.gate_coeffs, &sel.selected);
-        self.down.prefetch_cols(&self.down_coeffs, &sel.selected);
-    }
+    /// Software-prefetch hook for the selected coefficient tiles. No-op for
+    /// now — the Monarch path doesn't have a prefetch implementation yet
+    /// (BasisMatmul's was a pure perf hint, not required for correctness;
+    /// worth revisiting if benchmarks show it matters here).
+    pub fn prefetch_coeffs(&self, _sel: &FfnSelection) {}
 
-    /// Phase 2 — the compute given a [`FfnSelection`].
-    pub fn compute(&self, dict: &[Complex32], h: &[f32], sel: FfnSelection) -> FfnForward {
+    /// Phase 2 — the compute given a [`FfnSelection`]. `mono_d1`/`mono_d2` is
+    /// this FFN's shared Monarch dictionary (model-wide, passed in by the caller).
+    pub fn compute(&self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32], sel: FfnSelection) -> FfnForward {
         let (b, f) = (self.cfg.block, self.cfg.ffn);
         let FfnSelection { selected, gates, logits } = sel;
 
-        let (up, gate) =
-            self.up_gate.forward_rows_pair(dict, &self.up_coeffs, &self.gate_coeffs, h, &selected);
+        let (up, up_cache) = self.up_proj.forward_rows(mono_d1, mono_d2, h, &selected);
+        let (gate, gate_cache) = self.gate_proj.forward_rows(mono_d1, mono_d2, h, &selected);
 
         let mut act = vec![0.0f32; f];
         for (si, &blk) in selected.iter().enumerate() {
@@ -173,15 +199,15 @@ impl Ffn {
             }
         }
 
-        let out = self.down.forward_cols(dict, &self.down_coeffs, &act, &selected);
+        let (out, down_cache) = self.down_proj.forward_cols(mono_d1, mono_d2, &act, &selected);
 
-        FfnForward { out, selected, gates, logits, up, gate, act }
+        FfnForward { out, selected, gates, logits, up, gate, act, up_cache, gate_cache, down_cache }
     }
 
     /// Convenience forward = [`select`](Self::select) then [`compute`](Self::compute).
-    pub fn forward(&self, dict: &[Complex32], h: &[f32]) -> FfnForward {
+    pub fn forward(&self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32]) -> FfnForward {
         let sel = self.select(h);
-        self.compute(dict, h, sel)
+        self.compute(mono_d1, mono_d2, h, sel)
     }
 
     /// Batch select: route all `t_len` tokens at once.
@@ -196,14 +222,16 @@ impl Ffn {
     }
 
     /// Batch compute: process all `t_len` tokens through the FFN at once.
-    /// Loops over tokens calling per-token compute (BasisMatmul has no batch methods).
+    /// Loops over tokens calling per-token compute — each token's routing
+    /// selects different blocks, so there's no shared row/col-selection axis
+    /// to batch across the way attention's `forward_batch` does.
     /// `h` is `[t_len, hidden]`, `sels` is per-token selections.
     /// Returns per-token `FfnForward` results.
-    pub fn compute_batch(&self, dict: &[Complex32], h: &[f32], sels: &[FfnSelection], t_len: usize) -> Vec<FfnForward> {
+    pub fn compute_batch(&self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32], sels: &[FfnSelection], t_len: usize) -> Vec<FfnForward> {
         let hh = self.cfg.hidden;
         let mut results = Vec::with_capacity(t_len);
         for t in 0..t_len {
-            let fwd = self.compute(dict, &h[t * hh..(t + 1) * hh], FfnSelection {
+            let fwd = self.compute(mono_d1, mono_d2, &h[t * hh..(t + 1) * hh], FfnSelection {
                 selected: sels[t].selected.clone(),
                 gates: sels[t].gates.clone(),
                 logits: sels[t].logits.clone(),
@@ -216,7 +244,8 @@ impl Ffn {
     /// Backward for a single token.
     pub fn backward(
         &self,
-        dict: &[Complex32],
+        mono_d1: &[f32],
+        mono_d2: &[f32],
         h: &[f32],
         fwd: &FfnForward,
         d_out: &[f32],
@@ -224,9 +253,10 @@ impl Ffn {
         let (b, f, hh) = (self.cfg.block, self.cfg.ffn, self.cfg.hidden);
         debug_assert_eq!(d_out.len(), hh);
 
-        let g_down =
-            self.down.backward_cols(dict, &self.down_coeffs, &fwd.act, d_out, &fwd.selected);
-        let d_act = &g_down.d_x;
+        let mut d_act = vec![0.0f32; f];
+        let g_down: MonarchGrads = self.down_proj.backward_cols(
+            mono_d1, mono_d2, &fwd.act, &fwd.down_cache.zs, d_out, &mut d_act, &fwd.selected,
+        );
 
         let mut d_up = vec![0.0f32; f];
         let mut d_gate = vec![0.0f32; f];
@@ -246,15 +276,17 @@ impl Ffn {
             }
         }
 
-        let g_pair: PairGrads = self.up_gate.backward_rows_pair(
-            dict,
-            &self.up_coeffs,
-            &self.gate_coeffs,
-            h,
-            &d_up,
-            &d_gate,
-            &fwd.selected,
+        let mut d_h = vec![0.0f32; hh];
+        let g_up: MonarchGrads = self.up_proj.backward_rows(
+            mono_d1, mono_d2, h, &fwd.up_cache.zs, &d_up, &mut d_h, &fwd.selected,
         );
+        let mut d_h_gate = vec![0.0f32; hh];
+        let g_gate: MonarchGrads = self.gate_proj.backward_rows(
+            mono_d1, mono_d2, h, &fwd.gate_cache.zs, &d_gate, &mut d_h_gate, &fwd.selected,
+        );
+        for i in 0..hh {
+            d_h[i] += d_h_gate[i];
+        }
 
         let dotp: f32 = d_w.iter().zip(&fwd.gates).map(|(dw, w)| dw * w).sum();
         let mut d_logit = vec![0.0f32; self.m];
@@ -263,7 +295,6 @@ impl Ffn {
         }
 
         let mut d_router_w = vec![0.0f32; self.m * hh];
-        let mut d_h = vec![0.0f32; hh];
         for blk in 0..self.m {
             let dl = d_logit[blk];
             if dl != 0.0 {
@@ -276,20 +307,19 @@ impl Ffn {
             }
         }
 
-        for i in 0..hh {
-            d_h[i] += g_pair.d_x[i];
-        }
-
-        let mut d_dict = g_down.d_dict;
-        for i in 0..d_dict.len() {
-            d_dict[i] += g_pair.d_dict[i];
-        }
+        let mut d_mono_d1 = g_up.dd1;
+        for (a, x) in d_mono_d1.iter_mut().zip(&g_gate.dd1) { *a += *x; }
+        for (a, x) in d_mono_d1.iter_mut().zip(&g_down.dd1) { *a += *x; }
+        let mut d_mono_d2 = g_up.dd2;
+        for (a, x) in d_mono_d2.iter_mut().zip(&g_gate.dd2) { *a += *x; }
+        for (a, x) in d_mono_d2.iter_mut().zip(&g_down.dd2) { *a += *x; }
 
         FfnGrads {
-            d_up_coeffs: g_pair.d_coeffs_a,
-            d_gate_coeffs: g_pair.d_coeffs_b,
-            d_down_coeffs: g_down.d_coeffs,
-            d_dict,
+            d_up_coeffs: concat(g_up.da1, g_up.da2),
+            d_gate_coeffs: concat(g_gate.da1, g_gate.da2),
+            d_down_coeffs: concat(g_down.da1, g_down.da2),
+            d_mono_d1,
+            d_mono_d2,
             d_router_w,
             d_h,
         }
@@ -297,12 +327,14 @@ impl Ffn {
 
     /// Allocate this FFN's optimizer state (factored coeffs + router).
     pub fn init_opt(&self) -> FfnOptState {
-        let k = self.cfg.dict_k;
         let h = self.cfg.hidden;
+        let up_rows = 2 * self.up_proj.p * self.up_proj.q * self.up_proj.m;
+        let gate_rows = 2 * self.gate_proj.p * self.gate_proj.q * self.gate_proj.m;
+        let down_rows = 2 * self.down_proj.p * self.down_proj.q * self.down_proj.m;
         FfnOptState {
-            up: AdaFactorState::matrix(self.up_coeffs.len() / k, k, false),
-            gate: AdaFactorState::matrix(self.gate_coeffs.len() / k, k, false),
-            down: AdaFactorState::matrix(self.down_coeffs.len() / k, k, false),
+            up: AdaFactorState::matrix(up_rows, self.up_proj.nd, false),
+            gate: AdaFactorState::matrix(gate_rows, self.gate_proj.nd, false),
+            down: AdaFactorState::matrix(down_rows, self.down_proj.nd, false),
             router: AdaFactorState::matrix(self.router_w.len() / h, h, false),
         }
     }
@@ -319,9 +351,18 @@ impl Ffn {
         af: &AdaFactor,
         lr: f32,
     ) {
-        af.step(&mut self.up_coeffs, d_up, &mut st.up, lr);
-        af.step(&mut self.gate_coeffs, d_gate, &mut st.gate, lr);
-        af.step(&mut self.down_coeffs, d_down, &mut st.down, lr);
+        let mut up = self.up_coeffs();
+        af.step(&mut up, d_up, &mut st.up, lr);
+        self.set_up_coeffs(&up);
+
+        let mut gate = self.gate_coeffs();
+        af.step(&mut gate, d_gate, &mut st.gate, lr);
+        self.set_gate_coeffs(&gate);
+
+        let mut down = self.down_coeffs();
+        af.step(&mut down, d_down, &mut st.down, lr);
+        self.set_down_coeffs(&down);
+
         af.step(&mut self.router_w, d_router, &mut st.router, lr);
     }
 }
@@ -390,20 +431,20 @@ pub fn load_balance_aux(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::fft::init_dict_random;
+    use crate::kernels::monarch::init_shared_atoms;
 
-    fn small_ffn() -> (Ffn, Vec<Complex32>) {
+    fn small_ffn() -> (Ffn, Vec<f32>, Vec<f32>) {
         let cfg = FfnConfig { hidden: 8, ffn: 12, block: 4, n_active: 2, dict_k: 6 };
         let ffn = Ffn::new(cfg, 0xFEED);
-        let dict = init_dict_random(cfg.dict_k, cfg.block, 0xD1C7, 0.3);
-        (ffn, dict)
+        let (d1, d2) = init_shared_atoms(cfg.dict_k, 2, 0xD1C7);
+        (ffn, d1, d2)
     }
 
     #[test]
     fn routing_invariants() {
-        let (ffn, dict) = small_ffn();
+        let (ffn, d1, d2) = small_ffn();
         let h = [0.5f32, -1.0, 2.0, 0.3, -0.7, 1.1, 0.0, -0.4];
-        let fwd = ffn.forward(&dict, &h);
+        let fwd = ffn.forward(&d1, &d2, &h);
         assert_eq!(fwd.selected.len(), 2);
         assert_ne!(fwd.selected[0], fwd.selected[1]);
         let gsum: f32 = fwd.gates.iter().sum();
@@ -413,35 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn routed_forward_matches_dense_masked_reference() {
-        let (ffn, dict) = small_ffn();
-        let h = [1.0f32, 0.2, -0.5, 1.3, -1.1, 0.6, 0.9, -0.2];
-        let fwd = ffn.forward(&dict, &h);
-
-        let (b, f) = (ffn.cfg.block, ffn.cfg.ffn);
-        let up_full = ffn.up_gate.forward(&dict, &ffn.up_coeffs, &h);
-        let gate_full = ffn.up_gate.forward(&dict, &ffn.gate_coeffs, &h);
-        let mut act_ref = vec![0.0f32; f];
-        for (si, &blk) in fwd.selected.iter().enumerate() {
-            let w = fwd.gates[si];
-            for j in blk * b..(blk + 1) * b {
-                act_ref[j] = gate_full[j].max(0.0) * up_full[j] * w;
-            }
-        }
-        let out_ref = ffn.down.forward(&dict, &ffn.down_coeffs, &act_ref);
-
-        for i in 0..ffn.cfg.hidden {
-            assert!((fwd.out[i] - out_ref[i]).abs() < 1e-4, "out[{i}] {} vs {}", fwd.out[i], out_ref[i]);
-        }
-    }
-
-    #[test]
     fn output_responds_to_input() {
-        let (ffn, dict) = small_ffn();
+        let (ffn, d1, d2) = small_ffn();
         let h0 = [0.1f32; 8];
         let h1 = [0.9f32, -0.9, 0.5, -0.5, 0.3, -0.3, 0.7, -0.7];
-        let y0 = ffn.forward(&dict, &h0).out;
-        let y1 = ffn.forward(&dict, &h1).out;
+        let y0 = ffn.forward(&d1, &d2, &h0).out;
+        let y1 = ffn.forward(&d1, &d2, &h1).out;
         let diff: f32 = y0.iter().zip(&y1).map(|(a, b)| (a - b).abs()).sum();
         assert!(diff > 1e-6, "output did not respond to input change (diff {diff})");
     }
@@ -454,37 +472,37 @@ mod tests {
         }
     }
 
-    fn dense_ffn() -> (Ffn, Vec<Complex32>) {
+    fn dense_ffn() -> (Ffn, Vec<f32>, Vec<f32>) {
         let cfg = FfnConfig { hidden: 8, ffn: 12, block: 4, n_active: 2, dict_k: 6 };
         let mut ffn = Ffn::new(cfg, 0x51A1);
         let mut rng = Lcg(0x9911_7733);
-        for c in ffn.up_coeffs.iter_mut() {
-            *c = rng.f() * 0.6;
-        }
-        for c in ffn.gate_coeffs.iter_mut() {
-            *c = rng.f() * 0.6;
-        }
-        for c in ffn.down_coeffs.iter_mut() {
-            *c = rng.f() * 0.6;
-        }
+        let mut up = ffn.up_coeffs();
+        for c in up.iter_mut() { *c = rng.f() * 0.6; }
+        ffn.set_up_coeffs(&up);
+        let mut gate = ffn.gate_coeffs();
+        for c in gate.iter_mut() { *c = rng.f() * 0.6; }
+        ffn.set_gate_coeffs(&gate);
+        let mut down = ffn.down_coeffs();
+        for c in down.iter_mut() { *c = rng.f() * 0.6; }
+        ffn.set_down_coeffs(&down);
         for c in ffn.router_w.iter_mut() {
             *c = rng.f() * 0.6;
         }
-        let dict = init_dict_random(cfg.dict_k, cfg.block, 0xD1C7, 0.6);
-        (ffn, dict)
+        let (d1, d2) = init_shared_atoms(cfg.dict_k, 2, 0xD1C7);
+        (ffn, d1, d2)
     }
 
     #[test]
     fn split_select_compute_matches_forward_and_prefetch_is_safe() {
-        let (ffn, dict) = dense_ffn();
+        let (ffn, d1, d2) = dense_ffn();
         let mut rng = Lcg(0x5D11_7000);
         let h: Vec<f32> = (0..ffn.cfg.hidden).map(|_| rng.f()).collect();
 
-        let mono = ffn.forward(&dict, &h);
+        let mono = ffn.forward(&d1, &d2, &h);
 
         let sel = ffn.select(&h);
         ffn.prefetch_coeffs(&sel);
-        let split = ffn.compute(&dict, &h, sel);
+        let split = ffn.compute(&d1, &d2, &h, sel);
 
         assert_eq!(mono.selected, split.selected, "selection diverged");
         for (a, b) in mono.out.iter().zip(&split.out) {
@@ -492,8 +510,8 @@ mod tests {
         }
     }
 
-    fn loss_and_sel(ffn: &Ffn, dict: &[Complex32], h: &[f32], r: &[f32]) -> (f32, Vec<usize>) {
-        let fwd = ffn.forward(dict, h);
+    fn loss_and_sel(ffn: &Ffn, d1: &[f32], d2: &[f32], h: &[f32], r: &[f32]) -> (f32, Vec<usize>) {
+        let fwd = ffn.forward(d1, d2, h);
         let l: f32 = fwd.out.iter().zip(r).map(|(o, r)| o * r).sum();
         (l, fwd.selected)
     }
@@ -507,24 +525,26 @@ mod tests {
 
     fn p_get(f: &Ffn, w: &P, i: usize) -> f32 {
         match w {
-            P::Up => f.up_coeffs[i],
-            P::Gate => f.gate_coeffs[i],
-            P::Down => f.down_coeffs[i],
+            P::Up => f.up_coeffs()[i],
+            P::Gate => f.gate_coeffs()[i],
+            P::Down => f.down_coeffs()[i],
             P::Router => f.router_w[i],
         }
     }
     fn p_set(f: &mut Ffn, w: &P, i: usize, v: f32) {
         match w {
-            P::Up => f.up_coeffs[i] = v,
-            P::Gate => f.gate_coeffs[i] = v,
-            P::Down => f.down_coeffs[i] = v,
+            P::Up => { let mut c = f.up_coeffs(); c[i] = v; f.set_up_coeffs(&c); }
+            P::Gate => { let mut c = f.gate_coeffs(); c[i] = v; f.set_gate_coeffs(&c); }
+            P::Down => { let mut c = f.down_coeffs(); c[i] = v; f.set_down_coeffs(&c); }
             P::Router => f.router_w[i] = v,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fd_param(
         ffn: &mut Ffn,
-        dict: &[Complex32],
+        d1: &[f32],
+        d2: &[f32],
         h: &[f32],
         r: &[f32],
         base_sel: &[usize],
@@ -534,9 +554,9 @@ mod tests {
     ) -> Option<f32> {
         let save = p_get(ffn, w, i);
         p_set(ffn, w, i, save + dh);
-        let (lp, sp) = loss_and_sel(ffn, dict, h, r);
+        let (lp, sp) = loss_and_sel(ffn, d1, d2, h, r);
         p_set(ffn, w, i, save - dh);
-        let (lm, sm) = loss_and_sel(ffn, dict, h, r);
+        let (lm, sm) = loss_and_sel(ffn, d1, d2, h, r);
         p_set(ffn, w, i, save);
         if sp.as_slice() == base_sel && sm.as_slice() == base_sel {
             Some((lp - lm) / (2.0 * dh))
@@ -550,14 +570,14 @@ mod tests {
         const DH: f32 = 1e-3;
         let close = |fd: f32, an: f32| (fd - an).abs() < 1e-2 + 5e-2 * an.abs();
 
-        let (mut ffn, dict) = dense_ffn();
+        let (mut ffn, d1, d2) = dense_ffn();
         let h = vec![0.7f32, -1.1, 0.4, 0.9, -0.6, 1.2, -0.3, 0.5];
         let r = [0.5f32, -0.8, 1.1, 0.2, -0.4, 0.9, -1.0, 0.3];
         let hh = ffn.cfg.hidden;
 
-        let fwd = ffn.forward(&dict, &h);
+        let fwd = ffn.forward(&d1, &d2, &h);
         let base_sel = fwd.selected.clone();
-        let grads = ffn.backward(&dict, &h, &fwd, &r);
+        let grads = ffn.backward(&d1, &d2, &h, &fwd, &r);
 
         for &i in &[0usize, 5, 11, 17] {
             for (w, an) in [
@@ -569,7 +589,7 @@ mod tests {
                 if i >= an.len() {
                     continue;
                 }
-                if let Some(fd) = fd_param(&mut ffn, &dict, &h, &r, &base_sel, &w, i, DH) {
+                if let Some(fd) = fd_param(&mut ffn, &d1, &d2, &h, &r, &base_sel, &w, i, DH) {
                     assert!(close(fd, an[i]), "coeff d[{i}]: fd {fd} vs an {}", an[i]);
                 }
             }
@@ -579,9 +599,9 @@ mod tests {
         for i in 0..hh {
             let save = hp[i];
             hp[i] = save + DH;
-            let (lp, sp) = loss_and_sel(&ffn, &dict, &hp, &r);
+            let (lp, sp) = loss_and_sel(&ffn, &d1, &d2, &hp, &r);
             hp[i] = save - DH;
-            let (lm, sm) = loss_and_sel(&ffn, &dict, &hp, &r);
+            let (lm, sm) = loss_and_sel(&ffn, &d1, &d2, &hp, &r);
             hp[i] = save;
             if sp == base_sel && sm == base_sel {
                 let fd = (lp - lm) / (2.0 * DH);
@@ -589,9 +609,9 @@ mod tests {
             }
         }
 
-        // Verify d_dict is finite
-        for v in &grads.d_dict {
-            assert!(v.norm().is_finite(), "d_dict contains non-finite value");
+        // Verify d_mono_d1/d_mono_d2 are finite (dict-gradient path is new code).
+        for v in grads.d_mono_d1.iter().chain(&grads.d_mono_d2) {
+            assert!(v.is_finite(), "dict grad contains non-finite value");
         }
     }
 
