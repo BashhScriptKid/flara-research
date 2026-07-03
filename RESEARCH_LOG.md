@@ -2964,3 +2964,87 @@ core; reduce/reuse the `FwdCache.zs` allocation footprint (flagged by
 Fable, secondary at these shapes per the confirmed profiling — allocation
 overhead measured much smaller than Fable's estimate, ~5% not ~20%, so
 lower priority than initially thought).
+
+---
+
+## 2026-07-04 — Opus review: single-thread audit before parallelizing, then the regression fully closes
+
+Explicit instruction going in: don't reach for multi-core parallelism of
+the attention core until single-threaded waste in the hot path is
+genuinely exhausted, not just "probably fine." Asked Opus to audit
+`monarch.rs`'s two-phase backward/AVX2 kernels, `attn_flash.rs`/
+`attn_swa.rs`, the routed FFN batch paths, and the layer/attn_proj batched
+wrappers specifically for single-thread inefficiency — algorithmic or
+micro-architectural — before recommending parallelization.
+
+Opus's verdict: the big single-thread win (per-token reconstruction,
+per-token dictionary contraction) was already harvested. What was left was
+mostly small, with one exception. Prioritized findings:
+
+1. **`gemm::dot` had no `#[inline]` and re-checked
+   `is_x86_feature_detected!` on every call** — called O(n_q·T²) times on
+   64-element dot products inside the attention core's inner loop, where
+   the call/branch overhead is non-trivial relative to the work itself.
+   Rated "small-to-moderate."
+2. Register-blocking the attention score/`dv` dot products (keeping `qi`
+   resident across the inner `j` loop instead of reloading it) — a real
+   lever, but a new SIMD kernel with correctness risk, orthogonal to
+   parallelism. Deferred, not done.
+3. Per-token `vec![0.0f32; b]` scratch allocation inside the monarch apply
+   closures (`forward_batch`/`forward_rows_batch`/`forward_cols_batch`) —
+   rated negligible (well under 1%), and hoisting it safely under rayon's
+   work-stealing would need thread-local scratch, not worth the
+   complexity for the estimated win. Skipped.
+4. Redundant `h_mid.clone()` in `layer.rs`'s FFN residual write (clone
+   then add-in-place, when a single combined write does the same job in
+   one pass) — rated small.
+
+Opus's explicit final call: single-threaded optimization was close to
+exhausted; attention-core parallelization (embarrassingly parallel over
+query rows, ~89ms/step fully serial, largest remaining single sub-block)
+was the correct next lever — but only *after* grabbing the cheap, safe
+items above, and it explicitly checked the attention algorithm itself
+wasn't wasteful before recommending parallelism by default.
+
+### Landed the two cheap, safe fixes (#1 and #4)
+
+- `#[inline]` on `gemm::dot` (`src/kernels/gemm.rs`).
+- `layer.rs`: replaced `h_mid.clone()` + in-place residual add with a
+  single combined write (`out[j] = h_mid[j] + scale * ffn_out[j]`),
+  dropping one full `T·H` memcpy per layer.
+
+Skipped #2 (real gain, real risk, orthogonal to this pass) and #3
+(negligible, needs thread-local scratch to do safely).
+
+**Result — far larger than either fix looked in isolation.** Measured
+twice for reproducibility (`TRAIN_SMALL_LOD=1 STEPS=20 WARMUP=5 SEQ=256
+./target/release/profile`, LTO release binary): total step time
+**364ms → ~264-270ms/step (28% reduction)**. The `dot()` inlining was the
+real story — attention's inner loops call it O(T²) times per step, and the
+call + feature-detection overhead on a 64-element dot dominated the actual
+FMA work at this shape. Committed as `4fdd016`.
+
+### The regression is now fully closed and reversed
+
+`profile.rs`'s `TRAIN_SMALL_LOD=1` mode already *is* a real end-to-end
+forward+backward+optimizer step on the exact `train_small_lod` shape with
+real (synthetic) data — no need to reconstruct a separate `bench_efficiency.rs`
+throwaway. Wall-clock: **269.67ms/step**, vs. the pre-swap BasisMatmul
+baseline of **306.5ms/step**. The Swap-to-Monarch move — which regressed
+to 420ms/step immediately after landing — is now **~12% faster than the
+original pre-swap baseline**, not slower.
+
+**Decision point, asked explicitly:** proceed with attention-core
+parallelization now (a pure additional win, no longer closing a
+regression), or stop here. User chose to stop here — the accessibility and
+efficiency goals that motivated this entire multi-session effort are met,
+and further parallelization work is deferred as an explicitly flagged,
+not-yet-started future lever rather than continued speculatively.
+
+**Status:** the post-swap regression is closed and reversed end-to-end.
+Remaining known levers, flagged but explicitly deferred, not started:
+parallelize the attention core (~89ms/step serial, embarrassingly
+parallel over query rows per Opus); register-block the attention
+score/`dv` dot products; evaluate the frozen-dictionary experiment for
+training-quality impact (2x additional backward speedup measured, not yet
+adopted — separate training decision from this performance thread).
