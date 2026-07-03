@@ -1171,6 +1171,257 @@ impl SharedMonarchProj {
         g
     }
 
+    /// Batched, hoisted `forward_rows`: every `(pp,qq)` block is reconstructed
+    /// once (dense — see `expand_all_blocks`; with per-token routing, the
+    /// union of blocks touched across a real-sized batch typically covers
+    /// most/all of `P` anyway, so reconstructing everything up front is
+    /// simpler than tracking a per-batch active set and is not meaningfully
+    /// more work), then applied per token restricted to that token's own
+    /// `active_p[t]` — the routing skip is preserved exactly, only the
+    /// reconstruction is shared. `x` is `[n_tokens, in_dim]`; `active_p` has
+    /// one entry per token.
+    pub fn forward_rows_batch(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], active_p: &[Vec<usize>], n_tokens: usize,
+    ) -> (Vec<f32>, FwdCache) {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        let in_dim = q * b;
+        let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+
+        let mut y  = vec![0.0f32; n_tokens * p * b];
+        let mut zs = vec![0.0f32; n_tokens * p * q * b];
+
+        let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [f32]| {
+            let x_t = &x[t * in_dim..(t + 1) * in_dim];
+            let mut y1 = vec![0.0f32; b];
+            for &pp in &active_p[t] {
+                debug_assert!(pp < p, "active row-block {pp} out of range");
+                let ypp = &mut y_t[pp * b..(pp + 1) * b];
+                for qq in 0..q {
+                    let idx = pp * q + qq;
+                    let z = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                    SharedMonarchMatmul::apply_block(
+                        &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
+                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, z, ypp,
+                    );
+                }
+            }
+        };
+
+        if n_tokens < Self::PARALLEL_THRESHOLD {
+            for (t, (y_t, zs_t)) in y.chunks_mut(p * b).zip(zs.chunks_mut(p * q * b)).enumerate() {
+                apply_token(t, y_t, zs_t);
+            }
+        } else {
+            use rayon::prelude::*;
+            y.par_chunks_mut(p * b).zip(zs.par_chunks_mut(p * q * b)).enumerate()
+                .for_each(|(t, (y_t, zs_t))| apply_token(t, y_t, zs_t));
+        }
+        (y, FwdCache { zs })
+    }
+
+    /// Batched, hoisted `forward_cols` — same hoist as `forward_rows_batch`,
+    /// restricting the *input* col-blocks per token instead of the output
+    /// row-blocks (for the routed `W_down` projection, whose input is exactly
+    /// zero outside the routed blocks).
+    pub fn forward_cols_batch(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], active_q: &[Vec<usize>], n_tokens: usize,
+    ) -> (Vec<f32>, FwdCache) {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        let in_dim = q * b;
+        let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+
+        let mut y  = vec![0.0f32; n_tokens * p * b];
+        let mut zs = vec![0.0f32; n_tokens * p * q * b];
+
+        let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [f32]| {
+            let x_t = &x[t * in_dim..(t + 1) * in_dim];
+            let mut y1 = vec![0.0f32; b];
+            for pp in 0..p {
+                let ypp = &mut y_t[pp * b..(pp + 1) * b];
+                for &qq in &active_q[t] {
+                    debug_assert!(qq < q, "active col-block {qq} out of range");
+                    let idx = pp * q + qq;
+                    let z = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                    SharedMonarchMatmul::apply_block(
+                        &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
+                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, z, ypp,
+                    );
+                }
+            }
+        };
+
+        if n_tokens < Self::PARALLEL_THRESHOLD {
+            for (t, (y_t, zs_t)) in y.chunks_mut(p * b).zip(zs.chunks_mut(p * q * b)).enumerate() {
+                apply_token(t, y_t, zs_t);
+            }
+        } else {
+            use rayon::prelude::*;
+            y.par_chunks_mut(p * b).zip(zs.par_chunks_mut(p * q * b)).enumerate()
+                .for_each(|(t, (y_t, zs_t))| apply_token(t, y_t, zs_t));
+        }
+        (y, FwdCache { zs })
+    }
+
+    /// Batched, hoisted `backward_rows` — token-chunked parallelism (see
+    /// `backward_batch`), restricted per token to `active_p[t]`. `dx` is
+    /// `[n_tokens, in_dim]`, zeroed here.
+    pub fn backward_rows_batch(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32],
+        active_p: &[Vec<usize>], n_tokens: usize,
+    ) -> Grads {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        let in_dim = q * b;
+        let out_dim = p * b;
+        dx.iter_mut().for_each(|v| *v = 0.0);
+        let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+
+        let run_range = |t0: usize, t1: usize, dd1: &mut [f32], dd2: &mut [f32], da1: &mut [f32], da2: &mut [f32], dx_out: &mut [f32]| {
+            let mut dz  = vec![0.0f32; b];
+            let mut dy1 = vec![0.0f32; b];
+            for t in t0..t1 {
+                let dout_t = &dout[t * out_dim..(t + 1) * out_dim];
+                for &pp in &active_p[t] {
+                    debug_assert!(pp < p, "active row-block {pp} out of range");
+                    let dout_pp = &dout_t[pp * b..(pp + 1) * b];
+                    for qq in 0..q {
+                        let idx = pp * q + qq;
+                        let eff1 = &eff1_all[idx * m * b..(idx + 1) * m * b];
+                        let eff2 = &eff2_all[idx * m * b..(idx + 1) * m * b];
+                        let x_blk = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
+                        let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
+                        let da_base = idx * m * nd;
+                        SharedMonarchMatmul::backward_block_hoisted(
+                            d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq),
+                            eff1, eff2, x_blk, z, dout_pp, dx_blk,
+                            m, nd, da_base, da1, da2, dd1, dd2, &mut dz, &mut dy1,
+                        );
+                    }
+                }
+            }
+        };
+
+        if n_tokens < Self::PARALLEL_THRESHOLD {
+            let mut g = Grads {
+                dd1: vec![0.0f32; nd * b], dd2: vec![0.0f32; nd * b],
+                da1: vec![0.0f32; p * q * m * nd], da2: vec![0.0f32; p * q * m * nd],
+            };
+            let mut dx_full = vec![0.0f32; n_tokens * in_dim];
+            run_range(0, n_tokens, &mut g.dd1, &mut g.dd2, &mut g.da1, &mut g.da2, &mut dx_full);
+            dx.copy_from_slice(&dx_full);
+            return g;
+        }
+
+        use rayon::prelude::*;
+        let n_chunks = rayon::current_num_threads().max(1).min(n_tokens);
+        let chunk_len = n_tokens.div_ceil(n_chunks);
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
+            (0..n_chunks).into_par_iter().map(|c| {
+                let t0 = c * chunk_len;
+                let t1 = ((c + 1) * chunk_len).min(n_tokens);
+                let mut dd1 = vec![0.0f32; nd * b];
+                let mut dd2 = vec![0.0f32; nd * b];
+                let mut da1 = vec![0.0f32; p * q * m * nd];
+                let mut da2 = vec![0.0f32; p * q * m * nd];
+                let mut dx_chunk = vec![0.0f32; t1.saturating_sub(t0) * in_dim];
+                run_range(t0, t1, &mut dd1, &mut dd2, &mut da1, &mut da2, &mut dx_chunk);
+                (dd1, dd2, da1, da2, dx_chunk, t0, t1)
+            }).collect();
+
+        let mut g = Grads {
+            dd1: vec![0.0f32; nd * b], dd2: vec![0.0f32; nd * b],
+            da1: vec![0.0f32; p * q * m * nd], da2: vec![0.0f32; p * q * m * nd],
+        };
+        for (dd1, dd2, da1, da2, dx_chunk, t0, t1) in results {
+            for i in 0..nd * b { g.dd1[i] += dd1[i]; g.dd2[i] += dd2[i]; }
+            for i in 0..g.da1.len() { g.da1[i] += da1[i]; g.da2[i] += da2[i]; }
+            dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
+        }
+        g
+    }
+
+    /// Batched, hoisted `backward_cols` — mirrors `backward_rows_batch`,
+    /// restricting the *input* col-blocks per token instead of the output
+    /// row-blocks. Every output block contributes gradient (not restricted).
+    pub fn backward_cols_batch(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32],
+        active_q: &[Vec<usize>], n_tokens: usize,
+    ) -> Grads {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        let in_dim = q * b;
+        let out_dim = p * b;
+        dx.iter_mut().for_each(|v| *v = 0.0);
+        let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+
+        let run_range = |t0: usize, t1: usize, dd1: &mut [f32], dd2: &mut [f32], da1: &mut [f32], da2: &mut [f32], dx_out: &mut [f32]| {
+            let mut dz  = vec![0.0f32; b];
+            let mut dy1 = vec![0.0f32; b];
+            for t in t0..t1 {
+                let dout_t = &dout[t * out_dim..(t + 1) * out_dim];
+                for pp in 0..p {
+                    let dout_pp = &dout_t[pp * b..(pp + 1) * b];
+                    for &qq in &active_q[t] {
+                        debug_assert!(qq < q, "active col-block {qq} out of range");
+                        let idx = pp * q + qq;
+                        let eff1 = &eff1_all[idx * m * b..(idx + 1) * m * b];
+                        let eff2 = &eff2_all[idx * m * b..(idx + 1) * m * b];
+                        let x_blk = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
+                        let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
+                        let da_base = idx * m * nd;
+                        SharedMonarchMatmul::backward_block_hoisted(
+                            d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq),
+                            eff1, eff2, x_blk, z, dout_pp, dx_blk,
+                            m, nd, da_base, da1, da2, dd1, dd2, &mut dz, &mut dy1,
+                        );
+                    }
+                }
+            }
+        };
+
+        if n_tokens < Self::PARALLEL_THRESHOLD {
+            let mut g = Grads {
+                dd1: vec![0.0f32; nd * b], dd2: vec![0.0f32; nd * b],
+                da1: vec![0.0f32; p * q * m * nd], da2: vec![0.0f32; p * q * m * nd],
+            };
+            let mut dx_full = vec![0.0f32; n_tokens * in_dim];
+            run_range(0, n_tokens, &mut g.dd1, &mut g.dd2, &mut g.da1, &mut g.da2, &mut dx_full);
+            dx.copy_from_slice(&dx_full);
+            return g;
+        }
+
+        use rayon::prelude::*;
+        let n_chunks = rayon::current_num_threads().max(1).min(n_tokens);
+        let chunk_len = n_tokens.div_ceil(n_chunks);
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
+            (0..n_chunks).into_par_iter().map(|c| {
+                let t0 = c * chunk_len;
+                let t1 = ((c + 1) * chunk_len).min(n_tokens);
+                let mut dd1 = vec![0.0f32; nd * b];
+                let mut dd2 = vec![0.0f32; nd * b];
+                let mut da1 = vec![0.0f32; p * q * m * nd];
+                let mut da2 = vec![0.0f32; p * q * m * nd];
+                let mut dx_chunk = vec![0.0f32; t1.saturating_sub(t0) * in_dim];
+                run_range(t0, t1, &mut dd1, &mut dd2, &mut da1, &mut da2, &mut dx_chunk);
+                (dd1, dd2, da1, da2, dx_chunk, t0, t1)
+            }).collect();
+
+        let mut g = Grads {
+            dd1: vec![0.0f32; nd * b], dd2: vec![0.0f32; nd * b],
+            da1: vec![0.0f32; p * q * m * nd], da2: vec![0.0f32; p * q * m * nd],
+        };
+        for (dd1, dd2, da1, da2, dx_chunk, t0, t1) in results {
+            for i in 0..nd * b { g.dd1[i] += dd1[i]; g.dd2[i] += dd2[i]; }
+            for i in 0..g.da1.len() { g.da1[i] += da1[i]; g.da2[i] += da2[i]; }
+            dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
+        }
+        g
+    }
+
     /// Shared per-(pp,qq)-block backward step, factored out of `backward` so
     /// `backward_rows`/`backward_cols` can reuse it over a restricted loop
     /// without duplicating the AVX2/scalar dispatch.
@@ -1965,5 +2216,79 @@ mod tests {
         // p=10 exercises the rayon-parallel branch.
         backward_batch_matches_summed_looped_backward_at(3, 2);
         backward_batch_matches_summed_looped_backward_at(10, 2);
+    }
+
+    #[test]
+    fn routed_batch_matches_looped_forward_rows_and_cols() {
+        // Ffn's up/gate projections use forward_rows/backward_rows (output
+        // routed); down uses forward_cols/backward_cols (input routed). Each
+        // token gets a genuinely different active set (mimicking real
+        // per-token routing) — proves the *_batch variants' shared dense
+        // reconstruction doesn't corrupt the per-token restriction.
+        let (p, q, m, nd) = (6, 3, 8, 4);
+        let (d1, d2) = init_shared_atoms(nd, m, 0xD1CE);
+        let proj = SharedMonarchProj::new(p, q, m, nd, 0xFACE);
+        let b = m * m;
+        let in_dim = q * b;
+        let out_dim = p * b;
+        let n_tokens = 7;
+        let n_active = 2;
+
+        let x: Vec<f32> = randvec(n_tokens * in_dim, 0x1111);
+        let dout: Vec<f32> = randvec(n_tokens * out_dim, 0x2222);
+        // Deterministic but token-varying "routing".
+        let active_p: Vec<Vec<usize>> = (0..n_tokens).map(|t| {
+            (0..n_active).map(|k| (t * 3 + k * 5) % p).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+        }).collect();
+
+        let (y_batch, cache_batch) = proj.forward_rows_batch(&d1, &d2, &x, &active_p, n_tokens);
+        let mut dx_batch = vec![0.0f32; n_tokens * in_dim];
+        let g_batch = proj.backward_rows_batch(&d1, &d2, &x, &cache_batch.zs, &dout, &mut dx_batch, &active_p, n_tokens);
+
+        let mut g_looped_da1 = vec![0.0f32; p * q * m * nd];
+        let mut g_looped_da2 = vec![0.0f32; p * q * m * nd];
+        for t in 0..n_tokens {
+            let x_t = &x[t * in_dim..(t + 1) * in_dim];
+            let dout_t = &dout[t * out_dim..(t + 1) * out_dim];
+            let (y_t, cache_t) = proj.forward_rows(&d1, &d2, x_t, &active_p[t]);
+            for i in 0..out_dim {
+                let got = y_batch[t * out_dim + i];
+                assert!((got - y_t[i]).abs() < 1e-5, "token {t} y[{i}]: batch={got} looped={}", y_t[i]);
+            }
+            let mut dx_t = vec![0.0f32; in_dim];
+            let g_t = proj.backward_rows(&d1, &d2, x_t, &cache_t.zs, dout_t, &mut dx_t, &active_p[t]);
+            for i in 0..in_dim {
+                let got = dx_batch[t * in_dim + i];
+                assert!((got - dx_t[i]).abs() < 1e-5, "token {t} dx[{i}]: batch={got} looped={}", dx_t[i]);
+            }
+            for i in 0..g_t.da1.len() { g_looped_da1[i] += g_t.da1[i]; g_looped_da2[i] += g_t.da2[i]; }
+        }
+        for i in 0..g_batch.da1.len() {
+            assert!((g_batch.da1[i] - g_looped_da1[i]).abs() < 1e-4, "da1[{i}]: batch={} looped={}", g_batch.da1[i], g_looped_da1[i]);
+            assert!((g_batch.da2[i] - g_looped_da2[i]).abs() < 1e-4, "da2[{i}]: batch={} looped={}", g_batch.da2[i], g_looped_da2[i]);
+        }
+
+        // Same, for the cols (input-routed, down-proj) variant.
+        let active_q: Vec<Vec<usize>> = (0..n_tokens).map(|t| {
+            (0..n_active).map(|k| (t * 2 + k * 7) % q).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+        }).collect();
+        let (y_batch, cache_batch) = proj.forward_cols_batch(&d1, &d2, &x, &active_q, n_tokens);
+        let mut dx_batch = vec![0.0f32; n_tokens * in_dim];
+        let g_batch = proj.backward_cols_batch(&d1, &d2, &x, &cache_batch.zs, &dout, &mut dx_batch, &active_q, n_tokens);
+        for t in 0..n_tokens {
+            let x_t = &x[t * in_dim..(t + 1) * in_dim];
+            let dout_t = &dout[t * out_dim..(t + 1) * out_dim];
+            let (y_t, cache_t) = proj.forward_cols(&d1, &d2, x_t, &active_q[t]);
+            for i in 0..out_dim {
+                let got = y_batch[t * out_dim + i];
+                assert!((got - y_t[i]).abs() < 1e-5, "cols token {t} y[{i}]: batch={got} looped={}", y_t[i]);
+            }
+            let mut dx_t = vec![0.0f32; in_dim];
+            let g_t = proj.backward_cols(&d1, &d2, x_t, &cache_t.zs, dout_t, &mut dx_t, &active_q[t]);
+            for i in 0..in_dim {
+                let got = dx_batch[t * in_dim + i];
+                assert!((got - dx_t[i]).abs() < 1e-5, "cols token {t} dx[{i}]: batch={got} looped={}", dx_t[i]);
+            }
+        }
     }
 }
