@@ -9,4 +9,5 @@ pub mod gemm;
 pub mod norm;
 pub mod optimizer;
 pub mod probe;
+pub mod profiling;
 pub mod rope;

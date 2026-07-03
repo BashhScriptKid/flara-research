@@ -858,6 +858,13 @@ impl SharedMonarchProj {
     /// block, a per-token partial would mean `n_tokens` full-sized copies;
     /// chunking to `num_threads` keeps that bounded). `dx` is
     /// `[n_tokens, in_dim]` and is zeroed here.
+    /// Two-phase batched backward (see RESEARCH_LOG.md 2026-07-03, Fable
+    /// review + implementation): phase 1 accumulates each block's `s1`/`s2`
+    /// outer-product sums across every token in the batch (cheap — no `nd`
+    /// dependence); phase 2 contracts each block with the dictionary exactly
+    /// once (was: once per token). Same math as the old per-token
+    /// `backward_block_hoisted` loop, reassociated — see
+    /// `phase1_plus_contract_matches_backward_block_hoisted`.
     pub fn backward_batch(
         &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32], n_tokens: usize,
     ) -> Grads {
@@ -868,13 +875,9 @@ impl SharedMonarchProj {
         dx.iter_mut().for_each(|v| *v = 0.0);
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
-        // Accumulates gradients for tokens `t0..t1` into freshly-zeroed
-        // `dd1`/`dd2`/`da1`/`da2` and `dx_out` (sized to just this range,
-        // `[t1-t0, in_dim]`) — shared by both the sequential and
-        // rayon-chunked callers below.
-        let run_range = |t0: usize, t1: usize, dd1: &mut [f32], dd2: &mut [f32], da1: &mut [f32], da2: &mut [f32], dx_out: &mut [f32]| {
-            let mut dz  = vec![0.0f32; b];
-            let mut dy1 = vec![0.0f32; b];
+        // Phase 1: accumulate s1/s2 (p*q*m*b each) and dx for tokens t0..t1
+        // — shared by both the sequential and rayon-chunked callers below.
+        let run_range = |t0: usize, t1: usize, s1: &mut [f32], s2: &mut [f32], dx_out: &mut [f32]| {
             for t in t0..t1 {
                 for pp in 0..p {
                     let dout_pp = &dout[t * out_dim + pp * b..t * out_dim + (pp + 1) * b];
@@ -885,58 +888,44 @@ impl SharedMonarchProj {
                         let x_blk = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
                         let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
                         let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
-                        let da_base = idx * m * nd;
-                        SharedMonarchMatmul::backward_block_hoisted(
-                            d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq),
-                            eff1, eff2, x_blk, z, dout_pp, dx_blk,
-                            m, nd, da_base, da1, da2, dd1, dd2, &mut dz, &mut dy1,
-                        );
+                        let s1_blk = &mut s1[idx * m * b..(idx + 1) * m * b];
+                        let s2_blk = &mut s2[idx * m * b..(idx + 1) * m * b];
+                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, z, dout_pp, dx_blk, m, s1_blk, s2_blk);
                     }
                 }
             }
         };
 
         if n_tokens < Self::PARALLEL_THRESHOLD {
-            let mut g = Grads {
-                dd1: vec![0.0f32; nd * b],
-                dd2: vec![0.0f32; nd * b],
-                da1: vec![0.0f32; p * q * m * nd],
-                da2: vec![0.0f32; p * q * m * nd],
-            };
+            let mut s1 = vec![0.0f32; p * q * m * b];
+            let mut s2 = vec![0.0f32; p * q * m * b];
             let mut dx_full = vec![0.0f32; n_tokens * in_dim];
-            run_range(0, n_tokens, &mut g.dd1, &mut g.dd2, &mut g.da1, &mut g.da2, &mut dx_full);
+            run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
             dx.copy_from_slice(&dx_full);
-            return g;
+            return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
         }
 
         use rayon::prelude::*;
         let n_chunks = rayon::current_num_threads().max(1).min(n_tokens);
         let chunk_len = n_tokens.div_ceil(n_chunks);
-        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
             (0..n_chunks).into_par_iter().map(|c| {
                 let t0 = c * chunk_len;
                 let t1 = ((c + 1) * chunk_len).min(n_tokens);
-                let mut dd1 = vec![0.0f32; nd * b];
-                let mut dd2 = vec![0.0f32; nd * b];
-                let mut da1 = vec![0.0f32; p * q * m * nd];
-                let mut da2 = vec![0.0f32; p * q * m * nd];
+                let mut s1 = vec![0.0f32; p * q * m * b];
+                let mut s2 = vec![0.0f32; p * q * m * b];
                 let mut dx_chunk = vec![0.0f32; t1.saturating_sub(t0) * in_dim];
-                run_range(t0, t1, &mut dd1, &mut dd2, &mut da1, &mut da2, &mut dx_chunk);
-                (dd1, dd2, da1, da2, dx_chunk, t0, t1)
+                run_range(t0, t1, &mut s1, &mut s2, &mut dx_chunk);
+                (s1, s2, dx_chunk, t0, t1)
             }).collect();
 
-        let mut g = Grads {
-            dd1: vec![0.0f32; nd * b],
-            dd2: vec![0.0f32; nd * b],
-            da1: vec![0.0f32; p * q * m * nd],
-            da2: vec![0.0f32; p * q * m * nd],
-        };
-        for (dd1, dd2, da1, da2, dx_chunk, t0, t1) in results {
-            for i in 0..nd * b { g.dd1[i] += dd1[i]; g.dd2[i] += dd2[i]; }
-            for i in 0..g.da1.len() { g.da1[i] += da1[i]; g.da2[i] += da2[i]; }
+        let mut s1_all = vec![0.0f32; p * q * m * b];
+        let mut s2_all = vec![0.0f32; p * q * m * b];
+        for (s1, s2, dx_chunk, t0, t1) in results {
+            for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
-        g
+        SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
     }
 
     /// Slice a single token's `zs` out of a batched `forward_batch` cache (or
@@ -1267,6 +1256,9 @@ impl SharedMonarchProj {
     /// Batched, hoisted `backward_rows` — token-chunked parallelism (see
     /// `backward_batch`), restricted per token to `active_p[t]`. `dx` is
     /// `[n_tokens, in_dim]`, zeroed here.
+    /// Two-phase batched `backward_rows` — same restructuring as
+    /// `backward_batch` (accumulate `s1`/`s2` across the batch, contract once
+    /// per block afterward), restricted per token to `active_p[t]`.
     pub fn backward_rows_batch(
         &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32],
         active_p: &[Vec<usize>], n_tokens: usize,
@@ -1278,9 +1270,7 @@ impl SharedMonarchProj {
         dx.iter_mut().for_each(|v| *v = 0.0);
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
-        let run_range = |t0: usize, t1: usize, dd1: &mut [f32], dd2: &mut [f32], da1: &mut [f32], da2: &mut [f32], dx_out: &mut [f32]| {
-            let mut dz  = vec![0.0f32; b];
-            let mut dy1 = vec![0.0f32; b];
+        let run_range = |t0: usize, t1: usize, s1: &mut [f32], s2: &mut [f32], dx_out: &mut [f32]| {
             for t in t0..t1 {
                 let dout_t = &dout[t * out_dim..(t + 1) * out_dim];
                 for &pp in &active_p[t] {
@@ -1293,57 +1283,47 @@ impl SharedMonarchProj {
                         let x_blk = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
                         let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
                         let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
-                        let da_base = idx * m * nd;
-                        SharedMonarchMatmul::backward_block_hoisted(
-                            d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq),
-                            eff1, eff2, x_blk, z, dout_pp, dx_blk,
-                            m, nd, da_base, da1, da2, dd1, dd2, &mut dz, &mut dy1,
-                        );
+                        let s1_blk = &mut s1[idx * m * b..(idx + 1) * m * b];
+                        let s2_blk = &mut s2[idx * m * b..(idx + 1) * m * b];
+                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, z, dout_pp, dx_blk, m, s1_blk, s2_blk);
                     }
                 }
             }
         };
 
         if n_tokens < Self::PARALLEL_THRESHOLD {
-            let mut g = Grads {
-                dd1: vec![0.0f32; nd * b], dd2: vec![0.0f32; nd * b],
-                da1: vec![0.0f32; p * q * m * nd], da2: vec![0.0f32; p * q * m * nd],
-            };
+            let mut s1 = vec![0.0f32; p * q * m * b];
+            let mut s2 = vec![0.0f32; p * q * m * b];
             let mut dx_full = vec![0.0f32; n_tokens * in_dim];
-            run_range(0, n_tokens, &mut g.dd1, &mut g.dd2, &mut g.da1, &mut g.da2, &mut dx_full);
+            run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
             dx.copy_from_slice(&dx_full);
-            return g;
+            return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
         }
 
         use rayon::prelude::*;
         let n_chunks = rayon::current_num_threads().max(1).min(n_tokens);
         let chunk_len = n_tokens.div_ceil(n_chunks);
-        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
             (0..n_chunks).into_par_iter().map(|c| {
                 let t0 = c * chunk_len;
                 let t1 = ((c + 1) * chunk_len).min(n_tokens);
-                let mut dd1 = vec![0.0f32; nd * b];
-                let mut dd2 = vec![0.0f32; nd * b];
-                let mut da1 = vec![0.0f32; p * q * m * nd];
-                let mut da2 = vec![0.0f32; p * q * m * nd];
+                let mut s1 = vec![0.0f32; p * q * m * b];
+                let mut s2 = vec![0.0f32; p * q * m * b];
                 let mut dx_chunk = vec![0.0f32; t1.saturating_sub(t0) * in_dim];
-                run_range(t0, t1, &mut dd1, &mut dd2, &mut da1, &mut da2, &mut dx_chunk);
-                (dd1, dd2, da1, da2, dx_chunk, t0, t1)
+                run_range(t0, t1, &mut s1, &mut s2, &mut dx_chunk);
+                (s1, s2, dx_chunk, t0, t1)
             }).collect();
 
-        let mut g = Grads {
-            dd1: vec![0.0f32; nd * b], dd2: vec![0.0f32; nd * b],
-            da1: vec![0.0f32; p * q * m * nd], da2: vec![0.0f32; p * q * m * nd],
-        };
-        for (dd1, dd2, da1, da2, dx_chunk, t0, t1) in results {
-            for i in 0..nd * b { g.dd1[i] += dd1[i]; g.dd2[i] += dd2[i]; }
-            for i in 0..g.da1.len() { g.da1[i] += da1[i]; g.da2[i] += da2[i]; }
+        let mut s1_all = vec![0.0f32; p * q * m * b];
+        let mut s2_all = vec![0.0f32; p * q * m * b];
+        for (s1, s2, dx_chunk, t0, t1) in results {
+            for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
-        g
+        SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
     }
 
-    /// Batched, hoisted `backward_cols` — mirrors `backward_rows_batch`,
+    /// Two-phase batched `backward_cols` — mirrors `backward_rows_batch`,
     /// restricting the *input* col-blocks per token instead of the output
     /// row-blocks. Every output block contributes gradient (not restricted).
     pub fn backward_cols_batch(
@@ -1357,9 +1337,7 @@ impl SharedMonarchProj {
         dx.iter_mut().for_each(|v| *v = 0.0);
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
-        let run_range = |t0: usize, t1: usize, dd1: &mut [f32], dd2: &mut [f32], da1: &mut [f32], da2: &mut [f32], dx_out: &mut [f32]| {
-            let mut dz  = vec![0.0f32; b];
-            let mut dy1 = vec![0.0f32; b];
+        let run_range = |t0: usize, t1: usize, s1: &mut [f32], s2: &mut [f32], dx_out: &mut [f32]| {
             for t in t0..t1 {
                 let dout_t = &dout[t * out_dim..(t + 1) * out_dim];
                 for pp in 0..p {
@@ -1372,54 +1350,44 @@ impl SharedMonarchProj {
                         let x_blk = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
                         let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
                         let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
-                        let da_base = idx * m * nd;
-                        SharedMonarchMatmul::backward_block_hoisted(
-                            d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq),
-                            eff1, eff2, x_blk, z, dout_pp, dx_blk,
-                            m, nd, da_base, da1, da2, dd1, dd2, &mut dz, &mut dy1,
-                        );
+                        let s1_blk = &mut s1[idx * m * b..(idx + 1) * m * b];
+                        let s2_blk = &mut s2[idx * m * b..(idx + 1) * m * b];
+                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, z, dout_pp, dx_blk, m, s1_blk, s2_blk);
                     }
                 }
             }
         };
 
         if n_tokens < Self::PARALLEL_THRESHOLD {
-            let mut g = Grads {
-                dd1: vec![0.0f32; nd * b], dd2: vec![0.0f32; nd * b],
-                da1: vec![0.0f32; p * q * m * nd], da2: vec![0.0f32; p * q * m * nd],
-            };
+            let mut s1 = vec![0.0f32; p * q * m * b];
+            let mut s2 = vec![0.0f32; p * q * m * b];
             let mut dx_full = vec![0.0f32; n_tokens * in_dim];
-            run_range(0, n_tokens, &mut g.dd1, &mut g.dd2, &mut g.da1, &mut g.da2, &mut dx_full);
+            run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
             dx.copy_from_slice(&dx_full);
-            return g;
+            return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
         }
 
         use rayon::prelude::*;
         let n_chunks = rayon::current_num_threads().max(1).min(n_tokens);
         let chunk_len = n_tokens.div_ceil(n_chunks);
-        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
             (0..n_chunks).into_par_iter().map(|c| {
                 let t0 = c * chunk_len;
                 let t1 = ((c + 1) * chunk_len).min(n_tokens);
-                let mut dd1 = vec![0.0f32; nd * b];
-                let mut dd2 = vec![0.0f32; nd * b];
-                let mut da1 = vec![0.0f32; p * q * m * nd];
-                let mut da2 = vec![0.0f32; p * q * m * nd];
+                let mut s1 = vec![0.0f32; p * q * m * b];
+                let mut s2 = vec![0.0f32; p * q * m * b];
                 let mut dx_chunk = vec![0.0f32; t1.saturating_sub(t0) * in_dim];
-                run_range(t0, t1, &mut dd1, &mut dd2, &mut da1, &mut da2, &mut dx_chunk);
-                (dd1, dd2, da1, da2, dx_chunk, t0, t1)
+                run_range(t0, t1, &mut s1, &mut s2, &mut dx_chunk);
+                (s1, s2, dx_chunk, t0, t1)
             }).collect();
 
-        let mut g = Grads {
-            dd1: vec![0.0f32; nd * b], dd2: vec![0.0f32; nd * b],
-            da1: vec![0.0f32; p * q * m * nd], da2: vec![0.0f32; p * q * m * nd],
-        };
-        for (dd1, dd2, da1, da2, dx_chunk, t0, t1) in results {
-            for i in 0..nd * b { g.dd1[i] += dd1[i]; g.dd2[i] += dd2[i]; }
-            for i in 0..g.da1.len() { g.da1[i] += da1[i]; g.da2[i] += da2[i]; }
+        let mut s1_all = vec![0.0f32; p * q * m * b];
+        let mut s2_all = vec![0.0f32; p * q * m * b];
+        for (s1, s2, dx_chunk, t0, t1) in results {
+            for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
-        g
+        SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
     }
 
     /// Shared per-(pp,qq)-block backward step, factored out of `backward` so
@@ -1665,6 +1633,219 @@ impl SharedMonarchMatmul {
                 }
                 let dx_i = &mut dx_blk[i * m..(i + 1) * m];
                 for c in 0..m { dx_i[c] += d_y * eff_i[r * m + c]; }
+            }
+        }
+    }
+
+    /// Phase 1 of the two-phase batched backward (see RESEARCH_LOG.md
+    /// 2026-07-03, Fable review — "attack backward, not forward"): computes
+    /// `dz`/`dx` exactly as `backward_block_hoisted` does (cheap, uses the
+    /// precomputed `eff`), but instead of contracting with the dictionary
+    /// per token (the `nd`-scaled cost that dominated backward), accumulates
+    /// the per-block outer products `s1 += Σ dy1_i ⊗ x_i`, `s2 += Σ dout_j ⊗
+    /// z_j` into caller-owned `s1`/`s2` (`m*b` each, zero-initialized by the
+    /// caller, `+=` here — summed across every token in the batch). The
+    /// dictionary contraction happens exactly once per block, after the
+    /// whole batch, via `contract_block`/`contract_all_blocks` — algebraic
+    /// reassociation of the same math, not an approximation (see the
+    /// `phase1_plus_contract_matches_backward_block_hoisted` test).
+    #[allow(clippy::too_many_arguments)]
+    fn backward_block_phase1(
+        eff1: &[f32], eff2: &[f32], x_blk: &[f32], z: &[f32], dout_pp: &[f32], dx_blk: &mut [f32],
+        m: usize, s1: &mut [f32], s2: &mut [f32],
+    ) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if m == 8 {
+            unsafe {
+                backward_block_phase1_avx2(
+                    eff1.as_ptr(), eff2.as_ptr(), x_blk.as_ptr(), z.as_ptr(), dout_pp.as_ptr(),
+                    dx_blk.as_mut_ptr(), s1.as_mut_ptr(), s2.as_mut_ptr(),
+                );
+            }
+            return;
+        }
+
+        let b = m * m;
+        let mut dz = vec![0.0f32; b];
+        for j in 0..m {
+            let zj = &z[j * m..(j + 1) * m];
+            let dout_j = &dout_pp[j * m..(j + 1) * m];
+            let eff_j = &eff2[j * b..(j + 1) * b];
+            let s2_j = &mut s2[j * b..(j + 1) * b];
+            for r in 0..m {
+                let dy = dout_j[r];
+                for c in 0..m {
+                    dz[j * m + c] += eff_j[r * m + c] * dy;
+                    s2_j[r * m + c] += dy * zj[c];
+                }
+            }
+        }
+        let mut dy1 = vec![0.0f32; b];
+        for j in 0..m { for i in 0..m { dy1[i * m + j] = dz[j * m + i]; } }
+        for i in 0..m {
+            let xi = &x_blk[i * m..(i + 1) * m];
+            let dy1_i = &dy1[i * m..(i + 1) * m];
+            let eff_i = &eff1[i * b..(i + 1) * b];
+            let s1_i = &mut s1[i * b..(i + 1) * b];
+            for r in 0..m {
+                let d_y = dy1_i[r];
+                for c in 0..m {
+                    dx_blk[i * m + c] += d_y * eff_i[r * m + c];
+                    s1_i[r * m + c] += d_y * xi[c];
+                }
+            }
+        }
+    }
+
+    /// Phase 2: contract one block's accumulated outer products (`s1`/`s2`,
+    /// `m*b` each, from `backward_block_phase1` summed over the whole batch)
+    /// with the dictionary — the `nd`-scaled work, now done once per block
+    /// instead of once per token.
+    #[allow(clippy::too_many_arguments)]
+    fn contract_block(
+        d1: &[f32], d2: &[f32], a1_blk: &[f32], a2_blk: &[f32], s1: &[f32], s2: &[f32],
+        m: usize, nd: usize, da1: &mut [f32], da2: &mut [f32], dd1: &mut [f32], dd2: &mut [f32],
+    ) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if m == 8 {
+            unsafe {
+                contract_block_avx2(
+                    d1.as_ptr(), d2.as_ptr(), a1_blk.as_ptr(), a2_blk.as_ptr(),
+                    s1.as_ptr(), s2.as_ptr(), nd,
+                    da1.as_mut_ptr(), da2.as_mut_ptr(), dd1.as_mut_ptr(), dd2.as_mut_ptr(),
+                );
+            }
+            return;
+        }
+
+        let b = m * m;
+        for j in 0..m {
+            let s2_j = &s2[j * b..(j + 1) * b];
+            for r in 0..m {
+                let s_r = &s2_j[r * m..(r + 1) * m];
+                for d in 0..nd {
+                    let a = a2_blk[j * nd + d];
+                    let drow = &d2[(d * m + r) * m..(d * m + r) * m + m];
+                    da2[j * nd + d] += gemm::dot(drow, s_r);
+                    let dd2row = &mut dd2[(d * m + r) * m..(d * m + r) * m + m];
+                    for c in 0..m { dd2row[c] += a * s_r[c]; }
+                }
+            }
+        }
+        for i in 0..m {
+            let s1_i = &s1[i * b..(i + 1) * b];
+            for r in 0..m {
+                let s_r = &s1_i[r * m..(r + 1) * m];
+                for d in 0..nd {
+                    let a = a1_blk[i * nd + d];
+                    let drow = &d1[(d * m + r) * m..(d * m + r) * m + m];
+                    da1[i * nd + d] += gemm::dot(drow, s_r);
+                    let dd1row = &mut dd1[(d * m + r) * m..(d * m + r) * m + m];
+                    for c in 0..m { dd1row[c] += a * s_r[c]; }
+                }
+            }
+        }
+    }
+
+    /// Contract every `(pp,qq)` block's accumulated `s1_all`/`s2_all`
+    /// (`p*q*m*b` each) into a fresh `Grads`. Sequential — the total work
+    /// here (`P·Q·m·nd` contractions, done once) is small enough that
+    /// parallelizing it isn't worth the dispatch overhead; it's the
+    /// per-token cost this whole restructuring exists to avoid paying
+    /// `n_tokens` times, not a bottleneck itself.
+    pub fn contract_all_blocks(
+        d1: &[f32], d2: &[f32], a1: &[f32], a2: &[f32], s1_all: &[f32], s2_all: &[f32],
+        p: usize, q: usize, m: usize, nd: usize,
+    ) -> Grads {
+        let b = m * m;
+        let mut g = Grads {
+            dd1: vec![0.0f32; nd * b],
+            dd2: vec![0.0f32; nd * b],
+            da1: vec![0.0f32; p * q * m * nd],
+            da2: vec![0.0f32; p * q * m * nd],
+        };
+        for pp in 0..p {
+            for qq in 0..q {
+                let idx = pp * q + qq;
+                let base = idx * m * nd;
+                let s1 = &s1_all[idx * m * b..(idx + 1) * m * b];
+                let s2 = &s2_all[idx * m * b..(idx + 1) * m * b];
+                Self::contract_block(
+                    d1, d2, &a1[base..base + m * nd], &a2[base..base + m * nd], s1, s2, m, nd,
+                    &mut g.da1[base..base + m * nd], &mut g.da2[base..base + m * nd],
+                    &mut g.dd1, &mut g.dd2,
+                );
+            }
+        }
+        g
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn backward_block_phase1_avx2(
+    eff1: *const f32, eff2: *const f32, x_blk: *const f32, z: *const f32, dout_pp: *const f32,
+    dx: *mut f32, s1: *mut f32, s2: *mut f32,
+) {
+    const M: usize = 8;
+    const B: usize = 64;
+    let mut dz  = [0.0f32; B];
+    let mut dy1 = [0.0f32; B];
+
+    for j in 0..M {
+        let zj     = z.add(j * M);
+        let dout_j = dout_pp.add(j * M);
+        let eff    = eff2.add(j * B);
+        let dz_j = dz.as_mut_ptr().add(j * M);
+        let s2_j = s2.add(j * B);
+        for r in 0..M {
+            let dy = *dout_j.add(r);
+            axpy8(dz_j, eff.add(r * M), dy);
+            axpy8(s2_j.add(r * M), zj, dy);
+        }
+    }
+    for i in 0..M { for j in 0..M { dy1[i*M+j] = dz[j*M+i]; } }
+    for i in 0..M {
+        let xi    = x_blk.add(i * M);
+        let dy1_i = dy1.as_ptr().add(i * M);
+        let eff   = eff1.add(i * B);
+        let s1_i  = s1.add(i * B);
+        for r in 0..M {
+            let d_y = *dy1_i.add(r);
+            axpy8(dx.add(i * M), eff.add(r * M), d_y);
+            axpy8(s1_i.add(r * M), xi, d_y);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn contract_block_avx2(
+    d1: *const f32, d2: *const f32, a1_blk: *const f32, a2_blk: *const f32,
+    s1: *const f32, s2: *const f32, nd: usize,
+    da1: *mut f32, da2: *mut f32, dd1: *mut f32, dd2: *mut f32,
+) {
+    const M: usize = 8;
+    const B: usize = 64;
+    for j in 0..M {
+        let s2_j = s2.add(j * B);
+        for r in 0..M {
+            let s_r = s2_j.add(r * M);
+            for d in 0..nd {
+                let a = *a2_blk.add(j * nd + d);
+                *da2.add(j * nd + d) += dot8(d2.add((d * M + r) * M), s_r);
+                axpy8(dd2.add((d * M + r) * M), s_r, a);
+            }
+        }
+    }
+    for i in 0..M {
+        let s1_i = s1.add(i * B);
+        for r in 0..M {
+            let s_r = s1_i.add(r * M);
+            for d in 0..nd {
+                let a = *a1_blk.add(i * nd + d);
+                *da1.add(i * nd + d) += dot8(d1.add((d * M + r) * M), s_r);
+                axpy8(dd1.add((d * M + r) * M), s_r, a);
             }
         }
     }
@@ -2291,6 +2472,107 @@ mod tests {
         // p=10 exercises the rayon-parallel branch.
         backward_batch_matches_summed_looped_backward_at(3, 2);
         backward_batch_matches_summed_looped_backward_at(10, 2);
+    }
+
+    #[test]
+    fn phase1_plus_contract_matches_backward_block_hoisted() {
+        // The two-phase restructuring (accumulate per-block outer products
+        // across tokens, contract with the dictionary once per block
+        // afterward) is an algebraic reassociation of backward_block_hoisted's
+        // math, not an approximation — this proves phase1+contract over N
+        // tokens equals N calls to backward_block_hoisted summed, at m=8
+        // (AVX2 path) and a non-8 m (scalar path).
+        for &(m, nd) in &[(8usize, 8usize), (4, 4)] {
+            let b = m * m;
+            let (p, q) = (2, 3);
+            let (d1, d2) = init_shared_atoms(nd, m, 0xC0DE);
+            let a1 = randvec(p * q * m * nd, 0x1111);
+            let a2 = randvec(p * q * m * nd, 0x2222);
+            let n_tokens = 5;
+
+            let (eff1_all, eff2_all) = SharedMonarchProj::expand_all_blocks(&d1, &d2, &a1, &a2, p, q, m, nd);
+
+            let x: Vec<f32> = randvec(n_tokens * q * b, 0x3333);
+            let dout: Vec<f32> = randvec(n_tokens * p * b, 0x4444);
+            // Fabricate a plausible zs cache: apply each block per token.
+            let mut zs = vec![0.0f32; n_tokens * p * q * b];
+            for t in 0..n_tokens {
+                let mut y1 = vec![0.0f32; b];
+                let mut y_dummy = vec![0.0f32; b];
+                for pp in 0..p {
+                    for qq in 0..q {
+                        let idx = pp * q + qq;
+                        let z = &mut zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        SharedMonarchMatmul::apply_block(
+                            &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
+                            &x[t * q * b + qq * b..t * q * b + (qq + 1) * b], m, &mut y1, z, &mut y_dummy,
+                        );
+                    }
+                }
+            }
+
+            // Old: N calls to backward_block_hoisted, summed.
+            let mut g_old = Grads {
+                dd1: vec![0.0f32; nd * b], dd2: vec![0.0f32; nd * b],
+                da1: vec![0.0f32; p * q * m * nd], da2: vec![0.0f32; p * q * m * nd],
+            };
+            let mut dz = vec![0.0f32; b];
+            let mut dy1 = vec![0.0f32; b];
+            let mut dx_old = vec![0.0f32; n_tokens * q * b];
+            for t in 0..n_tokens {
+                for pp in 0..p {
+                    let dout_pp = &dout[t * p * b + pp * b..t * p * b + (pp + 1) * b];
+                    for qq in 0..q {
+                        let idx = pp * q + qq;
+                        let eff1 = &eff1_all[idx * m * b..(idx + 1) * m * b];
+                        let eff2 = &eff2_all[idx * m * b..(idx + 1) * m * b];
+                        let x_blk = &x[t * q * b + qq * b..t * q * b + (qq + 1) * b];
+                        let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        let dx_blk = &mut dx_old[t * q * b + qq * b..t * q * b + (qq + 1) * b];
+                        let base = idx * m * nd;
+                        SharedMonarchMatmul::backward_block_hoisted(
+                            &d1, &d2, &a1[base..base + m * nd], &a2[base..base + m * nd],
+                            eff1, eff2, x_blk, z, dout_pp, dx_blk, m, nd, base,
+                            &mut g_old.da1, &mut g_old.da2, &mut g_old.dd1, &mut g_old.dd2, &mut dz, &mut dy1,
+                        );
+                    }
+                }
+            }
+
+            // New: phase1 (accumulate s1/s2 across all tokens) + one contract_all_blocks.
+            let mut s1_all = vec![0.0f32; p * q * m * b];
+            let mut s2_all = vec![0.0f32; p * q * m * b];
+            let mut dx_new = vec![0.0f32; n_tokens * q * b];
+            for t in 0..n_tokens {
+                for pp in 0..p {
+                    let dout_pp = &dout[t * p * b + pp * b..t * p * b + (pp + 1) * b];
+                    for qq in 0..q {
+                        let idx = pp * q + qq;
+                        let eff1 = &eff1_all[idx * m * b..(idx + 1) * m * b];
+                        let eff2 = &eff2_all[idx * m * b..(idx + 1) * m * b];
+                        let x_blk = &x[t * q * b + qq * b..t * q * b + (qq + 1) * b];
+                        let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        let dx_blk = &mut dx_new[t * q * b + qq * b..t * q * b + (qq + 1) * b];
+                        let s1 = &mut s1_all[idx * m * b..(idx + 1) * m * b];
+                        let s2 = &mut s2_all[idx * m * b..(idx + 1) * m * b];
+                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, z, dout_pp, dx_blk, m, s1, s2);
+                    }
+                }
+            }
+            let g_new = SharedMonarchMatmul::contract_all_blocks(&d1, &d2, &a1, &a2, &s1_all, &s2_all, p, q, m, nd);
+
+            for i in 0..dx_old.len() {
+                assert!((dx_old[i] - dx_new[i]).abs() < 1e-4, "m={m} dx[{i}]: old={} new={}", dx_old[i], dx_new[i]);
+            }
+            for i in 0..g_old.da1.len() {
+                assert!((g_old.da1[i] - g_new.da1[i]).abs() < 1e-3, "m={m} da1[{i}]: old={} new={}", g_old.da1[i], g_new.da1[i]);
+                assert!((g_old.da2[i] - g_new.da2[i]).abs() < 1e-3, "m={m} da2[{i}]: old={} new={}", g_old.da2[i], g_new.da2[i]);
+            }
+            for i in 0..g_old.dd1.len() {
+                assert!((g_old.dd1[i] - g_new.dd1[i]).abs() < 1e-3, "m={m} dd1[{i}]: old={} new={}", g_old.dd1[i], g_new.dd1[i]);
+                assert!((g_old.dd2[i] - g_new.dd2[i]).abs() < 1e-3, "m={m} dd2[{i}]: old={} new={}", g_old.dd2[i], g_new.dd2[i]);
+            }
+        }
     }
 
     #[test]

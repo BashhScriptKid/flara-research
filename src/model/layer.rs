@@ -17,6 +17,7 @@ use crate::kernels::attn_swa::SlidingWindowAttention;
 use crate::kernels::ffn::{Ffn, FfnForwardBatch, FfnOptState};
 use crate::kernels::monarch::FwdCache;
 use crate::kernels::norm;
+use crate::kernels::profiling::{self, Timer};
 use crate::kernels::optimizer::{AdaFactor, AdaFactorState};
 use crate::kernels::probe::ExitProbe;
 use crate::kernels::rope::Rope;
@@ -331,16 +332,25 @@ impl TransformerLayer {
         let mut v = vec![0.0f32; t_len * kvd];
         let mut probe_p = vec![0.0f32; t_len];
 
-        for ti in 0..t_len {
-            let hin = &hidden[ti * h..(ti + 1) * h];
-            let nrm = &mut normed[ti * h..(ti + 1) * h];
-            rinv[ti] = norm::forward(hin, &self.attn_norm_gain, cfg.norm_eps, nrm);
-            probe_p[ti] = self.probe.forward(nrm);
+        {
+            let _t = Timer::start(&profiling::NORM_FWD);
+            for ti in 0..t_len {
+                let hin = &hidden[ti * h..(ti + 1) * h];
+                let nrm = &mut normed[ti * h..(ti + 1) * h];
+                rinv[ti] = norm::forward(hin, &self.attn_norm_gain, cfg.norm_eps, nrm);
+                probe_p[ti] = self.probe.forward(nrm);
+            }
         }
 
-        let wq_fc = self.wq.forward_batch(mono_d1, mono_d2, &normed, &mut q, t_len);
-        let wk_fc = self.wk.forward_batch(mono_d1, mono_d2, &normed, &mut k, t_len);
-        let wv_fc = self.wv.forward_batch(mono_d1, mono_d2, &normed, &mut v, t_len);
+        let wq_fc;
+        let wk_fc;
+        let wv_fc;
+        {
+            let _t = Timer::start(&profiling::QKV_FWD);
+            wq_fc = self.wq.forward_batch(mono_d1, mono_d2, &normed, &mut q, t_len);
+            wk_fc = self.wk.forward_batch(mono_d1, mono_d2, &normed, &mut k, t_len);
+            wv_fc = self.wv.forward_batch(mono_d1, mono_d2, &normed, &mut v, t_len);
+        }
 
         for ti in 0..t_len {
             for head in 0..cfg.n_q_heads {
@@ -352,11 +362,17 @@ impl TransformerLayer {
         }
 
         let mut attn_out = vec![0.0f32; t_len * qd];
-        let lse = self.attn.forward(&q, &k, &v, &mut attn_out);
+        let lse = {
+            let _t = Timer::start(&profiling::ATTN_CORE_FWD);
+            self.attn.forward(&q, &k, &v, &mut attn_out)
+        };
 
         let mut h_mid = hidden.to_vec();
         let mut o_proj = vec![0.0f32; t_len * qd];
-        let wo_fc = self.wo.forward_batch(mono_d1, mono_d2, &attn_out, &mut o_proj, t_len);
+        let wo_fc = {
+            let _t = Timer::start(&profiling::WO_FWD);
+            self.wo.forward_batch(mono_d1, mono_d2, &attn_out, &mut o_proj, t_len)
+        };
         for ti in 0..t_len {
             let oi = &o_proj[ti * qd..(ti + 1) * qd];
             let dst = &mut h_mid[ti * h..(ti + 1) * h];
@@ -373,13 +389,22 @@ impl TransformerLayer {
         // once per token regardless of routing.
         let mut normed2 = vec![0.0f32; t_len * h];
         let mut rinv2 = vec![0.0f32; t_len];
-        for ti in 0..t_len {
-            let hin = &h_mid[ti * h..(ti + 1) * h];
-            let nrm = &mut normed2[ti * h..(ti + 1) * h];
-            rinv2[ti] = norm::forward(hin, &self.ffn_norm_gain, cfg.norm_eps, nrm);
+        {
+            let _t = Timer::start(&profiling::NORM_FWD);
+            for ti in 0..t_len {
+                let hin = &h_mid[ti * h..(ti + 1) * h];
+                let nrm = &mut normed2[ti * h..(ti + 1) * h];
+                rinv2[ti] = norm::forward(hin, &self.ffn_norm_gain, cfg.norm_eps, nrm);
+            }
         }
-        let sels = self.ffn.select_batch(&normed2, t_len);
-        let ffn_fwds = self.ffn.compute_batch(ffn_d1, ffn_d2, &normed2, &sels, t_len);
+        let sels = {
+            let _t = Timer::start(&profiling::FFN_SELECT);
+            self.ffn.select_batch(&normed2, t_len)
+        };
+        let ffn_fwds = {
+            let _t = Timer::start(&profiling::FFN_FWD);
+            self.ffn.compute_batch(ffn_d1, ffn_d2, &normed2, &sels, t_len)
+        };
         let mut out = h_mid.clone();
         for ti in 0..t_len {
             let dst = &mut out[ti * h..(ti + 1) * h];
@@ -463,7 +488,10 @@ impl TransformerLayer {
         for i in 0..t_len * h {
             d_ffn_out[i] = scale * d_out[i];
         }
-        let fg = self.ffn.backward_batch(ffn_d1, ffn_d2, &fwd.normed2, &fwd.ffn_fwds, &d_ffn_out, t_len);
+        let fg = {
+            let _t = Timer::start(&profiling::FFN_BWD);
+            self.ffn.backward_batch(ffn_d1, ffn_d2, &fwd.normed2, &fwd.ffn_fwds, &d_ffn_out, t_len)
+        };
         add_f(&mut g.d_up_coeffs, &fg.d_up_coeffs);
         add_f(&mut g.d_gate_coeffs, &fg.d_gate_coeffs);
         add_f(&mut g.d_down_coeffs, &fg.d_down_coeffs);
@@ -477,6 +505,7 @@ impl TransformerLayer {
         }
         let mut d_h_mid = vec![0.0f32; t_len * h];
         let ffn_norm_results: Vec<NormTokenGrad2> = {
+            let _t = Timer::start(&profiling::NORM_BWD);
             use rayon::prelude::*;
             (0..t_len).into_par_iter().map(|ti| {
                 let mut dx = vec![0.0f32; h];
@@ -508,7 +537,10 @@ impl TransformerLayer {
         for i in 0..t_len * h {
             d_oi_all[i] = scale * d_h_mid[i];
         }
-        let wo_g = self.wo.backward_batch(mono_d1, mono_d2, &fwd.attn_out, &fwd.wo_fc, &d_oi_all, t_len);
+        let wo_g = {
+            let _t = Timer::start(&profiling::WO_BWD);
+            self.wo.backward_batch(mono_d1, mono_d2, &fwd.attn_out, &fwd.wo_fc, &d_oi_all, t_len)
+        };
         let d_attn_out = wo_g.d_x;
         add_f(&mut g.d_wo, &wo_g.d_param);
         add_f(&mut g.d_mono_d1, &wo_g.d_d1);
@@ -522,9 +554,12 @@ impl TransformerLayer {
         let mut dq = vec![0.0f32; t_len * qd];
         let mut dk = vec![0.0f32; t_len * kvd];
         let mut dv = vec![0.0f32; t_len * kvd];
-        self.attn.backward(
-            &fwd.q, &fwd.k, &fwd.v, &fwd.attn_out, &fwd.lse, &d_attn_out, &mut dq, &mut dk, &mut dv,
-        );
+        {
+            let _t = Timer::start(&profiling::ATTN_CORE_BWD);
+            self.attn.backward(
+                &fwd.q, &fwd.k, &fwd.v, &fwd.attn_out, &fwd.lse, &d_attn_out, &mut dq, &mut dk, &mut dv,
+            );
+        }
         for ti in 0..t_len {
             for head in 0..cfg.n_q_heads {
                 rope.apply_backward(&mut dq[ti * qd + head * hd..ti * qd + (head + 1) * hd], ti);
@@ -541,9 +576,15 @@ impl TransformerLayer {
         // whole sequence. norm::backward is per-token and nonlinear (can't
         // be hoisted the same way), so it stays in a collect+merge loop —
         // but now it's the *only* thing left in that loop.
-        let wq_g = self.wq.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wq_fc, &dq, t_len);
-        let wk_g = self.wk.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wk_fc, &dk, t_len);
-        let wv_g = self.wv.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wv_fc, &dv, t_len);
+        let wq_g;
+        let wk_g;
+        let wv_g;
+        {
+            let _t = Timer::start(&profiling::QKV_BWD);
+            wq_g = self.wq.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wq_fc, &dq, t_len);
+            wk_g = self.wk.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wk_fc, &dk, t_len);
+            wv_g = self.wv.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wv_fc, &dv, t_len);
+        }
         add_f(&mut g.d_wq, &wq_g.d_param);
         add_f(&mut g.d_wk, &wk_g.d_param);
         add_f(&mut g.d_wv, &wv_g.d_param);
@@ -563,6 +604,7 @@ impl TransformerLayer {
             dg: Vec<f32>,
         }
         let norm_results: Vec<NormTokenGrad> = {
+            let _t = Timer::start(&profiling::NORM_BWD);
             use rayon::prelude::*;
             (0..t_len).into_par_iter().map(|ti| {
                 let mut dx = vec![0.0f32; h];

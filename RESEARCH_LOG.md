@@ -2864,3 +2864,103 @@ this session decided to adopt.
 capacity, at every scale tested, once backward is correctly included).
 Block-size tuning is closed as a dead end. Frozen-dictionary is an open,
 promising, *not yet evaluated for training quality* future option.
+
+---
+
+## 2026-07-03 — Fable review #2 + implementation: real in-process profiling, then the actual backward fix
+
+Asked Fable to investigate why real training throughput (408-420ms/step)
+still trailed the isolated kernel win (2.7-3x) so badly, given both
+`AttnProj` and `Ffn` were already hoisted+batched. Fable read
+`layer.rs`/`ffn.rs`/`optim.rs` directly, confirmed the batching really is
+exercised at this shape (no silent fallback), ruled out the AdaFactor
+optimizer (~1% of a step), and profiled a standalone (non-LTO) scratchpad
+bench to attribute time: **Monarch backward ≈ 72% of backward, ~half the
+whole step** — driven by `backward_block_hoisted`'s `da/dd` (coefficient +
+dictionary gradient) accumulation, which costs ~16x the data-gradient
+(`dx/dz`) per token and — critically — runs **per token**, even though
+`da`/`dd` are weight gradients that don't depend on any individual token.
+Root cause, precisely stated: forward reconstruction was hoisted (last
+entry); the corresponding backward *contraction* with the dictionary was
+not — it was still happening `n_tokens` times per block instead of once.
+
+### Landed in-repo instrumentation first (verification before the rewrite)
+
+Added `src/kernels/profiling.rs` (named `AtomicU64` counters + an RAII
+`Timer`, ~zero overhead — a handful of `Instant::now()` calls per layer per
+step against work measured in milliseconds) and wired it into every named
+sub-block of `TransformerLayer::forward`/`backward`
+(QKV/WO/attn-core/FFN-select/FFN-compute/norm, fwd and bwd separately).
+Extended `src/bin/profile.rs` with `TRAIN_SMALL_LOD=1` to exactly replicate
+`train_small_lod`'s config, and to print the accumulated breakdown.
+**Confirmed Fable's attribution precisely, in the real LTO'd release
+binary** (not a scratchpad probe): of a 663ms/step total, Monarch backward
+(FFN+QKV+WO combined) was **374.9ms — 56.5% of the entire step**, with
+allocation/glue overhead actually small (~5%, smaller than Fable's rougher
+estimate) — the dominant cost really was exactly where Fable said.
+
+### The fix: defer the dictionary contraction to once per block, not once per token
+
+Algebraic reassociation, not an approximation. Per block, per stage, the
+weight-gradient contribution from token `t` is `dy_t[r] · dot(dict_row,
+z_t)` (da) and `a · dy_t[r] · z_t` (dd) — both linear in `z_t`/`x_t`, so
+summing over tokens can move inside: `Σ_t dy_t[r]·dot(dict_row, z_t) =
+dot(dict_row, Σ_t dy_t[r]·z_t)`. Define `S[r] = Σ_t dy_t[r] ⊗ z_t` (an
+`m×m` accumulator per block per stage — literally an outer-product sum,
+cheap: `O(m²)` per token, same cost class as the `dz`/`dx` propagation that
+was already cheap) — then the `nd`-scaled dictionary contraction
+(`dot`/`axpy` over `nd` atoms) runs **once per block, after the whole
+token batch**, instead of once per token.
+
+Implemented as a genuine two-phase split in `monarch.rs`:
+- **Phase 1** (`backward_block_phase1`, AVX2 `m=8` + scalar fallback):
+  computes `dz`/`dx` exactly as before (unchanged, cheap) and accumulates
+  `s1`/`s2` (`Σ dy1_i⊗x_i`, `Σ dout_j⊗z_j`) via plain `axpy8` — no `nd` loop
+  at all in the per-token path anymore.
+- **Phase 2** (`contract_block`/`contract_all_blocks`, AVX2 + scalar): the
+  `nd`-scaled `da`/`dd` computation, structurally identical to the old
+  per-token inner loop but now reading `s1`/`s2` (the batch-summed outer
+  product) instead of a single token's `z`/`x`, run exactly once per block.
+
+Rewired `SharedMonarchProj::backward_batch`/`backward_rows_batch`/
+`backward_cols_batch` (the dense and routed variants both) to this
+two-phase shape — same token-chunked parallelism structure as before
+(chunks accumulate local `s1`/`s2` partials, merged via `+=`, contraction
+runs once sequentially at the end since its total cost — `P·Q·m·nd`, done
+once — is now small enough not to need parallelizing).
+
+**Correctness**: new test `phase1_plus_contract_matches_backward_block_hoisted`
+proves phase1+contract over N tokens exactly equals N old-style
+per-token `backward_block_hoisted` calls summed, at both `m=8` (AVX2) and
+`m=4` (scalar) — algebraic reassociation confirmed, not just "the numbers
+came out close." Full suite: 92/92 pass, including every existing
+gradcheck (`backward_batch_matches_summed_looped_backward`,
+`routed_batch_matches_looped_forward_rows_and_cols`, layer/model-level
+gradchecks) — all still validated against the *original* single-token
+`backward()`/`backward_rows()`/`backward_cols()` methods, so this landed
+without touching (or needing to trust) any of the reference implementations.
+
+**Result, sub-block breakdown, same shape as above:** total step time
+663ms → **364ms** (45% reduction). Monarch backward specifically: 374.9ms
+→ **~108ms** (3.5x reduction — close to Fable's estimate of "toward
+40-70ms" per the less-optimized scratchpad build). Attention core is now
+the next-largest single item (~89ms/step, unparallelized — Fable's
+secondary recommendation, not done this pass).
+
+**Result, real end-to-end synthetic bench** (same `train_small_lod`-shape
+byte-vocab bench used throughout this session): **353-393ms/step**, down
+from 408-420ms before this fix. Relative to the pre-swap BasisMatmul
+baseline (306.5ms/step): was 33-37% slower, now **~15-28% slower** — real,
+substantial progress, not fully closed. The remaining gap is consistent
+with the now-larger relative weight of the fully-serial attention core
+(no rayon anywhere in `attn_flash.rs`/`attn_swa.rs`) and residual
+allocation/glue overhead, both flagged but not addressed this pass.
+
+**Status:** the backward gradient-accumulation bug (the actual dominant
+cost of the post-swap regression) is fixed and verified. Training
+throughput has closed roughly two-thirds of the gap to the pre-swap
+baseline. Remaining known levers, not yet done: parallelize the attention
+core; reduce/reuse the `FwdCache.zs` allocation footprint (flagged by
+Fable, secondary at these shapes per the confirmed profiling — allocation
+overhead measured much smaller than Fable's estimate, ~5% not ~20%, so
+lower priority than initially thought).

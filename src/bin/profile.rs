@@ -13,6 +13,7 @@
 use std::time::Instant;
 
 use fydel::kernels::optimizer::AdaFactor;
+use fydel::kernels::profiling;
 use fydel::model::config::ModelConfig;
 use fydel::model::model::{Model, cross_entropy};
 use fydel::train::optim::Optimizer;
@@ -29,18 +30,39 @@ fn profile_cfg() -> ModelConfig {
         c.validate();
         return c;
     }
+    // TRAIN_SMALL_LOD=1 exactly matches src/bin/train_small_lod.rs's shape,
+    // for profiling the config the real end-to-end synthetic bench uses.
+    if envu("TRAIN_SMALL_LOD", 0) == 1 {
+        let mut c = ModelConfig::default();
+        c.n_layers = 12;
+        c.full_attn_layers = 3;
+        c.hidden = 256;
+        c.n_q_heads = 4;
+        c.n_kv_heads = 1;
+        c.head_dim = 64;
+        c.ffn_dim = 768;
+        c.block = 64;
+        c.n_active = 3;
+        c.dict_k = 8;
+        c.kv_block = 64;
+        c.window = 64;
+        c.vocab = envu("VOCAB", 128);
+        c.max_seq = 512;
+        c.validate();
+        return c;
+    }
     let mut c = ModelConfig::default();
     c.n_layers = envu("N_LAYERS", 12);
-    c.hidden = 512;
-    c.n_q_heads = 8; // 8 * 64 = 512 = hidden
-    c.n_kv_heads = 2;
-    c.head_dim = 64;
-    c.ffn_dim = 2048;
-    c.block = 64;
+    c.hidden = envu("HIDDEN", 512);
+    c.n_q_heads = envu("N_Q_HEADS", 8); // must divide HIDDEN with HEAD_DIM
+    c.n_kv_heads = envu("N_KV_HEADS", 2);
+    c.head_dim = envu("HEAD_DIM", 64);
+    c.ffn_dim = envu("FFN_DIM", 2048);
+    c.block = envu("BLOCK", 64);
     c.n_active = envu("N_ACTIVE", 12);
-    c.dict_k = 32;
-    c.kv_block = 64;
-    c.window = 256;
+    c.dict_k = envu("DICT_K", 32);
+    c.kv_block = envu("KV_BLOCK", 64);
+    c.window = envu("WINDOW", 256);
     c.full_attn_layers = envu("FULL_ATTN", 3);
     c.vocab = envu("VOCAB", 8192);
     c.max_seq = 512;
@@ -90,6 +112,7 @@ fn main() {
     for _ in 0..warmup {
         run_step(&mut model, &mut opt, &mut warm);
     }
+    profiling::reset(); // drop warmup's contribution to the sub-block breakdown
 
     let mut t = [0.0f64; 3];
     let wall = Instant::now();
@@ -109,4 +132,5 @@ fn main() {
     }
     eprintln!("total     {:8.2}", total / n * 1e3);
     eprintln!("wall      {:8.2}  ({:.1} steps/s)", wall / n * 1e3, n / wall);
+    profiling::report();
 }
