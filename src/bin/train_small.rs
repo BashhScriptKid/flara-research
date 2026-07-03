@@ -1,21 +1,20 @@
 //! Small real-architecture baseline: same Full/Sliding attention split as the
 //! Fydel-1B spec (ratio-matched: 3 Full / 9 Sliding vs. production's 24 / 96),
-//! shrunk to train in minutes on CPU. Exists to answer one question the
-//! block-sparse-attention TODO in RESEARCH_LOG.md needs answered first: how much
-//! held-out quality does the *existing* sliding-window design already cost,
-//! relative to full attention on the same trained weights?
+//! shrunk to train in minutes on CPU.
 //!
 //! Uses the real GPT-2 BPE tokenizer/vocab (50257) over a Hugging Face corpus
 //! fetch, so it's the closer proxy to the actual 1B target's tokenization
 //! scheme. See `train_small_lod` for a byte-level-vocab fast-iteration
 //! variant of this same architecture — faster to run, but not a stand-in for
 //! this binary's quality conclusions (char-level LMs behave differently
-//! w.r.t. context length than subword LMs).
+//! w.r.t. context length than subword LMs). The sliding-vs-full quality-cost
+//! question is answered there instead, by training two independent models
+//! (post-hoc attention-window swapping on one checkpoint is confounded — see
+//! RESEARCH_LOG.md).
 //!
 //! `cargo run --release --bin train_small` trains + checkpoints.
 //! `cargo run --release --bin train_small -- --eval` loads the checkpoint and
-//! reports held-out CE for both the as-trained (sliding) and an all-full-attention
-//! reconstruction sharing the identical trained weights.
+//! reports held-out CE.
 
 use std::path::PathBuf;
 
@@ -88,18 +87,8 @@ fn main() {
         let mut val_r = load_val_reader(&cache_dir);
         eprintln!("held-out set: {} tokens", val_r.len());
 
-        let sliding_val_r = val_r.clone();
-        let sliding_loss = eval_loss(&model, &mut val_r, EVAL_SEQ_LEN, EVAL_WINDOWS);
-
-        let mut ckpt = model.to_checkpoint();
-        ckpt.cfg.full_attn_layers = ckpt.cfg.n_layers; // same trained weights, all layers Full
-        let full_model = Model::from_checkpoint(&ckpt);
-        let mut full_val_r = sliding_val_r;
-        let full_loss = eval_loss(&full_model, &mut full_val_r, EVAL_SEQ_LEN, EVAL_WINDOWS);
-
-        eprintln!("sliding-window (as trained)        held-out CE: {sliding_loss:.4} nats");
-        eprintln!("all-full-attention (same weights)  held-out CE: {full_loss:.4} nats");
-        eprintln!("quality cost of sliding-window:     {:.4} nats", sliding_loss - full_loss);
+        let loss = eval_loss(&model, &mut val_r, EVAL_SEQ_LEN, EVAL_WINDOWS);
+        eprintln!("held-out CE: {loss:.4} nats");
         return;
     }
 

@@ -292,7 +292,16 @@ impl SharedMonarchMatmul {
         }
     }
 
+    /// Below this many parallel units (`p`), rayon's fork-join wake cost
+    /// outweighs the actual per-unit work — see `SharedMonarchProj`'s
+    /// identical constant and the gate_c.rs toy-shape benchmarks for the
+    /// measured motivation.
+    const PARALLEL_THRESHOLD: usize = 8;
+
     pub fn forward(&self, x: &[f32]) -> (Vec<f32>, FwdCache) {
+        if self.p < Self::PARALLEL_THRESHOLD {
+            return self.forward_serial(x);
+        }
         use rayon::prelude::*;
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
@@ -319,9 +328,35 @@ impl SharedMonarchMatmul {
         (y, FwdCache { zs })
     }
 
+    /// Same math as `forward`, no rayon — for `p < PARALLEL_THRESHOLD`.
+    fn forward_serial(&self, x: &[f32]) -> (Vec<f32>, FwdCache) {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        let mut y   = vec![0.0f32; p * b];
+        let mut zs  = vec![0.0f32; p * q * b];
+        let mut eff = vec![0.0f32; b];
+        let mut y1  = vec![0.0f32; b];
+        for pp in 0..p {
+            let ypp = &mut y[pp * b..(pp + 1) * b];
+            for qq in 0..q {
+                let z = &mut zs[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                Self::fwd_block(
+                    &self.d1, &self.d2,
+                    self.a1_blk(pp, qq), self.a2_blk(pp, qq),
+                    &x[qq * b..(qq + 1) * b],
+                    m, nd, &mut y1, z, ypp, &mut eff,
+                );
+            }
+        }
+        (y, FwdCache { zs })
+    }
+
     /// Forward without storing a cache — for inference where backward is not needed.
     /// Allocates only the output vec; y1/z scratch are reused per block, not kept.
     pub fn forward_inference(&self, x: &[f32]) -> Vec<f32> {
+        if self.p < Self::PARALLEL_THRESHOLD {
+            return self.forward_inference_serial(x);
+        }
         use rayon::prelude::*;
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
@@ -684,7 +719,18 @@ impl SharedMonarchProj {
         &self.a2[base..base + self.m * self.nd]
     }
 
+    /// Below this many parallel units (`p`), rayon's fork-join wake cost
+    /// (~5-15µs on this machine) outweighs the actual per-unit work — a
+    /// handful of microseconds each at toy scale — so we run inline instead.
+    /// See `forward_inference_serial`'s doc comment and the gate_c.rs
+    /// `train_small_lod`-shape benchmarks (256x256, P=4: 5x slower than
+    /// BasisMatmul) for the measured motivation.
+    const PARALLEL_THRESHOLD: usize = 8;
+
     pub fn forward(&self, d1: &[f32], d2: &[f32], x: &[f32]) -> (Vec<f32>, FwdCache) {
+        if self.p < Self::PARALLEL_THRESHOLD {
+            return self.forward_serial(d1, d2, x);
+        }
         use rayon::prelude::*;
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
@@ -711,18 +757,62 @@ impl SharedMonarchProj {
         (y, FwdCache { zs })
     }
 
+    /// Same math as `forward`, no rayon — for `p < PARALLEL_THRESHOLD`.
+    fn forward_serial(&self, d1: &[f32], d2: &[f32], x: &[f32]) -> (Vec<f32>, FwdCache) {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        let mut y   = vec![0.0f32; p * b];
+        let mut zs  = vec![0.0f32; p * q * b];
+        let mut eff = vec![0.0f32; b];
+        let mut y1  = vec![0.0f32; b];
+        for pp in 0..p {
+            let ypp = &mut y[pp * b..(pp + 1) * b];
+            for qq in 0..q {
+                let z = &mut zs[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                SharedMonarchMatmul::fwd_block(
+                    d1, d2,
+                    self.a1_blk(pp, qq), self.a2_blk(pp, qq),
+                    &x[qq * b..(qq + 1) * b],
+                    m, nd, &mut y1, z, ypp, &mut eff,
+                );
+            }
+        }
+        (y, FwdCache { zs })
+    }
+
     /// Forward for `n_tokens` tokens in one call — see
     /// [`SharedMonarchMatmul::forward_batch`] for why this exists (amortizing
     /// rayon dispatch overhead across a whole sequence instead of paying it
     /// once per token).
     pub fn forward_batch(&self, d1: &[f32], d2: &[f32], x: &[f32], n_tokens: usize) -> (Vec<f32>, FwdCache) {
-        use rayon::prelude::*;
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let in_dim = q * b;
         let mut y   = vec![0.0f32; n_tokens * p * b];
         let mut zs  = vec![0.0f32; n_tokens * p * q * b];
 
+        if n_tokens * p < Self::PARALLEL_THRESHOLD {
+            let mut eff = vec![0.0f32; b];
+            let mut y1  = vec![0.0f32; b];
+            for t in 0..n_tokens {
+                let x_t = &x[t * in_dim..(t + 1) * in_dim];
+                for pp in 0..p {
+                    let ypp = &mut y[(t * p + pp) * b..(t * p + pp + 1) * b];
+                    for qq in 0..q {
+                        let z = &mut zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        SharedMonarchMatmul::fwd_block(
+                            d1, d2,
+                            self.a1_blk(pp, qq), self.a2_blk(pp, qq),
+                            &x_t[qq * b..(qq + 1) * b],
+                            m, nd, &mut y1, z, ypp, &mut eff,
+                        );
+                    }
+                }
+            }
+            return (y, FwdCache { zs });
+        }
+
+        use rayon::prelude::*;
         let units: Vec<(&mut [f32], &mut [f32])> = y.chunks_mut(b)
             .zip(zs.chunks_mut(q * b))
             .collect();

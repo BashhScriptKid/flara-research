@@ -2481,3 +2481,134 @@ level — a full-model wall-clock A/B (old BasisMatmul-integrated model vs.
 current) was not run and would require reverting the model-level
 integration, judged not worth doing given the kernel-level result is this
 clear.
+
+---
+
+## 2026-07-03 — The full-model A/B *was* run after all: real training got slower, not faster
+
+The previous entry judged a full-model wall-clock A/B "not worth doing." It
+turned out to be necessary: `train_small` (real GPT-2-vocab config,
+`hidden=256, ffn_dim=768, block=64, dict_k=8`) finished its post-swap
+3000-step run cleanly (held-out CE 5.4773 nats — the first honest number
+post-swap; `--eval`'s confounded post-hoc-full-attention-swap comparison
+was also deleted from `train_small.rs` in this session, matching the fix
+already applied to `train_small_lod`).
+
+Prompted by "do you mind booting Fable" once the accessibility framing
+came up ("Monarch should be ≤ BasisMatmul at *any* scale, not just
+production scale — that's the pitch"), a real old-vs-new comparison was
+run via a throwaway synthetic bench (`git worktree` checkout of the
+pre-swap commit `6ae62cb`, a scratch `bench_efficiency.rs` doing N
+forward+backward+AdaFactor steps on random token ids — no corpus fetch
+needed, never committed):
+
+```
+train_small config (vocab=50257, real GPT-2 vocab):
+  old (BasisMatmul):        2650.8 ms/step, 51.72 MB checkpoint
+  new (SharedMonarchProj):  2826.3 ms/step, 52.79 MB checkpoint   (+6.6% slower)
+
+train_small_lod config (vocab=128, byte-level — embedding no longer dominates):
+  old (BasisMatmul):         306.5 ms/step,  0.39 MB checkpoint
+  new (SharedMonarchProj):   438.4 ms/step,  1.46 MB checkpoint   (+43% slower, 3.7x bigger)
+```
+
+Not a contradiction of the previous entry's kernel-level result — a scale
+mismatch. `train_small`'s actual dims (`hidden=256, ffn_dim=768`) sit
+*below* the crossover point found in `gate_c.rs`'s own grid search
+(roughly `768-896`). The isolated equal-capacity wins (8.1x/3.2x etc.) were
+all measured at production-scale shapes (`896x896`, `896x3072`); nothing
+in this project has trained at that scale yet. `train_small` is currently
+the wrong regime to expect a win in — a "sports car on a driveway" situation,
+not a broken swap.
+
+### Fable 5 consultation: is the low-x loss fixable, or a hard floor?
+
+Asked Fable to verify two hypotheses from reading the code directly
+(`monarch.rs`, `fft.rs`, `gate_c.rs`) and give a verdict on whether
+"Monarch ≤ BasisMatmul at every scale" — the actual accessibility goal, not
+just "wins at 1B scale" — is achievable without sacrificing the
+parameter-efficiency the whole scheme exists for.
+
+**Verified, and a bigger bug found than either hypothesis:** `fwd_block_avx2`/
+`bwd_block_avx2` really do pay an ~8:1 reconstruction:compute FLOP ratio at
+`nd=8` (confirms the "inherent atom-reconstruction tax" hypothesis) — but
+the actual defect isn't that the tax exists, it's *where* it's paid.
+`SharedMonarchProj::forward_batch` and the per-token `backward` calls in
+`layer.rs`/`ffn.rs` reconstruct the effective `eff` blocks **from scratch
+for every token**, even though `eff` depends only on weights, which are
+fixed for an entire training step (or forever, at inference). This is
+loop-ordering, not inherent math — training should reconstruct each block
+once per step and reuse it across all `t_len` tokens; it currently doesn't.
+Rayon dispatch overhead (the original hypothesis (b)) is real but
+secondary — `forward_batch` already amortizes dispatch across
+`n_tokens × P` units, so it's a minor contributor to the real 43%
+regression, confined mostly to the isolated single-call `gate_c.rs`
+benchmark.
+
+A second confound was flagged in the same pass: the toy-scale `gate_c.rs`
+benchmark compared `nd=8` against `K=8` "to isolate the kernel" — but per
+block-pair that hands Monarch `2·m·nd=128` coefficients against
+BasisMatmul's `8`, a 16x capacity difference, not an isolated kernel
+comparison at all.
+
+**Verdict:** no fundamental floor. Both kernels pay an unhoisted
+per-call reconstruction tax (BasisMatmul's is FFT/IFFT + `K`-atom axpy,
+same defect, never hoisted either); at matched capacity the floors are the
+same order. Training amortizes trivially once fixed (reconstruct once,
+reuse across the whole batch); inference can precompute the effective
+blocks once at model load and never reconstruct again, which would make
+Monarch strictly cheaper than BasisMatmul at every shape. Explicit
+recommendation: **do not reintroduce BasisMatmul as a scale-dependent
+hybrid fallback** — once the reconstruction is hoisted, there's no regime
+left where it wins at equal capacity, and reintroducing it has real
+complexity cost (it was fully deleted from the live model this session).
+
+Prioritized fix list from the review (highest impact first): (1) reorder
+`forward_batch`/backward to reconstruct each block once, loop tokens
+inside — the actual fix for the training regression, not yet started;
+(2) sequential fallback below a small-work threshold — cheap, done (see
+below); (3) cache reconstructed blocks at inference load time — not yet
+started, blocked on there being an inference/decode path at all; (4) a
+proper micro-GEMM restructure of `matvec8` — smaller win, not started;
+(5) fix `gate_c.rs`'s toy-scale benchmark to use equal capacity — done
+(see below).
+
+### Two cheap fixes landed today
+
+**`PARALLEL_THRESHOLD` sequential fallback** (`monarch.rs`): both
+`SharedMonarchProj` and `SharedMonarchMatmul` now skip rayon and run
+inline when the number of parallel units (`p`, or `n_tokens*p` for
+`forward_batch`) is below 8 — rayon's fork-join wake cost was dominating
+actual per-unit work at toy scale. Reuses the existing
+`forward_inference_serial` pattern already established for `prefill`.
+11/11 monarch tests still pass.
+
+**`gate_c.rs` equal-capacity toy-scale benchmark added** (`K=128` at
+`train_small_lod`'s exact shapes, alongside the existing `K=8`
+capacity-mismatched row, so both are visible together).
+
+**Measured effect — isolated kernel benchmark, clear win:**
+
+```
+256x256, nd=k=8 (same-nd/k, capacity-mismatched):  fwd 20.94µs → 5.28µs (4x), speedup 0.2x → 0.5x
+256x256, K=128 (true equal capacity):               speedup 1.6x → 4.3x
+```
+
+**Measured effect — real training throughput (train_small_lod config,
+same synthetic bench as above): no change (438.4ms → 450.1ms, within
+noise).** Root cause: `forward_batch`'s parallel unit count is
+`n_tokens × P` — at training scale (`seq_len=256, P=4` → 1024 units) this
+is always far above the threshold, so the sequential fallback never
+triggers during real training. It only helps single-token-scale calls
+(future autoregressive decode), which don't exist as a code path yet. This
+is a clean negative result, not a wasted effort: it directly confirms
+Fable's diagnosis that rayon dispatch was never the dominant cost in the
+training regression — the still-unfixed per-token reconstruction
+redundancy (fix #1 above) is.
+
+**Status:** the accessibility goal ("Monarch ≤ BasisMatmul at any scale")
+looks achievable per Fable's analysis, but is not yet delivered — the
+high-impact fix (reconstruction-hoisting across the batch, in both
+`forward_batch` and a new batched `backward`) has not been started. This
+is now the clear next item, ahead of block-sparse attention and the
+ternary/matmul-free TODOs.

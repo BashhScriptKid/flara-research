@@ -256,6 +256,14 @@ fn main() {
     bench(256, 256, 64, 8, 8, iters, &mut rng); // wq / wo
     bench(64,  256, 64, 8, 8, iters, &mut rng); // wk / wv
 
+    // Same shapes, but at true equal parameter count (K=2·m·nd=128 at m=8,
+    // nd=8) instead of nd=k=8 — the row above hands Monarch 16x more
+    // per-block params than BasisMatmul, so it isn't isolating the kernel,
+    // it's mostly measuring a capacity difference. This is the fair version.
+    eprintln!("\n=== Timing @ train_small_lod shapes, equal params (K=2*m*nd=128) (iters={iters}) ===");
+    bench(256, 256, 64, 8, 128, iters, &mut rng); // wq / wo
+    bench(64,  256, 64, 8, 128, iters, &mut rng); // wk / wv
+
     // Crossover search: square P×Q grids at nd=k=8, block=64, between the two
     // known points (256x256 loses at 0.2x, 896x896 wins at 1.3x).
     eprintln!("\n=== Crossover search: square grids, nd=k=8 (iters={iters}) ===");
