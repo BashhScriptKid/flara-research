@@ -2612,3 +2612,77 @@ high-impact fix (reconstruction-hoisting across the batch, in both
 `forward_batch` and a new batched `backward`) has not been started. This
 is now the clear next item, ahead of block-sparse attention and the
 ternary/matmul-free TODOs.
+
+---
+
+## 2026-07-03 — Reconstruction hoisting, take two: parallelize over tokens, not blocks
+
+Implemented the fix flagged above (`expand_block`/`apply_block`/
+`backward_block_hoisted` primitives in `monarch.rs`, splitting weight
+reconstruction from per-token application), gradcheck-verified against
+summed independent per-token `backward()` calls (new test:
+`backward_batch_matches_summed_looped_backward`, 12/12 monarch tests
+pass) — but the first version shipped with a real bug, caught before it
+reached `layer.rs`... and then again after it did.
+
+**First version parallelized `forward_batch`/`backward_batch` over `P`
+(the block-row count), matching the file's existing `forward`/
+`forward_inference` convention.** Wrong choice for this problem: `P` is
+small (4 at `train_small_lod`'s shapes, low tens even at production
+scale), while `n_tokens` (the sequence length, 128-256+) is the axis with
+real work to spread across 12 cores. Wired into `AttnProj`/`layer.rs`
+(new `AttnProj::backward_batch`, replacing the per-token collect+merge
+loop for wq/wk/wv/wo — 89/89 full test suite passes, including the
+whole-model gradcheck tests, so correctness was never in question) — real
+training throughput got *worse* (438ms baseline → 698-734ms/step,
+repeated). A focused isolated-kernel bench pinpointed why: at `P=4` (below
+`PARALLEL_THRESHOLD=8`), `backward_batch` always took the sequential
+branch — losing the old per-token loop's real 12-core parallelism over
+256 tokens entirely, for a hoisting saving that turned out to be much
+smaller than assumed (reconstruction is *not* backward's dominant cost —
+the per-token gradient-accumulation math, `dot8`+`axpy8` over `m·nd`
+pairs, is; isolated looped-vs-batched kernel bench at matched work showed
+only **1.00x**, i.e. no win at all from hoisting alone at this shape).
+
+**Fix: decouple hoisting from parallelization axis entirely.** New
+`expand_all_blocks` reconstructs every `(pp,qq)` block once, unconditionally
+(cheap — `P×Q` is always small), before either forward or backward touches
+a single token. Application/gradient computation then always parallelizes
+over **tokens** — `forward_batch` directly via `par_chunks_mut` (each
+token's output is exclusive, no merge needed); `backward_batch` via
+token-*chunks* sized to `rayon::current_num_threads()` (not one partial
+per token — every token touches every block, so per-token partials would
+mean `n_tokens` full-sized `da1`/`da2` copies; chunking to ~12 groups
+keeps that bounded, each chunk still processes its tokens sequentially,
+accumulating locally, merged at the end — same collect+merge shape used
+elsewhere in this codebase).
+
+**Result, isolated kernel bench (`P=4,Q=4,m=8,nd=8`, `n_tokens=256`,
+`train_small_lod`'s actual wq/wo shape):**
+
+```
+looped (old, per-token):  45.4µs/token
+batched (new):             10.2µs/token
+speedup: 4.45x
+```
+
+**Result, real end-to-end training throughput (same synthetic bench,
+byte-vocab config): noisy, 387-464ms/step across 5 runs, no longer a
+regression (was 698-734ms with the broken P-parallel version) but also
+not a decisive win over the 438-450ms pre-this-fix baseline.** Consistent
+with expectation, not a failure: `Ffn`'s backward (up/gate/down, three
+larger projections — `768×256`/`256×768` vs AttnProj's `256×256`/`64×256`
+— plus MoE routing) is still fully unhoisted, per-token, untouched by this
+pass. At this toy scale FFN is the larger cost center; AttnProj's real,
+verified 4.45x win is now a smaller fraction of a step dominated by
+something this pass didn't touch. Extending the same hoist to `Ffn` (open
+question: how routing interacts with hoisting when different tokens
+activate different blocks — flagged as the "trickier part" before this
+pass started) is the next item, and is where a real full-step win should
+actually show up, if the diagnosis holds.
+
+**Status:** `AttnProj`'s reconstruction-hoisting is done, tested (89/89 full
+suite + new kernel-level backward-batch test), and wired into
+`layer.rs`. `Ffn` is not yet touched. The accessibility goal ("Monarch ≤
+BasisMatmul at any scale") is not yet demonstrated end-to-end — closer
+than before, but still gated on the FFN half of this same fix.

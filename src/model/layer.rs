@@ -513,31 +513,19 @@ impl TransformerLayer {
         }
 
         // ---- attention sub-block ----
-        // O projection: h_mid = hidden + scale·O(attn_out). Same collect+merge shape.
-        struct WoTokenGrad {
-            d_param: Vec<f32>,
-            d_d1: Vec<f32>,
-            d_d2: Vec<f32>,
+        // O projection: h_mid = hidden + scale·O(attn_out). Batched: reconstructs
+        // each Monarch weight block once and reuses it across all t_len tokens
+        // (see SharedMonarchProj::backward_batch), instead of the old per-token
+        // collect+merge loop, which paid the reconstruction cost once per token.
+        let mut d_oi_all = vec![0.0f32; t_len * h];
+        for i in 0..t_len * h {
+            d_oi_all[i] = scale * d_h_mid[i];
         }
-        let mut d_attn_out = vec![0.0f32; t_len * qd];
-        let wo_results: Vec<WoTokenGrad> = {
-            use rayon::prelude::*;
-            (0..t_len).into_par_iter().zip(d_attn_out.par_chunks_mut(qd)).map(|(ti, out_ti)| {
-                let mut d_oi = vec![0.0f32; h];
-                for j in 0..h {
-                    d_oi[j] = scale * d_h_mid[ti * h + j];
-                }
-                let zs_ti = self.wo.zs_at(&fwd.wo_fc, ti);
-                let pg = self.wo.backward(mono_d1, mono_d2, &fwd.attn_out[ti * qd..(ti + 1) * qd], zs_ti, &d_oi);
-                out_ti.copy_from_slice(&pg.d_x);
-                WoTokenGrad { d_param: pg.d_param, d_d1: pg.d_d1, d_d2: pg.d_d2 }
-            }).collect()
-        };
-        for r in &wo_results {
-            add_f(&mut g.d_wo, &r.d_param);
-            add_f(&mut g.d_mono_d1, &r.d_d1);
-            add_f(&mut g.d_mono_d2, &r.d_d2);
-        }
+        let wo_g = self.wo.backward_batch(mono_d1, mono_d2, &fwd.attn_out, &fwd.wo_fc, &d_oi_all, t_len);
+        let d_attn_out = wo_g.d_x;
+        add_f(&mut g.d_wo, &wo_g.d_param);
+        add_f(&mut g.d_mono_d1, &wo_g.d_d1);
+        add_f(&mut g.d_mono_d2, &wo_g.d_d2);
         // Identity residual of the attention sub-block.
         for i in 0..t_len * h {
             g.d_hidden[i] += d_h_mid[i];
@@ -561,59 +549,53 @@ impl TransformerLayer {
 
         // Q/K/V projections → d_normed, then attention-norm backward → d_hidden.
         // Same collect+merge shape as the FFN/wo blocks above.
-        struct QkvTokenGrad {
-            d_wq: Vec<f32>,
-            d_wk: Vec<f32>,
-            d_wv: Vec<f32>,
-            d_mono_d1: Vec<f32>,
-            d_mono_d2: Vec<f32>,
-            d_norm_gain: Vec<f32>,
+        // Batched, same reasoning as the wo block above: each of wq/wk/wv
+        // reconstructs its weight blocks once and reuses them across the
+        // whole sequence. norm::backward is per-token and nonlinear (can't
+        // be hoisted the same way), so it stays in a collect+merge loop —
+        // but now it's the *only* thing left in that loop.
+        let wq_g = self.wq.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wq_fc, &dq, t_len);
+        let wk_g = self.wk.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wk_fc, &dk, t_len);
+        let wv_g = self.wv.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wv_fc, &dv, t_len);
+        add_f(&mut g.d_wq, &wq_g.d_param);
+        add_f(&mut g.d_wk, &wk_g.d_param);
+        add_f(&mut g.d_wv, &wv_g.d_param);
+        add_f(&mut g.d_mono_d1, &wq_g.d_d1);
+        add_f(&mut g.d_mono_d1, &wk_g.d_d1);
+        add_f(&mut g.d_mono_d1, &wv_g.d_d1);
+        add_f(&mut g.d_mono_d2, &wq_g.d_d2);
+        add_f(&mut g.d_mono_d2, &wk_g.d_d2);
+        add_f(&mut g.d_mono_d2, &wv_g.d_d2);
+
+        let mut d_normed = vec![0.0f32; t_len * h];
+        for i in 0..t_len * h {
+            d_normed[i] = wq_g.d_x[i] + wk_g.d_x[i] + wv_g.d_x[i];
         }
-        let qkv_results: Vec<QkvTokenGrad> = {
+        struct NormTokenGrad {
+            dx: Vec<f32>,
+            dg: Vec<f32>,
+        }
+        let norm_results: Vec<NormTokenGrad> = {
             use rayon::prelude::*;
-            (0..t_len).into_par_iter().zip(g.d_hidden.par_chunks_mut(h)).map(|(ti, dh_ti)| {
-                let nrm = &fwd.normed[ti * h..(ti + 1) * h];
-                let gq = self.wq.backward(mono_d1, mono_d2, nrm, self.wq.zs_at(&fwd.wq_fc, ti), &dq[ti * qd..(ti + 1) * qd]);
-                let gk = self.wk.backward(mono_d1, mono_d2, nrm, self.wk.zs_at(&fwd.wk_fc, ti), &dk[ti * kvd..(ti + 1) * kvd]);
-                let gv = self.wv.backward(mono_d1, mono_d2, nrm, self.wv.zs_at(&fwd.wv_fc, ti), &dv[ti * kvd..(ti + 1) * kvd]);
-
-                let mut d_mono_d1 = gq.d_d1;
-                for (a, b) in d_mono_d1.iter_mut().zip(&gk.d_d1) { *a += *b; }
-                for (a, b) in d_mono_d1.iter_mut().zip(&gv.d_d1) { *a += *b; }
-                let mut d_mono_d2 = gq.d_d2;
-                for (a, b) in d_mono_d2.iter_mut().zip(&gk.d_d2) { *a += *b; }
-                for (a, b) in d_mono_d2.iter_mut().zip(&gv.d_d2) { *a += *b; }
-
-                let mut d_normed = vec![0.0f32; h];
-                for j in 0..h {
-                    d_normed[j] = gq.d_x[j] + gk.d_x[j] + gv.d_x[j];
-                }
+            (0..t_len).into_par_iter().map(|ti| {
                 let mut dx = vec![0.0f32; h];
                 let mut dg = vec![0.0f32; h];
                 norm::backward(
                     &hidden[ti * h..(ti + 1) * h],
                     &self.attn_norm_gain,
-                    &d_normed,
+                    &d_normed[ti * h..(ti + 1) * h],
                     fwd.rinv[ti],
                     &mut dx,
                     &mut dg,
                 );
-                for j in 0..h {
-                    dh_ti[j] += dx[j];
-                }
-                QkvTokenGrad {
-                    d_wq: gq.d_param, d_wk: gk.d_param, d_wv: gv.d_param,
-                    d_mono_d1, d_mono_d2, d_norm_gain: dg,
-                }
+                NormTokenGrad { dx, dg }
             }).collect()
         };
-        for r in &qkv_results {
-            add_f(&mut g.d_wq, &r.d_wq);
-            add_f(&mut g.d_wk, &r.d_wk);
-            add_f(&mut g.d_wv, &r.d_wv);
-            add_f(&mut g.d_mono_d1, &r.d_mono_d1);
-            add_f(&mut g.d_mono_d2, &r.d_mono_d2);
-            add_f(&mut g.d_attn_norm_gain, &r.d_norm_gain);
+        for (ti, r) in norm_results.into_iter().enumerate() {
+            for j in 0..h {
+                g.d_hidden[ti * h + j] += r.dx[j];
+            }
+            add_f(&mut g.d_attn_norm_gain, &r.dg);
         }
 
         // Probe head: gradient-stopped, so params only — no path into d_hidden.

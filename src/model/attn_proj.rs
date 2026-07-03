@@ -74,6 +74,17 @@ pub struct ProjGrads {
     pub d_x: Vec<f32>,
 }
 
+/// Same as [`ProjGrads`], batched over `t_len` tokens: `d_x` is
+/// `[t_len, in_]`; `d_param`/`d_d1`/`d_d2` are already summed across every
+/// token in the batch (they're weight gradients, one value per parameter
+/// regardless of batch size).
+pub struct ProjGradsBatch {
+    pub d_param: Vec<f32>,
+    pub d_d1: Vec<f32>,
+    pub d_d2: Vec<f32>,
+    pub d_x: Vec<f32>,
+}
+
 impl AttnProj {
     /// Construct per the [`DENSE_ATTN`] switch. `block` is the Monarch block
     /// size `b = m²` (so `m = √block`); `k` is the atom count `nd`.
@@ -195,6 +206,43 @@ impl AttnProj {
                     }
                 }
                 ProjGrads { d_param: d_w, d_d1: Vec::new(), d_d2: Vec::new(), d_x }
+            }
+        }
+    }
+
+    /// Batched VJP: `x` is `[t_len, in_]`, `cache` is the [`FwdCache`] from a
+    /// matching `forward_batch` call, `dy` is `[t_len, out]`. For the Monarch
+    /// path this reconstructs each weight block once and reuses it across
+    /// every token (see [`SharedMonarchProj::backward_batch`]) instead of
+    /// once per token, which is what `backward` called in a loop would do.
+    pub fn backward_batch(&self, d1: &[f32], d2: &[f32], x: &[f32], cache: &FwdCache, dy: &[f32], t_len: usize) -> ProjGradsBatch {
+        match &self.kind {
+            ProjKind::Monarch { proj } => {
+                let mut dx = vec![0.0f32; t_len * self.in_];
+                let g: MonarchGrads = proj.backward_batch(d1, d2, x, &cache.zs, dy, &mut dx, t_len);
+                let mut d_param = Vec::with_capacity(g.da1.len() + g.da2.len());
+                d_param.extend_from_slice(&g.da1);
+                d_param.extend_from_slice(&g.da2);
+                ProjGradsBatch { d_param, d_d1: g.dd1, d_d2: g.dd2, d_x: dx }
+            }
+            ProjKind::Dense { w } => {
+                let mut d_w = vec![0.0f32; self.out * self.in_];
+                let mut d_x = vec![0.0f32; t_len * self.in_];
+                for t in 0..t_len {
+                    let xi = &x[t * self.in_..(t + 1) * self.in_];
+                    let dyi = &dy[t * self.out..(t + 1) * self.out];
+                    let dxi = &mut d_x[t * self.in_..(t + 1) * self.in_];
+                    for o in 0..self.out {
+                        let dyo = dyi[o];
+                        let row = &w[o * self.in_..(o + 1) * self.in_];
+                        let dwr = &mut d_w[o * self.in_..(o + 1) * self.in_];
+                        for i in 0..self.in_ {
+                            dwr[i] += dyo * xi[i];
+                            dxi[i] += row[i] * dyo;
+                        }
+                    }
+                }
+                ProjGradsBatch { d_param: d_w, d_d1: Vec::new(), d_d2: Vec::new(), d_x }
             }
         }
     }
