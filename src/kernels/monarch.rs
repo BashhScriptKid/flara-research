@@ -780,10 +780,13 @@ impl SharedMonarchProj {
         (y, FwdCache { zs })
     }
 
-    /// Forward for `n_tokens` tokens in one call — see
-    /// [`SharedMonarchMatmul::forward_batch`] for why this exists (amortizing
-    /// rayon dispatch overhead across a whole sequence instead of paying it
-    /// once per token).
+    /// Forward for `n_tokens` tokens in one call. Block-major: the effective
+    /// weight blocks are reconstructed from the shared dictionary **once per
+    /// `(pp,qq)` block**, not once per token — reconstruction depends only on
+    /// weights, which are fixed for the whole batch. See RESEARCH_LOG.md
+    /// (2026-07-03, Fable review) for why the earlier token-major version
+    /// (reconstruct-per-token) was the dominant cost of the real
+    /// training-throughput regression.
     pub fn forward_batch(&self, d1: &[f32], d2: &[f32], x: &[f32], n_tokens: usize) -> (Vec<f32>, FwdCache) {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
@@ -791,21 +794,20 @@ impl SharedMonarchProj {
         let mut y   = vec![0.0f32; n_tokens * p * b];
         let mut zs  = vec![0.0f32; n_tokens * p * q * b];
 
-        if n_tokens * p < Self::PARALLEL_THRESHOLD {
-            let mut eff = vec![0.0f32; b];
-            let mut y1  = vec![0.0f32; b];
-            for t in 0..n_tokens {
-                let x_t = &x[t * in_dim..(t + 1) * in_dim];
-                for pp in 0..p {
-                    let ypp = &mut y[(t * p + pp) * b..(t * p + pp + 1) * b];
-                    for qq in 0..q {
-                        let z = &mut zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
-                        SharedMonarchMatmul::fwd_block(
-                            d1, d2,
-                            self.a1_blk(pp, qq), self.a2_blk(pp, qq),
-                            &x_t[qq * b..(qq + 1) * b],
-                            m, nd, &mut y1, z, ypp, &mut eff,
-                        );
+        if p < Self::PARALLEL_THRESHOLD {
+            let mut eff1 = vec![0.0f32; m * b];
+            let mut eff2 = vec![0.0f32; m * b];
+            let mut y1   = vec![0.0f32; b];
+            for pp in 0..p {
+                for qq in 0..q {
+                    SharedMonarchMatmul::expand_block(
+                        d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq), m, nd, &mut eff1, &mut eff2,
+                    );
+                    for t in 0..n_tokens {
+                        let x_t  = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
+                        let ypp  = &mut y[(t * p + pp) * b..(t * p + pp + 1) * b];
+                        let z    = &mut zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        SharedMonarchMatmul::apply_block(&eff1, &eff2, x_t, m, &mut y1, z, ypp);
                     }
                 }
             }
@@ -813,27 +815,132 @@ impl SharedMonarchProj {
         }
 
         use rayon::prelude::*;
-        let units: Vec<(&mut [f32], &mut [f32])> = y.chunks_mut(b)
-            .zip(zs.chunks_mut(q * b))
-            .collect();
-
-        units.into_par_iter().enumerate().for_each(|(idx, (ypp, zs_pp))| {
-            let t  = idx / p;
-            let pp = idx % p;
-            let x_t = &x[t * in_dim..(t + 1) * in_dim];
-            let mut eff = vec![0.0f32; b];
-            let mut y1  = vec![0.0f32; b];
+        let results: Vec<(Vec<f32>, Vec<f32>)> = (0..p).into_par_iter().map(|pp| {
+            let mut y_pp  = vec![0.0f32; n_tokens * b];
+            let mut zs_pp = vec![0.0f32; n_tokens * q * b];
+            let mut eff1 = vec![0.0f32; m * b];
+            let mut eff2 = vec![0.0f32; m * b];
+            let mut y1   = vec![0.0f32; b];
             for qq in 0..q {
-                let z = &mut zs_pp[qq * b..(qq + 1) * b];
-                SharedMonarchMatmul::fwd_block(
-                    d1, d2,
-                    self.a1_blk(pp, qq), self.a2_blk(pp, qq),
-                    &x_t[qq * b..(qq + 1) * b],
-                    m, nd, &mut y1, z, ypp, &mut eff,
+                SharedMonarchMatmul::expand_block(
+                    d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq), m, nd, &mut eff1, &mut eff2,
                 );
+                for t in 0..n_tokens {
+                    let x_t = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
+                    let out = &mut y_pp[t * b..(t + 1) * b];
+                    let z   = &mut zs_pp[(t * q + qq) * b..(t * q + qq + 1) * b];
+                    SharedMonarchMatmul::apply_block(&eff1, &eff2, x_t, m, &mut y1, z, out);
+                }
             }
-        });
+            (y_pp, zs_pp)
+        }).collect();
+
+        for (pp, (y_pp, zs_pp)) in results.into_iter().enumerate() {
+            for t in 0..n_tokens {
+                y[(t * p + pp) * b..(t * p + pp + 1) * b].copy_from_slice(&y_pp[t * b..(t + 1) * b]);
+                let dst = &mut zs[(t * p + pp) * q * b..(t * p + pp + 1) * q * b];
+                dst.copy_from_slice(&zs_pp[t * q * b..(t + 1) * q * b]);
+            }
+        }
         (y, FwdCache { zs })
+    }
+
+    /// VJP for `forward_batch`. Same block-major hoist: gradients w.r.t.
+    /// coefficients/dictionary that are inherently per-token (they read this
+    /// token's cached `z`/`x`) still touch every token, but the effective
+    /// block reconstruction happens once per `(pp,qq)` and is reused across
+    /// the whole batch. `dx` is `[n_tokens, in_dim]` and is zeroed here
+    /// (every block that reads a given `qq` slice accumulates into it with
+    /// `+=`).
+    pub fn backward_batch(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32], n_tokens: usize,
+    ) -> Grads {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        let in_dim = q * b;
+        dx.iter_mut().for_each(|v| *v = 0.0);
+
+        if p < Self::PARALLEL_THRESHOLD {
+            let mut g = Grads {
+                dd1: vec![0.0f32; nd * b],
+                dd2: vec![0.0f32; nd * b],
+                da1: vec![0.0f32; p * q * m * nd],
+                da2: vec![0.0f32; p * q * m * nd],
+            };
+            let mut eff1 = vec![0.0f32; m * b];
+            let mut eff2 = vec![0.0f32; m * b];
+            let mut dz  = vec![0.0f32; b];
+            let mut dy1 = vec![0.0f32; b];
+            for pp in 0..p {
+                for qq in 0..q {
+                    SharedMonarchMatmul::expand_block(
+                        d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq), m, nd, &mut eff1, &mut eff2,
+                    );
+                    let da_base = (pp * q + qq) * m * nd;
+                    for t in 0..n_tokens {
+                        let x_blk   = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
+                        let z       = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        let dout_pp = &dout[(t * p + pp) * b..(t * p + pp + 1) * b];
+                        let dx_blk  = &mut dx[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
+                        SharedMonarchMatmul::backward_block_hoisted(
+                            d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq),
+                            &eff1, &eff2, x_blk, z, dout_pp, dx_blk,
+                            m, nd, da_base,
+                            &mut g.da1, &mut g.da2, &mut g.dd1, &mut g.dd2,
+                            &mut dz, &mut dy1,
+                        );
+                    }
+                }
+            }
+            return g;
+        }
+
+        use rayon::prelude::*;
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> = (0..p).into_par_iter().map(|pp| {
+            let mut dd1_p = vec![0.0f32; nd * b];
+            let mut dd2_p = vec![0.0f32; nd * b];
+            let mut da1_p = vec![0.0f32; q * m * nd]; // this pp's block-rows only
+            let mut da2_p = vec![0.0f32; q * m * nd];
+            let mut dx_p  = vec![0.0f32; n_tokens * in_dim];
+            let mut eff1 = vec![0.0f32; m * b];
+            let mut eff2 = vec![0.0f32; m * b];
+            let mut dz  = vec![0.0f32; b];
+            let mut dy1 = vec![0.0f32; b];
+            for qq in 0..q {
+                SharedMonarchMatmul::expand_block(
+                    d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq), m, nd, &mut eff1, &mut eff2,
+                );
+                let da_base = qq * m * nd;
+                for t in 0..n_tokens {
+                    let x_blk   = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
+                    let z       = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                    let dout_pp = &dout[(t * p + pp) * b..(t * p + pp + 1) * b];
+                    let dx_blk  = &mut dx_p[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
+                    SharedMonarchMatmul::backward_block_hoisted(
+                        d1, d2, self.a1_blk(pp, qq), self.a2_blk(pp, qq),
+                        &eff1, &eff2, x_blk, z, dout_pp, dx_blk,
+                        m, nd, da_base,
+                        &mut da1_p, &mut da2_p, &mut dd1_p, &mut dd2_p,
+                        &mut dz, &mut dy1,
+                    );
+                }
+            }
+            (dd1_p, dd2_p, da1_p, da2_p, dx_p)
+        }).collect();
+
+        let mut g = Grads {
+            dd1: vec![0.0f32; nd * b],
+            dd2: vec![0.0f32; nd * b],
+            da1: vec![0.0f32; p * q * m * nd],
+            da2: vec![0.0f32; p * q * m * nd],
+        };
+        for (pp, (dd1_p, dd2_p, da1_p, da2_p, dx_p)) in results.into_iter().enumerate() {
+            for i in 0..nd * b { g.dd1[i] += dd1_p[i]; g.dd2[i] += dd2_p[i]; }
+            g.da1[pp * q * m * nd..(pp + 1) * q * m * nd].copy_from_slice(&da1_p);
+            g.da2[pp * q * m * nd..(pp + 1) * q * m * nd].copy_from_slice(&da2_p);
+            for i in 0..dx.len() { dx[i] += dx_p[i]; }
+        }
+        g
     }
 
     /// Slice a single token's `zs` out of a batched `forward_batch` cache (or
@@ -1157,6 +1264,250 @@ impl SharedMonarchProj {
                 let dx_i = &mut dx[qq * b + i * m..qq * b + (i + 1) * m];
                 for c in 0..m { dx_i[c] += d_y * eff_i[r * m + c]; }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hoisted-reconstruction primitives: split "rebuild the effective block from
+// the shared dictionary" (weight-only, independent of any token) out of the
+// per-token math, so a batched caller can reconstruct once per (pp,qq) block
+// and reuse it across every token in the batch. See RESEARCH_LOG.md
+// (2026-07-03, Fable review) — the un-hoisted per-token reconstruction was
+// the dominant cost of the real training-throughput regression.
+// ---------------------------------------------------------------------------
+
+impl SharedMonarchMatmul {
+    /// Rebuild the `m` stage-1 and `m` stage-2 effective row/col matrices for
+    /// one `(pp,qq)` block from the shared dictionary. `eff1`/`eff2` must
+    /// each be `m*b` long. Weight-only — safe to call once per block and
+    /// reuse across an entire token batch.
+    fn expand_block(
+        d1: &[f32], d2: &[f32], a1_blk: &[f32], a2_blk: &[f32],
+        m: usize, nd: usize, eff1: &mut [f32], eff2: &mut [f32],
+    ) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if m == 8 {
+            unsafe { expand_block_avx2(d1, d2, a1_blk, a2_blk, nd, eff1, eff2); }
+            return;
+        }
+        let b = m * m;
+        for i in 0..m {
+            let e = &mut eff1[i * b..(i + 1) * b];
+            e.fill(0.0);
+            for d in 0..nd {
+                let a = a1_blk[i * nd + d];
+                let atom = &d1[d * b..d * b + b];
+                for c in 0..b { e[c] += a * atom[c]; }
+            }
+        }
+        for j in 0..m {
+            let e = &mut eff2[j * b..(j + 1) * b];
+            e.fill(0.0);
+            for d in 0..nd {
+                let a = a2_blk[j * nd + d];
+                let atom = &d2[d * b..d * b + b];
+                for c in 0..b { e[c] += a * atom[c]; }
+            }
+        }
+    }
+
+    /// Apply an already-expanded block to one token's input, accumulating
+    /// into `out` (matches `fwd_block`'s `+=` convention on `out`).
+    fn apply_block(
+        eff1: &[f32], eff2: &[f32], x_blk: &[f32], m: usize,
+        y1: &mut [f32], z: &mut [f32], out: &mut [f32],
+    ) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if m == 8 {
+            unsafe { apply_block_avx2(eff1, eff2, x_blk, y1, z, out); }
+            return;
+        }
+        let b = m * m;
+        for i in 0..m {
+            let xi = &x_blk[i * m..(i + 1) * m];
+            let e = &eff1[i * b..(i + 1) * b];
+            for r in 0..m {
+                let mut acc = 0.0f32;
+                for c in 0..m { acc += e[r * m + c] * xi[c]; }
+                y1[i * m + r] = acc;
+            }
+        }
+        for i in 0..m { for j in 0..m { z[j * m + i] = y1[i * m + j]; } }
+        for j in 0..m {
+            let zj = &z[j * m..(j + 1) * m];
+            let e = &eff2[j * b..(j + 1) * b];
+            for r in 0..m {
+                let mut acc = 0.0f32;
+                for c in 0..m { acc += e[r * m + c] * zj[c]; }
+                out[j * m + r] += acc;
+            }
+        }
+    }
+
+    /// VJP for one `(pp,qq,token)` triple against an already-expanded block.
+    /// `da_base`/`g_da1`/`g_da2` follow `backward_block`'s convention (full
+    /// model-wide `da1`/`da2` slices, indexed at this block's offset);
+    /// `g_dd1`/`g_dd2` are the shared-dictionary gradient accumulators
+    /// (summed across every block and token that reads them). `dz`/`dy1`
+    /// are scratch, caller-owned to avoid a per-call allocation.
+    #[allow(clippy::too_many_arguments)]
+    fn backward_block_hoisted(
+        d1: &[f32], d2: &[f32], a1_blk: &[f32], a2_blk: &[f32],
+        eff1: &[f32], eff2: &[f32],
+        x_blk: &[f32], z: &[f32], dout_pp: &[f32], dx_blk: &mut [f32],
+        m: usize, nd: usize, da_base: usize,
+        g_da1: &mut [f32], g_da2: &mut [f32], g_dd1: &mut [f32], g_dd2: &mut [f32],
+        dz: &mut [f32], dy1: &mut [f32],
+    ) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if m == 8 {
+            unsafe {
+                bwd_block_avx2_hoisted(
+                    d1.as_ptr(), d2.as_ptr(),
+                    a1_blk.as_ptr(), a2_blk.as_ptr(),
+                    eff1.as_ptr(), eff2.as_ptr(),
+                    x_blk.as_ptr(), z.as_ptr(), dout_pp.as_ptr(), nd,
+                    g_da1.as_mut_ptr().add(da_base), g_da2.as_mut_ptr().add(da_base),
+                    g_dd1.as_mut_ptr(), g_dd2.as_mut_ptr(),
+                    dx_blk.as_mut_ptr(),
+                );
+            }
+            return;
+        }
+
+        let b = m * m;
+        dz.fill(0.0);
+        for j in 0..m {
+            let zj = &z[j * m..(j + 1) * m];
+            let dout_j = &dout_pp[j * m..(j + 1) * m];
+            let eff_j = &eff2[j * b..(j + 1) * b];
+            for r in 0..m {
+                let dy = dout_j[r];
+                for c in 0..m { dz[j * m + c] += eff_j[r * m + c] * dy; }
+            }
+            for r in 0..m {
+                let dy = dout_j[r];
+                if dy == 0.0 { continue; }
+                for d in 0..nd {
+                    let a = a2_blk[j * nd + d];
+                    let drow = &d2[(d * m + r) * m..(d * m + r) * m + m];
+                    let u = gemm::dot(drow, zj);
+                    g_da2[da_base + j * nd + d] += dy * u;
+                    let dd2row = &mut g_dd2[(d * m + r) * m..(d * m + r) * m + m];
+                    for c in 0..m { dd2row[c] += dy * a * zj[c]; }
+                }
+            }
+        }
+        dy1.fill(0.0);
+        for j in 0..m { for i in 0..m { dy1[i * m + j] = dz[j * m + i]; } }
+        for i in 0..m {
+            let xi = &x_blk[i * m..(i + 1) * m];
+            let dy1_i = &dy1[i * m..(i + 1) * m];
+            let eff_i = &eff1[i * b..(i + 1) * b];
+            for r in 0..m {
+                let d_y = dy1_i[r];
+                if d_y == 0.0 { continue; }
+                for d in 0..nd {
+                    let a = a1_blk[i * nd + d];
+                    let drow = &d1[(d * m + r) * m..(d * m + r) * m + m];
+                    let u = gemm::dot(drow, xi);
+                    g_da1[da_base + i * nd + d] += d_y * u;
+                    let dd1row = &mut g_dd1[(d * m + r) * m..(d * m + r) * m + m];
+                    for c in 0..m { dd1row[c] += d_y * a * xi[c]; }
+                }
+                let dx_i = &mut dx_blk[i * m..(i + 1) * m];
+                for c in 0..m { dx_i[c] += d_y * eff_i[r * m + c]; }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn expand_block_avx2(
+    d1: &[f32], d2: &[f32], a1_blk: &[f32], a2_blk: &[f32], nd: usize,
+    eff1: &mut [f32], eff2: &mut [f32],
+) {
+    const M: usize = 8;
+    const B: usize = 64;
+    for i in 0..M {
+        let e = eff1.as_mut_ptr().add(i * B);
+        axpy64_init(e, d1.as_ptr(), *a1_blk.get_unchecked(i * nd));
+        for d in 1..nd { axpy64(e, d1.as_ptr().add(d * B), *a1_blk.get_unchecked(i * nd + d)); }
+    }
+    for j in 0..M {
+        let e = eff2.as_mut_ptr().add(j * B);
+        axpy64_init(e, d2.as_ptr(), *a2_blk.get_unchecked(j * nd));
+        for d in 1..nd { axpy64(e, d2.as_ptr().add(d * B), *a2_blk.get_unchecked(j * nd + d)); }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn apply_block_avx2(
+    eff1: &[f32], eff2: &[f32], x_blk: &[f32], y1: &mut [f32], z: &mut [f32], out: &mut [f32],
+) {
+    const M: usize = 8;
+    for i in 0..M {
+        matvec8(y1.as_mut_ptr().add(i * M), eff1.as_ptr().add(i * 64), x_blk.as_ptr().add(i * M));
+    }
+    for i in 0..M { for j in 0..M { *z.get_unchecked_mut(j * M + i) = *y1.get_unchecked(i * M + j); } }
+    for j in 0..M {
+        matvec8_accum(out.as_mut_ptr().add(j * M), eff2.as_ptr().add(j * 64), z.as_ptr().add(j * M));
+    }
+}
+
+/// Same math as `bwd_block_avx2`, but `eff1`/`eff2` are precomputed
+/// (via `expand_block_avx2`) rather than rebuilt from the dictionary on
+/// every call — the da/dd accumulation still touches `d1`/`d2` directly
+/// since those gradients are inherently per-token (depend on this token's
+/// `x`/`z`), but the `dz`/`dx` propagation reuses the hoisted `eff`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bwd_block_avx2_hoisted(
+    d1: *const f32, d2: *const f32,
+    a1_blk: *const f32, a2_blk: *const f32,
+    eff1: *const f32, eff2: *const f32,
+    x_blk: *const f32, z: *const f32,
+    dout_pp: *const f32, nd: usize,
+    da1: *mut f32, da2: *mut f32,
+    dd1: *mut f32, dd2: *mut f32,
+    dx: *mut f32,
+) {
+    const M: usize = 8;
+    const B: usize = 64;
+    let mut dz  = [0.0f32; B];
+    let mut dy1 = [0.0f32; B];
+
+    for j in 0..M {
+        let zj     = z.add(j * M);
+        let dout_j = dout_pp.add(j * M);
+        let eff    = eff2.add(j * B);
+        let dz_j = dz.as_mut_ptr().add(j * M);
+        for r in 0..M { axpy8(dz_j, eff.add(r * M), *dout_j.add(r)); }
+        for r in 0..M {
+            let dy = *dout_j.add(r);
+            for d in 0..nd {
+                let a = *a2_blk.add(j * nd + d);
+                *da2.add(j * nd + d) += dy * dot8(d2.add((d * M + r) * M), zj);
+                axpy8(dd2.add((d * M + r) * M), zj, dy * a);
+            }
+        }
+    }
+    for i in 0..M { for j in 0..M { dy1[i*M+j] = dz[j*M+i]; } }
+    for i in 0..M {
+        let xi    = x_blk.add(i * M);
+        let dy1_i = dy1.as_ptr().add(i * M);
+        let eff   = eff1.add(i * B);
+        for r in 0..M {
+            let d_y = *dy1_i.add(r);
+            for d in 0..nd {
+                let a = *a1_blk.add(i * nd + d);
+                *da1.add(i * nd + d) += d_y * dot8(d1.add((d * M + r) * M), xi);
+                axpy8(dd1.add((d * M + r) * M), xi, d_y * a);
+            }
+            axpy8(dx.add(i * M), eff.add(r * M), d_y);
         }
     }
 }
@@ -1555,5 +1906,68 @@ mod tests {
             assert!((g_full.da1[i] - g_cols.da1[i]).abs() < 1e-6, "da1[{i}]");
             assert!((g_full.da2[i] - g_cols.da2[i]).abs() < 1e-6, "da2[{i}]");
         }
+    }
+
+    fn backward_batch_matches_summed_looped_backward_at(p: usize, q: usize) {
+        // forward_batch/backward_batch reconstruct each (pp,qq) block's
+        // effective weight once and reuse it across every token, instead of
+        // once per (token,pp,qq) — this proves the hoist didn't change the
+        // math: backward_batch's grads must equal the sum, over tokens, of
+        // independent single-token backward() calls, and dx per token must
+        // match exactly (not just in aggregate).
+        let (m, nd) = (8, 4);
+        let (d1, d2) = init_shared_atoms(nd, m, 0x51DE);
+        let proj = SharedMonarchProj::new(p, q, m, nd, 0xF00D);
+        let b = m * m;
+        let in_dim = q * b;
+        let out_dim = p * b;
+        let n_tokens = 5;
+
+        let x: Vec<f32> = randvec(n_tokens * in_dim, 0x1010);
+        let dout: Vec<f32> = randvec(n_tokens * out_dim, 0x2020);
+
+        let (_, cache_batch) = proj.forward_batch(&d1, &d2, &x, n_tokens);
+        let mut dx_batch = vec![0.0f32; n_tokens * in_dim];
+        let g_batch = proj.backward_batch(&d1, &d2, &x, &cache_batch.zs, &dout, &mut dx_batch, n_tokens);
+
+        let mut g_looped = Grads {
+            dd1: vec![0.0f32; nd * b],
+            dd2: vec![0.0f32; nd * b],
+            da1: vec![0.0f32; p * q * m * nd],
+            da2: vec![0.0f32; p * q * m * nd],
+        };
+        for t in 0..n_tokens {
+            let x_t = &x[t * in_dim..(t + 1) * in_dim];
+            let dout_t = &dout[t * out_dim..(t + 1) * out_dim];
+            let (_, cache_t) = proj.forward(&d1, &d2, x_t);
+            let mut dx_t = vec![0.0f32; in_dim];
+            let g_t = proj.backward(&d1, &d2, x_t, &cache_t.zs, dout_t, &mut dx_t);
+
+            for i in 0..in_dim {
+                let got = dx_batch[t * in_dim + i];
+                assert!((got - dx_t[i]).abs() < 1e-5, "p={p} q={q} token {t} dx[{i}]: batch={got} looped={}", dx_t[i]);
+            }
+            for i in 0..g_t.da1.len() { g_looped.da1[i] += g_t.da1[i]; }
+            for i in 0..g_t.da2.len() { g_looped.da2[i] += g_t.da2[i]; }
+            for i in 0..g_t.dd1.len() { g_looped.dd1[i] += g_t.dd1[i]; }
+            for i in 0..g_t.dd2.len() { g_looped.dd2[i] += g_t.dd2[i]; }
+        }
+
+        for i in 0..g_batch.da1.len() {
+            assert!((g_batch.da1[i] - g_looped.da1[i]).abs() < 1e-4, "p={p} q={q} da1[{i}]: batch={} looped={}", g_batch.da1[i], g_looped.da1[i]);
+            assert!((g_batch.da2[i] - g_looped.da2[i]).abs() < 1e-4, "p={p} q={q} da2[{i}]: batch={} looped={}", g_batch.da2[i], g_looped.da2[i]);
+        }
+        for i in 0..g_batch.dd1.len() {
+            assert!((g_batch.dd1[i] - g_looped.dd1[i]).abs() < 1e-4, "p={p} q={q} dd1[{i}]: batch={} looped={}", g_batch.dd1[i], g_looped.dd1[i]);
+            assert!((g_batch.dd2[i] - g_looped.dd2[i]).abs() < 1e-4, "p={p} q={q} dd2[{i}]: batch={} looped={}", g_batch.dd2[i], g_looped.dd2[i]);
+        }
+    }
+
+    #[test]
+    fn backward_batch_matches_summed_looped_backward() {
+        // p=3 exercises the sequential branch (p < PARALLEL_THRESHOLD=8);
+        // p=10 exercises the rayon-parallel branch.
+        backward_batch_matches_summed_looped_backward_at(3, 2);
+        backward_batch_matches_summed_looped_backward_at(10, 2);
     }
 }
