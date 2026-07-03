@@ -214,6 +214,7 @@ unsafe fn head_backward_avx2(
 /// Dot product `Σ_i a[i]·b[i]` over two equal-length slices, AVX2+FMA when present.
 /// Used for the complex-dot reductions in `BasisMatmul::backward` (over interleaved
 /// re/im), which are reductions and so do not auto-vectorize.
+#[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]

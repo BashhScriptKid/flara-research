@@ -405,11 +405,13 @@ impl TransformerLayer {
             let _t = Timer::start(&profiling::FFN_FWD);
             self.ffn.compute_batch(ffn_d1, ffn_d2, &normed2, &sels, t_len)
         };
-        let mut out = h_mid.clone();
+        let mut out = vec![0.0f32; t_len * h];
         for ti in 0..t_len {
+            let src = &h_mid[ti * h..(ti + 1) * h];
+            let ffn = &ffn_fwds.out[ti * h..(ti + 1) * h];
             let dst = &mut out[ti * h..(ti + 1) * h];
             for j in 0..h {
-                dst[j] += scale * ffn_fwds.out[ti * h + j];
+                dst[j] = src[j] + scale * ffn[j];
             }
         }
 
