@@ -782,7 +782,7 @@ impl SharedMonarchProj {
 
     /// Reconstruct every `(pp,qq)` block's effective weight once — weight-only,
     /// independent of any token — into flat `[p*q, m*b]`-shaped buffers.
-    fn expand_all_blocks(d1: &[f32], d2: &[f32], a1: &[f32], a2: &[f32], p: usize, q: usize, m: usize, nd: usize) -> (Vec<f32>, Vec<f32>) {
+    pub fn expand_all_blocks(d1: &[f32], d2: &[f32], a1: &[f32], a2: &[f32], p: usize, q: usize, m: usize, nd: usize) -> (Vec<f32>, Vec<f32>) {
         let b = m * m;
         let mut eff1_all = vec![0.0f32; p * q * m * b];
         let mut eff2_all = vec![0.0f32; p * q * m * b];
@@ -1529,7 +1529,7 @@ impl SharedMonarchMatmul {
     /// one `(pp,qq)` block from the shared dictionary. `eff1`/`eff2` must
     /// each be `m*b` long. Weight-only — safe to call once per block and
     /// reuse across an entire token batch.
-    fn expand_block(
+    pub fn expand_block(
         d1: &[f32], d2: &[f32], a1_blk: &[f32], a2_blk: &[f32],
         m: usize, nd: usize, eff1: &mut [f32], eff2: &mut [f32],
     ) {
@@ -1561,7 +1561,7 @@ impl SharedMonarchMatmul {
 
     /// Apply an already-expanded block to one token's input, accumulating
     /// into `out` (matches `fwd_block`'s `+=` convention on `out`).
-    fn apply_block(
+    pub fn apply_block(
         eff1: &[f32], eff2: &[f32], x_blk: &[f32], m: usize,
         y1: &mut [f32], z: &mut [f32], out: &mut [f32],
     ) {
@@ -1599,7 +1599,7 @@ impl SharedMonarchMatmul {
     /// (summed across every block and token that reads them). `dz`/`dy1`
     /// are scratch, caller-owned to avoid a per-call allocation.
     #[allow(clippy::too_many_arguments)]
-    fn backward_block_hoisted(
+    pub fn backward_block_hoisted(
         d1: &[f32], d2: &[f32], a1_blk: &[f32], a2_blk: &[f32],
         eff1: &[f32], eff2: &[f32],
         x_blk: &[f32], z: &[f32], dout_pp: &[f32], dx_blk: &mut [f32],
@@ -1756,6 +1756,81 @@ unsafe fn bwd_block_avx2_hoisted(
             }
             axpy8(dx.add(i * M), eff.add(r * M), d_y);
         }
+    }
+}
+
+/// Research-only variant of `bwd_block_avx2_hoisted` that skips the
+/// `dd1`/`dd2` (shared-dictionary gradient) accumulation entirely — i.e. the
+/// "frozen dictionary, learn coefficients only" experiment (Opus review,
+/// RESEARCH_LOG.md 2026-07-03): `axpy8(dd*, ...)` is exactly half of the
+/// da/dd inner-loop work per `(r,d)` pair. Not wired into the live model —
+/// freezing the dictionary is a training/capacity decision, not just a perf
+/// one, and needs its own evaluation. Used by `bench_frozen_dict` only.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn bwd_block_avx2_hoisted_frozen(
+    d1: *const f32, d2: *const f32,
+    a1_blk: *const f32, a2_blk: *const f32,
+    eff1: *const f32, eff2: *const f32,
+    x_blk: *const f32, z: *const f32,
+    dout_pp: *const f32, nd: usize,
+    da1: *mut f32, da2: *mut f32,
+    dx: *mut f32,
+) {
+    const M: usize = 8;
+    const B: usize = 64;
+    let mut dz  = [0.0f32; B];
+    let mut dy1 = [0.0f32; B];
+
+    for j in 0..M {
+        let zj     = z.add(j * M);
+        let dout_j = dout_pp.add(j * M);
+        let eff    = eff2.add(j * B);
+        let dz_j = dz.as_mut_ptr().add(j * M);
+        for r in 0..M { axpy8(dz_j, eff.add(r * M), *dout_j.add(r)); }
+        for r in 0..M {
+            let dy = *dout_j.add(r);
+            for d in 0..nd {
+                *da2.add(j * nd + d) += dy * dot8(d2.add((d * M + r) * M), zj);
+            }
+        }
+    }
+    for i in 0..M { for j in 0..M { dy1[i*M+j] = dz[j*M+i]; } }
+    for i in 0..M {
+        let xi    = x_blk.add(i * M);
+        let dy1_i = dy1.as_ptr().add(i * M);
+        let eff   = eff1.add(i * B);
+        for r in 0..M {
+            let d_y = *dy1_i.add(r);
+            for d in 0..nd {
+                *da1.add(i * nd + d) += d_y * dot8(d1.add((d * M + r) * M), xi);
+            }
+            axpy8(dx.add(i * M), eff.add(r * M), d_y);
+        }
+    }
+    let _ = (a1_blk, a2_blk); // kept for signature symmetry with the non-frozen variant
+}
+
+/// Research-only: `backward_block_hoisted` with the dictionary gradient
+/// (`dd1`/`dd2`) skipped — see `bwd_block_avx2_hoisted_frozen`. `m==8` only
+/// (no scalar fallback — this is a benchmark probe, not a production path).
+#[allow(clippy::too_many_arguments)]
+pub fn backward_block_hoisted_frozen(
+    d1: &[f32], d2: &[f32], a1_blk: &[f32], a2_blk: &[f32],
+    eff1: &[f32], eff2: &[f32],
+    x_blk: &[f32], z: &[f32], dout_pp: &[f32], dx_blk: &mut [f32],
+    nd: usize, da_base: usize,
+    g_da1: &mut [f32], g_da2: &mut [f32],
+) {
+    unsafe {
+        bwd_block_avx2_hoisted_frozen(
+            d1.as_ptr(), d2.as_ptr(),
+            a1_blk.as_ptr(), a2_blk.as_ptr(),
+            eff1.as_ptr(), eff2.as_ptr(),
+            x_blk.as_ptr(), z.as_ptr(), dout_pp.as_ptr(), nd,
+            g_da1.as_mut_ptr().add(da_base), g_da2.as_mut_ptr().add(da_base),
+            dx_blk.as_mut_ptr(),
+        );
     }
 }
 

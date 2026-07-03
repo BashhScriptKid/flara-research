@@ -2750,3 +2750,117 @@ overhead that determines where the crossover sits.
 This closes the loop-ordering bug Fable found. What's left for the
 accessibility goal is a genuinely different lever — tuning `m` (block
 size) to move the crossover point itself — not more hoisting.
+
+---
+
+## 2026-07-03 — Opus review: block-size tuning was the wrong lever; the "crossover" was another capacity-mismatch artifact
+
+Asked Opus to investigate whether tuning `m` (block size) could push the
+small-scale crossover down, per the previous entry's framing (bigger `m` →
+fewer, bigger blocks → less relative reconstruction overhead at small
+matrix sizes). Two corrections to that framing, both verified against the
+actual code and prior log entries, not just asserted:
+
+1. **The reconstruction:compute FLOP ratio is `nd`, flat in `m`** — my
+   "~nd/m" was an arithmetic slip. Reconstructing one `m×m` eff-block from
+   `nd` atoms costs `nd·m²` MACs against a `m²`-MAC matvec; the ratio is
+   `nd`, independent of `m`. Block size doesn't touch this at all.
+2. **`nd≥8` is not a rank requirement.** The code comment and `gate_c.rs`
+   both say "for full rank," but the 2026-06-27 log entry (verified
+   directly, not just cited) shows the effective map is full-rank at
+   *every* `nd` down to 1 — the two-stage-plus-permutation structure
+   produces dense rank structurally. `nd≥8` is an empirically-observed
+   *optimization/trainability* threshold (same-family overfit solved-rate:
+   `nd=2` 9/12, `nd=4` 2/12 — a dead spot — `nd=8` 12/12), measured only at
+   `m=8`, never shown to scale with `m`.
+
+Bigger `m` also actively hurts the small-matrix regime this is supposed to
+help (collapses the P×Q grid — a 256×256 matrix at `m=16` gives `P=Q=1`,
+destroying the block-sharing structure that makes Monarch cheap in the
+first place), and any `m≠8` loses the AVX2 fast path entirely (hardcoded
+`M=8` in `fwd_block_avx2`/`bwd_block_avx2`/etc.) — so testing other `m`
+values would require writing new AVX2 kernels for a change that, per the
+FLOP analysis, doesn't even address the thing it was proposed to fix.
+**Verdict: drop block-size tuning as a lever.**
+
+The more consequential finding: **`gate_c.rs`'s crossover-search benchmark
+never timed `BasisMatmul::backward`** — the printed "speedup" ratio was
+forward-only (`basis_us / mon_us`, line ~140), while Monarch's backward
+carries a real, structural `nd`-scaled per-token gradient-accumulation cost
+(the `dot8`+`axpy8` loops over `m·nd` pairs in `bwd_block_avx2`) that
+forward-only reconstruction-hoisting can't touch (it's inherently per-token
+— depends on that token's own `x`/`z`/`dout`). The reported 768-896
+crossover was therefore measuring the wrong thing for a training-cost
+question.
+
+### Re-measured, with backward included
+
+Added `BasisMatmul::backward` timing to `gate_c.rs::bench()` alongside the
+existing forward timing, reporting both a forward-only and a fwd+bwd
+speedup ratio.
+
+**Capacity-mismatched `nd=k=8` (the original crossover-search setting):**
+no crossover found in the tested range at all — flat at **0.26-0.31x**
+(3-4x *slower*) from `384×384` through `896×896`. The apparent
+forward-only "improvement toward parity" (0.4x → 0.8x across that range)
+disappears once backward is included — it was riding on top of the same
+capacity mismatch (Monarch getting 16x more per-block params than K=8)
+this session already diagnosed once before (2026-07-02, "kernel throughput
+benchmark scare" entry), recurring here in a spot nobody had re-checked.
+
+**True equal capacity (`K=2·m·nd=128`) — the fair comparison, backward
+included:**
+
+```
+                    fwd-only    fwd+bwd
+256x256 (toy)         3.55x       2.73x
+64x256  (toy)         3.69x       3.07x
+896x896 (production)  6.33x       2.75x
+896x3072 (production) 9.46x       2.80x
+```
+
+Monarch wins at **every** shape tested, toy scale included, once capacity
+is compared fairly — margins compressed substantially from the
+forward-only numbers (backward's `nd`-tax is real, as predicted), but
+never flip. **There is no real crossover in the tested range; the
+appearance of one was entirely a capacity-accounting artifact, the same
+class of bug as before.** The accessibility goal ("Monarch ≤ BasisMatmul
+at any scale") is already met once measured correctly — no hybrid dispatch
+or block-size work needed.
+
+### Frozen-dictionary experiment (Opus's other recommendation)
+
+Opus's alternative lever, if Monarch itself needed to be faster at small
+scale: freeze the shared atom dictionary (learn coefficients only), which
+eliminates the `dd1`/`dd2` accumulation — exactly half of backward's
+`(r,d)`-loop body (`axpy8(dd*, ...)` alongside the `da*`/`dot8` computation
+that must stay, since it's needed regardless of whether the dictionary is
+learned).
+
+Implemented as research-only kernels (`bwd_block_avx2_hoisted_frozen`,
+`SharedMonarchMatmul::backward_block_hoisted_frozen`, `m=8`-only, no
+scalar fallback — not wired into the live model, since freezing the
+dictionary changes model capacity/expressiveness and is a training
+decision separate from a performance one) and measured via a throwaway
+standalone bench (isolated backward-only timing, normal vs. frozen, same
+reconstructed blocks):
+
+```
+256x256 (toy):          2.06x speedup
+896x896 (production):   2.11x speedup
+896x3072 (production):  2.20x speedup
+```
+
+Confirms Opus's prediction cleanly — consistent ~2x backward speedup from
+freezing the dictionary, at every scale tested. Not wired into the live
+model or evaluated for quality impact this session (that's the real
+question before adopting it — does freezing the dictionary cost held-out
+loss, and is it worth the tradeoff given the equal-capacity result above
+already closes the accessibility question without it). Flagged as a
+genuine, cheap-to-test future lever if more speed is wanted, not something
+this session decided to adopt.
+
+**Status:** the accessibility goal is resolved (Monarch wins at equal
+capacity, at every scale tested, once backward is correctly included).
+Block-size tuning is closed as a dead end. Frozen-dictionary is an open,
+promising, *not yet evaluated for training quality* future option.

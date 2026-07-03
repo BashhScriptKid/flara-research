@@ -133,11 +133,24 @@ fn bench(out_dim: usize, in_dim: usize, b: usize, nd: usize, k: usize, iters: us
     for _ in 0..iters { let _ = std::hint::black_box(basis.forward(&dict, &coeffs, &x)); }
     let basis_us = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
 
+    // BasisMatmul backward — previously never timed here, so every prior
+    // "crossover" measurement from this function was forward-only. Training
+    // cost is fwd+bwd, and Monarch's backward carries an O(nd) per-token
+    // gradient-accumulation tax that forward-only hoisting can't remove (see
+    // RESEARCH_LOG.md 2026-07-03, Opus review) — so the real crossover is
+    // expected to sit higher than the forward-only one below.
+    for _ in 0..200 { let _ = std::hint::black_box(basis.backward(&dict, &coeffs, &x, &dout)); }
+    let t = Instant::now();
+    for _ in 0..iters { let _ = std::hint::black_box(basis.backward(&dict, &coeffs, &x, &dout)); }
+    let basis_bwd_us = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
+
     let mon_params = nd * b * 2 + p * q * m * nd * 2;
     let basis_params = k * b * 2 + p * q * k;
+    let mon_total = mon_us + mon_bwd_us;
+    let basis_total = basis_us + basis_bwd_us;
     eprintln!(
-        "  {out_dim}x{in_dim}  SharedMonarch(nd={nd}, params={mon_params}): fwd={:>7.2}µs  bwd={:>7.2}µs  BasisMatmul(K={k}, params={basis_params}): {:>7.2}µs  speedup={:.1}×",
-        mon_us, mon_bwd_us, basis_us, basis_us / mon_us
+        "  {out_dim}x{in_dim}  SharedMonarch(nd={nd}, params={mon_params}): fwd={:>7.2}µs  bwd={:>7.2}µs  BasisMatmul(K={k}, params={basis_params}): fwd={:>7.2}µs  bwd={:>7.2}µs  fwd-only speedup={:.2}×  fwd+bwd speedup={:.2}×",
+        mon_us, mon_bwd_us, basis_us, basis_bwd_us, basis_us / mon_us, basis_total / mon_total
     );
 }
 
