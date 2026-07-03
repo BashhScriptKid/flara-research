@@ -73,6 +73,23 @@ pub struct FfnForward {
     down_cache: FwdCache,
 }
 
+/// Batched [`FfnForward`]: same fields, `t_len`-token-major (`out`/`up`/
+/// `gate`/`act` are `[t_len, *]`), plus the per-token routing decisions
+/// `backward_batch` needs.
+pub struct FfnForwardBatch {
+    pub out: Vec<f32>,
+    up: Vec<f32>,
+    gate: Vec<f32>,
+    act: Vec<f32>,
+    up_cache: FwdCache,
+    gate_cache: FwdCache,
+    down_cache: FwdCache,
+    /// Per-token selected block indices — the routing decision (public: the
+    /// caller needs this for e.g. stability checks across forward calls).
+    pub selected: Vec<Vec<usize>>,
+    pub gates: Vec<Vec<f32>>,
+}
+
 /// Routing decision for one token, produced by [`Ffn::select`] *before* the heavy
 /// compute. Exposing this seam lets the caller resolve the router early
 /// and prefetch the selected coefficient tiles while their cache lines are
@@ -97,6 +114,19 @@ pub struct FfnGrads {
     /// `M×H` row-major, matching `router_w`.
     pub d_router_w: Vec<f32>,
     /// Gradient w.r.t. the FFN input `h`, length `H`.
+    pub d_h: Vec<f32>,
+}
+
+/// Batched [`FfnGrads`]: coefficient/dictionary/router gradients are already
+/// summed across every token in the batch (weight gradients); `d_h` is
+/// `[t_len, H]`.
+pub struct FfnGradsBatch {
+    pub d_up_coeffs: Vec<f32>,
+    pub d_gate_coeffs: Vec<f32>,
+    pub d_down_coeffs: Vec<f32>,
+    pub d_mono_d1: Vec<f32>,
+    pub d_mono_d2: Vec<f32>,
+    pub d_router_w: Vec<f32>,
     pub d_h: Vec<f32>,
 }
 
@@ -222,23 +252,39 @@ impl Ffn {
     }
 
     /// Batch compute: process all `t_len` tokens through the FFN at once.
-    /// Loops over tokens calling per-token compute — each token's routing
-    /// selects different blocks, so there's no shared row/col-selection axis
-    /// to batch across the way attention's `forward_batch` does.
-    /// `h` is `[t_len, hidden]`, `sels` is per-token selections.
-    /// Returns per-token `FfnForward` results.
-    pub fn compute_batch(&self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32], sels: &[FfnSelection], t_len: usize) -> Vec<FfnForward> {
-        let hh = self.cfg.hidden;
-        let mut results = Vec::with_capacity(t_len);
+    /// Each token routes to a different block subset, so unlike attention's
+    /// `forward_batch` there's no shared row/col-selection to batch across —
+    /// but the *reconstruction* of every projection's weight blocks from the
+    /// shared dictionary is still weight-only and batch-wide (see
+    /// `SharedMonarchProj::forward_rows_batch`/`forward_cols_batch`), so it's
+    /// still done once instead of once per token. `h` is `[t_len, hidden]`.
+    pub fn compute_batch(&self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32], sels: &[FfnSelection], t_len: usize) -> FfnForwardBatch {
+        let (b, f) = (self.cfg.block, self.cfg.ffn);
+        let active_p: Vec<Vec<usize>> = sels.iter().map(|s| s.selected.clone()).collect();
+
+        let (up, up_cache) = self.up_proj.forward_rows_batch(mono_d1, mono_d2, h, &active_p, t_len);
+        let (gate, gate_cache) = self.gate_proj.forward_rows_batch(mono_d1, mono_d2, h, &active_p, t_len);
+
+        let mut act = vec![0.0f32; t_len * f];
         for t in 0..t_len {
-            let fwd = self.compute(mono_d1, mono_d2, &h[t * hh..(t + 1) * hh], FfnSelection {
-                selected: sels[t].selected.clone(),
-                gates: sels[t].gates.clone(),
-                logits: sels[t].logits.clone(),
-            });
-            results.push(fwd);
+            let sel = &sels[t];
+            for (si, &blk) in sel.selected.iter().enumerate() {
+                let w = sel.gates[si];
+                for j in blk * b..(blk + 1) * b {
+                    let idx = t * f + j;
+                    let g = gate[idx].max(0.0);
+                    act[idx] = g * up[idx] * w;
+                }
+            }
         }
-        results
+
+        let (out, down_cache) = self.down_proj.forward_cols_batch(mono_d1, mono_d2, &act, &active_p, t_len);
+
+        FfnForwardBatch {
+            out, up, gate, act, up_cache, gate_cache, down_cache,
+            selected: sels.iter().map(|s| s.selected.clone()).collect(),
+            gates: sels.iter().map(|s| s.gates.clone()).collect(),
+        }
     }
 
     /// Backward for a single token.
@@ -315,6 +361,91 @@ impl Ffn {
         for (a, x) in d_mono_d2.iter_mut().zip(&g_down.dd2) { *a += *x; }
 
         FfnGrads {
+            d_up_coeffs: concat(g_up.da1, g_up.da2),
+            d_gate_coeffs: concat(g_gate.da1, g_gate.da2),
+            d_down_coeffs: concat(g_down.da1, g_down.da2),
+            d_mono_d1,
+            d_mono_d2,
+            d_router_w,
+            d_h,
+        }
+    }
+
+    /// Batched VJP for `compute_batch`. `h` is `[t_len, hidden]`, `d_out` is
+    /// `[t_len, hidden]`. Same hoisted-reconstruction reasoning as
+    /// `compute_batch` — each projection's weight blocks are reconstructed
+    /// once (see `SharedMonarchProj::backward_rows_batch`/
+    /// `backward_cols_batch`) instead of once per token.
+    pub fn backward_batch(
+        &self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32], fwd: &FfnForwardBatch, d_out: &[f32], t_len: usize,
+    ) -> FfnGradsBatch {
+        let (b, f, hh) = (self.cfg.block, self.cfg.ffn, self.cfg.hidden);
+
+        let mut d_act = vec![0.0f32; t_len * f];
+        let g_down: MonarchGrads = self.down_proj.backward_cols_batch(
+            mono_d1, mono_d2, &fwd.act, &fwd.down_cache.zs, d_out, &mut d_act, &fwd.selected, t_len,
+        );
+
+        let mut d_up = vec![0.0f32; t_len * f];
+        let mut d_gate = vec![0.0f32; t_len * f];
+        let mut d_w: Vec<Vec<f32>> = fwd.selected.iter().map(|s| vec![0.0f32; s.len()]).collect();
+        for t in 0..t_len {
+            for (si, &blk) in fwd.selected[t].iter().enumerate() {
+                let w = fwd.gates[t][si];
+                for j in blk * b..(blk + 1) * b {
+                    let idx = t * f + j;
+                    let gate_pre = fwd.gate[idx];
+                    let g = gate_pre.max(0.0);
+                    let upj = fwd.up[idx];
+                    let da = d_act[idx];
+                    d_up[idx] = da * g * w;
+                    if gate_pre > 0.0 {
+                        d_gate[idx] = da * upj * w;
+                    }
+                    d_w[t][si] += da * g * upj;
+                }
+            }
+        }
+
+        let mut d_h = vec![0.0f32; t_len * hh];
+        let g_up: MonarchGrads = self.up_proj.backward_rows_batch(
+            mono_d1, mono_d2, h, &fwd.up_cache.zs, &d_up, &mut d_h, &fwd.selected, t_len,
+        );
+        let mut d_h_gate = vec![0.0f32; t_len * hh];
+        let g_gate: MonarchGrads = self.gate_proj.backward_rows_batch(
+            mono_d1, mono_d2, h, &fwd.gate_cache.zs, &d_gate, &mut d_h_gate, &fwd.selected, t_len,
+        );
+        for i in 0..t_len * hh {
+            d_h[i] += d_h_gate[i];
+        }
+
+        let mut d_router_w = vec![0.0f32; self.m * hh];
+        for t in 0..t_len {
+            let sel = &fwd.selected[t];
+            let gates_t = &fwd.gates[t];
+            let dotp: f32 = d_w[t].iter().zip(gates_t).map(|(dw, w)| dw * w).sum();
+            let h_t = &h[t * hh..(t + 1) * hh];
+            for (si, &blk) in sel.iter().enumerate() {
+                let dl = gates_t[si] * (d_w[t][si] - dotp);
+                if dl != 0.0 {
+                    let row = &self.router_w[blk * hh..(blk + 1) * hh];
+                    let drow = &mut d_router_w[blk * hh..(blk + 1) * hh];
+                    for i in 0..hh {
+                        drow[i] += dl * h_t[i];
+                        d_h[t * hh + i] += dl * row[i];
+                    }
+                }
+            }
+        }
+
+        let mut d_mono_d1 = g_up.dd1;
+        for (a, x) in d_mono_d1.iter_mut().zip(&g_gate.dd1) { *a += *x; }
+        for (a, x) in d_mono_d1.iter_mut().zip(&g_down.dd1) { *a += *x; }
+        let mut d_mono_d2 = g_up.dd2;
+        for (a, x) in d_mono_d2.iter_mut().zip(&g_gate.dd2) { *a += *x; }
+        for (a, x) in d_mono_d2.iter_mut().zip(&g_down.dd2) { *a += *x; }
+
+        FfnGradsBatch {
             d_up_coeffs: concat(g_up.da1, g_up.da2),
             d_gate_coeffs: concat(g_gate.da1, g_gate.da2),
             d_down_coeffs: concat(g_down.da1, g_down.da2),
@@ -653,6 +784,60 @@ mod tests {
                 let an = d_logits[t][j];
                 assert!((fd - an).abs() < 1e-3, "d_logit[{t}][{j}]: fd {fd} vs an {an}");
             }
+        }
+    }
+
+    #[test]
+    fn compute_batch_matches_looped_compute_and_backward() {
+        // compute_batch/backward_batch hoist reconstruction across the whole
+        // token batch (see SharedMonarchProj::forward_rows_batch etc.), but
+        // each token still routes independently — this proves the batched
+        // path produces byte-for-byte-close results to the original
+        // per-token select/compute/backward loop, with genuinely different
+        // routing per token (real hidden vectors, not synthetic).
+        let (ffn, d1, d2) = small_ffn();
+        let hh = ffn.cfg.hidden;
+        let t_len = 5;
+        let mut rng = Lcg(0xB19B00B5);
+        let h: Vec<f32> = (0..t_len * hh).map(|_| rng.f()).collect();
+        let d_out: Vec<f32> = (0..t_len * hh).map(|_| rng.f() * 0.1).collect();
+
+        let sels = ffn.select_batch(&h, t_len);
+        let fwd_batch = ffn.compute_batch(&d1, &d2, &h, &sels, t_len);
+        let g_batch = ffn.backward_batch(&d1, &d2, &h, &fwd_batch, &d_out, t_len);
+
+        let mut d_router_w_looped = vec![0.0f32; ffn.m * hh];
+        let mut d_mono_d1_looped = vec![0.0f32; d1.len()];
+        let mut d_mono_d2_looped = vec![0.0f32; d2.len()];
+        for t in 0..t_len {
+            let h_t = &h[t * hh..(t + 1) * hh];
+            let d_out_t = &d_out[t * hh..(t + 1) * hh];
+            let sel = ffn.select(h_t);
+            assert_eq!(sel.selected, sels[t].selected, "routing must be deterministic and match select_batch");
+            let fwd_t = ffn.compute(&d1, &d2, h_t, sel);
+
+            for j in 0..hh {
+                let got = fwd_batch.out[t * hh + j];
+                assert!((got - fwd_t.out[j]).abs() < 1e-5, "token {t} out[{j}]: batch={got} looped={}", fwd_t.out[j]);
+            }
+
+            let g_t = ffn.backward(&d1, &d2, h_t, &fwd_t, d_out_t);
+            for j in 0..hh {
+                let got = g_batch.d_h[t * hh + j];
+                assert!((got - g_t.d_h[j]).abs() < 1e-4, "token {t} d_h[{j}]: batch={got} looped={}", g_t.d_h[j]);
+            }
+            for i in 0..d_router_w_looped.len() { d_router_w_looped[i] += g_t.d_router_w[i]; }
+            for i in 0..d_mono_d1_looped.len() { d_mono_d1_looped[i] += g_t.d_mono_d1[i]; }
+            for i in 0..d_mono_d2_looped.len() { d_mono_d2_looped[i] += g_t.d_mono_d2[i]; }
+        }
+
+        for i in 0..d_router_w_looped.len() {
+            assert!((g_batch.d_router_w[i] - d_router_w_looped[i]).abs() < 1e-4,
+                "d_router_w[{i}]: batch={} looped={}", g_batch.d_router_w[i], d_router_w_looped[i]);
+        }
+        for i in 0..d_mono_d1_looped.len() {
+            assert!((g_batch.d_mono_d1[i] - d_mono_d1_looped[i]).abs() < 1e-3,
+                "d_mono_d1[{i}]: batch={} looped={}", g_batch.d_mono_d1[i], d_mono_d1_looped[i]);
         }
     }
 }

@@ -615,7 +615,7 @@ mod tests {
 
         // Base FFN routing per (layer, token), to detect top-k kinks under perturbation.
         let sel_of = |f: &ModelForward| -> Vec<Vec<usize>> {
-            f.layer_fwds.iter().flat_map(|lf| lf.ffn_fwds.iter().map(|x| x.selected.clone())).collect()
+            f.layer_fwds.iter().flat_map(|lf| lf.ffn_fwds.selected.clone()).collect()
         };
         let base_sel = sel_of(&fwd);
 

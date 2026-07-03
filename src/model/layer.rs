@@ -14,7 +14,7 @@
 
 use crate::kernels::attn_flash::FlashAttention;
 use crate::kernels::attn_swa::SlidingWindowAttention;
-use crate::kernels::ffn::{Ffn, FfnForward, FfnOptState};
+use crate::kernels::ffn::{Ffn, FfnForwardBatch, FfnOptState};
 use crate::kernels::monarch::FwdCache;
 use crate::kernels::norm;
 use crate::kernels::optimizer::{AdaFactor, AdaFactorState};
@@ -78,8 +78,8 @@ pub struct LayerForward {
     pub normed2: Vec<f32>,
     /// FFN-norm reciprocal-RMS per token, `T`.
     pub rinv2: Vec<f32>,
-    /// Per-token FFN forward caches.
-    pub ffn_fwds: Vec<FfnForward>,
+    /// Batched FFN forward cache (all `t_len` tokens' routing/caches).
+    pub ffn_fwds: FfnForwardBatch,
     /// Per-token early-exit probability, length `T`.
     pub probe_p: Vec<f32>,
     /// Batched Monarch forward caches for the four attention projections —
@@ -366,22 +366,26 @@ impl TransformerLayer {
         }
 
         // --- FFN sub-block ---
+        // Batched: reconstructs each up/gate/down weight block once and
+        // reuses it across every token's routed subset (see
+        // SharedMonarchProj::forward_rows_batch/forward_cols_batch), instead
+        // of the old per-token compute() loop, which paid reconstruction
+        // once per token regardless of routing.
         let mut normed2 = vec![0.0f32; t_len * h];
         let mut rinv2 = vec![0.0f32; t_len];
-        let mut out = h_mid.clone();
-        let mut ffn_fwds = Vec::with_capacity(t_len);
         for ti in 0..t_len {
             let hin = &h_mid[ti * h..(ti + 1) * h];
             let nrm = &mut normed2[ti * h..(ti + 1) * h];
             rinv2[ti] = norm::forward(hin, &self.ffn_norm_gain, cfg.norm_eps, nrm);
-            let sel = self.ffn.select(nrm);
-            self.ffn.prefetch_coeffs(&sel);
-            let fwd = self.ffn.compute(ffn_d1, ffn_d2, nrm, sel);
+        }
+        let sels = self.ffn.select_batch(&normed2, t_len);
+        let ffn_fwds = self.ffn.compute_batch(ffn_d1, ffn_d2, &normed2, &sels, t_len);
+        let mut out = h_mid.clone();
+        for ti in 0..t_len {
             let dst = &mut out[ti * h..(ti + 1) * h];
             for j in 0..h {
-                dst[j] += scale * fwd.out[j];
+                dst[j] += scale * ffn_fwds.out[ti * h + j];
             }
-            ffn_fwds.push(fwd);
         }
 
         LayerForward {
@@ -449,67 +453,50 @@ impl TransformerLayer {
         };
 
         // ---- FFN sub-block (last in forward ⇒ first in backward) ----
-        // out = h_mid + scale·ffn(normed2(h_mid)). Tokens are independent here, so
-        // this parallelizes over `ti` — collect (order-preserving) into a per-token
-        // Vec, then merge sequentially, exactly like Phase 2's training-loop fix:
-        // deterministic (no fold/reduce reordering) and free of per-call rayon
-        // dispatch overhead since it's one dispatch for the whole sequence.
-        struct FfnTokenGrad {
-            d_up: Vec<f32>,
-            d_gate: Vec<f32>,
-            d_down: Vec<f32>,
-            d_router: Vec<f32>,
-            d_ffn_d1: Vec<f32>,
-            d_ffn_d2: Vec<f32>,
-            d_norm_gain: Vec<f32>,
+        // out = h_mid + scale·ffn(normed2(h_mid)). Batched: reconstructs each
+        // weight block once and reuses it across every token's routed subset
+        // (see SharedMonarchProj::backward_rows_batch/backward_cols_batch),
+        // instead of the old per-token collect+merge loop. norm::backward is
+        // per-token and nonlinear (can't be hoisted the same way), so it
+        // stays in a collect+merge loop — but now it's the only thing left in it.
+        let mut d_ffn_out = vec![0.0f32; t_len * h];
+        for i in 0..t_len * h {
+            d_ffn_out[i] = scale * d_out[i];
+        }
+        let fg = self.ffn.backward_batch(ffn_d1, ffn_d2, &fwd.normed2, &fwd.ffn_fwds, &d_ffn_out, t_len);
+        add_f(&mut g.d_up_coeffs, &fg.d_up_coeffs);
+        add_f(&mut g.d_gate_coeffs, &fg.d_gate_coeffs);
+        add_f(&mut g.d_down_coeffs, &fg.d_down_coeffs);
+        add_f(&mut g.d_router_w, &fg.d_router_w);
+        add_f(&mut g.d_ffn_mono_d1, &fg.d_mono_d1);
+        add_f(&mut g.d_ffn_mono_d2, &fg.d_mono_d2);
+
+        struct NormTokenGrad2 {
+            dx: Vec<f32>,
+            dg: Vec<f32>,
         }
         let mut d_h_mid = vec![0.0f32; t_len * h];
-        let ffn_results: Vec<FfnTokenGrad> = {
+        let ffn_norm_results: Vec<NormTokenGrad2> = {
             use rayon::prelude::*;
-            (0..t_len).into_par_iter().zip(d_h_mid.par_chunks_mut(h)).map(|(ti, d_h_mid_ti)| {
-                let mut d_ffn_out = vec![0.0f32; h];
-                for j in 0..h {
-                    d_h_mid_ti[j] = d_out[ti * h + j]; // identity residual
-                    d_ffn_out[j] = scale * d_out[ti * h + j];
-                }
-                let fg = self.ffn.backward(
-                    ffn_d1, ffn_d2,
-                    &fwd.normed2[ti * h..(ti + 1) * h],
-                    &fwd.ffn_fwds[ti],
-                    &d_ffn_out,
-                );
+            (0..t_len).into_par_iter().map(|ti| {
                 let mut dx = vec![0.0f32; h];
                 let mut dg = vec![0.0f32; h];
                 norm::backward(
                     &fwd.h_mid[ti * h..(ti + 1) * h],
                     &self.ffn_norm_gain,
-                    &fg.d_h,
+                    &fg.d_h[ti * h..(ti + 1) * h],
                     fwd.rinv2[ti],
                     &mut dx,
                     &mut dg,
                 );
-                for j in 0..h {
-                    d_h_mid_ti[j] += dx[j];
-                }
-                FfnTokenGrad {
-                    d_up: fg.d_up_coeffs,
-                    d_gate: fg.d_gate_coeffs,
-                    d_down: fg.d_down_coeffs,
-                    d_router: fg.d_router_w,
-                    d_ffn_d1: fg.d_mono_d1,
-                    d_ffn_d2: fg.d_mono_d2,
-                    d_norm_gain: dg,
-                }
+                NormTokenGrad2 { dx, dg }
             }).collect()
         };
-        for r in &ffn_results {
-            add_f(&mut g.d_up_coeffs, &r.d_up);
-            add_f(&mut g.d_gate_coeffs, &r.d_gate);
-            add_f(&mut g.d_down_coeffs, &r.d_down);
-            add_f(&mut g.d_router_w, &r.d_router);
-            add_f(&mut g.d_ffn_mono_d1, &r.d_ffn_d1);
-            add_f(&mut g.d_ffn_mono_d2, &r.d_ffn_d2);
-            add_f(&mut g.d_ffn_norm_gain, &r.d_norm_gain);
+        for (ti, r) in ffn_norm_results.into_iter().enumerate() {
+            for j in 0..h {
+                d_h_mid[ti * h + j] = d_out[ti * h + j] + r.dx[j]; // identity residual + norm backward
+            }
+            add_f(&mut g.d_ffn_norm_gain, &r.dg);
         }
 
         // ---- attention sub-block ----
@@ -714,7 +701,7 @@ mod tests {
         let fwd = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t);
         assert_eq!(fwd.out.len(), t * c.hidden);
         assert_eq!(fwd.probe_p.len(), t);
-        assert_eq!(fwd.ffn_fwds.len(), t);
+        assert_eq!(fwd.ffn_fwds.selected.len(), t);
         for &p in &fwd.probe_p {
             assert!(p > 0.0 && p < 1.0, "probe prob out of range: {p}");
         }
@@ -782,11 +769,10 @@ mod tests {
 
         let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t);
         let grads = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, &base, &r, None, t);
-        let base_sel: Vec<Vec<usize>> = base.ffn_fwds.iter().map(|f| f.selected.clone()).collect();
+        let base_sel: Vec<Vec<usize>> = base.ffn_fwds.selected.clone();
 
         let loss = |fwd: &LayerForward| -> f32 { fwd.out.iter().zip(&r).map(|(o, rr)| o * rr).sum() };
-        let sel_stable =
-            |fwd: &LayerForward| fwd.ffn_fwds.iter().zip(&base_sel).all(|(f, s)| f.selected == *s);
+        let sel_stable = |fwd: &LayerForward| fwd.ffn_fwds.selected == base_sel;
 
         const H: f32 = 1e-3;
         let mut checked = 0;

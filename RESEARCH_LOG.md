@@ -2686,3 +2686,67 @@ suite + new kernel-level backward-batch test), and wired into
 `layer.rs`. `Ffn` is not yet touched. The accessibility goal ("Monarch ≤
 BasisMatmul at any scale") is not yet demonstrated end-to-end — closer
 than before, but still gated on the FFN half of this same fix.
+
+---
+
+## 2026-07-03 — Ffn gets the same hoist: real batching for the routed projections
+
+Extended the reconstruction-hoisting to `Ffn`, which — unlike `AttnProj` —
+had *zero* real batching before this: `select_batch`/`compute_batch` existed
+but were pure per-token loops calling the single-token `select`/`compute`
+(confirmed via grep: neither was called from `layer.rs`, which ran its own
+per-token `select`+`compute` loop directly).
+
+The wrinkle this session's earlier "trickier part" flag anticipated: each
+token routes to a different `n_active`-of-`M` block subset, so there's no
+shared row/col-selection axis the way dense `AttnProj` had. Resolution:
+reconstruct **every** block densely regardless of routing (via the existing
+`expand_all_blocks`) rather than tracking a per-batch active set — at any
+real batch size, the union of blocks touched across tokens tends to cover
+most/all of `M` anyway (`train_small_lod`: `n_active=3` of `M=12`, `t_len=256`
+tokens — the union is essentially guaranteed to be complete), so this is
+both simpler and not meaningfully more work than a "smart" union-only
+reconstruction would be. Added four new `SharedMonarchProj` methods —
+`forward_rows_batch`/`forward_cols_batch`/`backward_rows_batch`/
+`backward_cols_batch` — mirroring the dense `forward_batch`/`backward_batch`
+(same token-chunked-parallelism design from the fix earlier today), but
+restricted per token to that token's own routed subset when applying/
+accumulating. New test `routed_batch_matches_looped_forward_rows_and_cols`
+verifies against per-token loops with genuinely different routing per token
+(13/13 monarch tests pass).
+
+Wired through `Ffn::compute_batch`/new `Ffn::backward_batch` (real batched
+implementations, replacing the old loop-only stubs), with a new
+`FfnForwardBatch`/`FfnGradsBatch` pair mirroring the per-token
+`FfnForward`/`FfnGrads`. New test `compute_batch_matches_looped_compute_and_backward`
+(7/7 ffn tests pass). Wired into `layer.rs`'s FFN sub-block: the per-token
+`select`+`compute` loop and the per-token `backward`-in-a-`par_iter` block
+are both replaced with single batched calls; `norm::backward` (nonlinear,
+genuinely per-token) stays in a collect+merge loop, same pattern as the
+`AttnProj` wiring earlier today. Full suite: 91/91 pass, including the
+layer- and model-level gradcheck tests exercising the FFN routing path
+end-to-end.
+
+**Result, real end-to-end training throughput** (same synthetic
+byte-vocab bench as the AttnProj-only measurement): **408-420ms/step**,
+3 runs — tighter (lower variance: was 387-464ms with AttnProj hoisted
+alone) and modestly faster on average, but not a dramatic win, and still
+short of the pre-swap BasisMatmul baseline (306.5ms/step) at this
+specific toy scale. Consistent with the very first finding this project
+made about Monarch vs. BasisMatmul (`gate_c.rs`'s own crossover search):
+`train_small_lod`'s dimensions sit below the point where Monarch wins at
+all, hoisting or not — reconstruction-hoisting removes a real, measured
+inefficiency (the per-token reconstruction bug), it does not change which
+side of the crossover a given shape sits on. The accessibility goal
+("Monarch ≤ BasisMatmul at *any* scale", not just production scale) needs
+one more thing this pass didn't touch: the crossover point itself is a
+function of block size `m` (Fable's option #2 from two entries back,
+"increase block size relative to matrix size at low x") — reconstruction-
+hoisting fixes the *implementation* tax, not the *inherent* per-block
+overhead that determines where the crossover sits.
+
+**Status:** both `AttnProj` and `Ffn` are now real, batched, and hoisted
+(no known un-hoisted per-token reconstruction left in the training path).
+This closes the loop-ordering bug Fable found. What's left for the
+accessibility goal is a genuinely different lever — tuning `m` (block
+size) to move the crossover point itself — not more hoisting.
