@@ -21,6 +21,12 @@ counters!(
     ATTN_CORE_FWD, ATTN_CORE_BWD,
     FFN_SELECT, FFN_FWD, FFN_BWD,
     NORM_FWD, NORM_BWD,
+    // The dictionary-contraction tail of Monarch's two-phase backward
+    // (contract_all_blocks) -- serial, cost scales with dict_k, already
+    // included inside the *_BWD totals above; broken out separately here to
+    // isolate its share (Fable review 2026-07-05: flagged as the one
+    // unexamined serial path that scales adversely at production dict_k).
+    MONARCH_CONTRACT,
 );
 
 /// RAII timer: accumulates elapsed wall time into `counter` on drop.

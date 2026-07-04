@@ -1770,37 +1770,76 @@ impl SharedMonarchMatmul {
         }
     }
 
+    /// Below this many blocks, rayon dispatch overhead isn't worth it — same
+    /// rationale/threshold as the other kernels.
+    const CONTRACT_PARALLEL_THRESHOLD: usize = 8;
+
     /// Contract every `(pp,qq)` block's accumulated `s1_all`/`s2_all`
-    /// (`p*q*m*b` each) into a fresh `Grads`. Sequential — the total work
-    /// here (`P·Q·m·nd` contractions, done once) is small enough that
-    /// parallelizing it isn't worth the dispatch overhead; it's the
-    /// per-token cost this whole restructuring exists to avoid paying
-    /// `n_tokens` times, not a bottleneck itself.
+    /// (`p*q*m*b` each) into a fresh `Grads`. Cost is `P·Q·m·nd`, done once
+    /// per step — negligible at toy `nd` (dict_k), but scales linearly with
+    /// `nd` and was measured at production width (`dict_k=32`, RESEARCH_LOG
+    /// 2026-07-05, Fable review) to be ~6.6% of a whole training step, all
+    /// of it serial. Parallelized over `(pp,qq)` blocks: `da1`/`da2` are
+    /// written disjointly per block (direct `par_chunks_mut`); `dd1`/`dd2`
+    /// are shared accumulators (every block contributes to the same
+    /// dictionary), so each chunk accumulates its own local copy, merged
+    /// (summed) afterward — same pattern as the two-phase backward's
+    /// `s1`/`s2` token-chunk accumulation.
     pub fn contract_all_blocks(
         d1: &[f32], d2: &[f32], a1: &[f32], a2: &[f32], s1_all: &[f32], s2_all: &[f32],
         p: usize, q: usize, m: usize, nd: usize,
     ) -> Grads {
+        let _t = crate::kernels::profiling::Timer::start(&crate::kernels::profiling::MONARCH_CONTRACT);
         let b = m * m;
-        let mut g = Grads {
-            dd1: vec![0.0f32; nd * b],
-            dd2: vec![0.0f32; nd * b],
-            da1: vec![0.0f32; p * q * m * nd],
-            da2: vec![0.0f32; p * q * m * nd],
-        };
-        for pp in 0..p {
-            for qq in 0..q {
-                let idx = pp * q + qq;
+        let n_blocks = p * q;
+        let mut da1 = vec![0.0f32; n_blocks * m * nd];
+        let mut da2 = vec![0.0f32; n_blocks * m * nd];
+
+        let run_range = |idx0: usize, idx1: usize, da1_c: &mut [f32], da2_c: &mut [f32], dd1: &mut [f32], dd2: &mut [f32]| {
+            for (local_i, idx) in (idx0..idx1).enumerate() {
                 let base = idx * m * nd;
                 let s1 = &s1_all[idx * m * b..(idx + 1) * m * b];
                 let s2 = &s2_all[idx * m * b..(idx + 1) * m * b];
+                let da1_blk = &mut da1_c[local_i * m * nd..(local_i + 1) * m * nd];
+                let da2_blk = &mut da2_c[local_i * m * nd..(local_i + 1) * m * nd];
                 Self::contract_block(
                     d1, d2, &a1[base..base + m * nd], &a2[base..base + m * nd], s1, s2, m, nd,
-                    &mut g.da1[base..base + m * nd], &mut g.da2[base..base + m * nd],
-                    &mut g.dd1, &mut g.dd2,
+                    da1_blk, da2_blk, dd1, dd2,
                 );
             }
+        };
+
+        if n_blocks < Self::CONTRACT_PARALLEL_THRESHOLD {
+            let mut dd1 = vec![0.0f32; nd * b];
+            let mut dd2 = vec![0.0f32; nd * b];
+            run_range(0, n_blocks, &mut da1, &mut da2, &mut dd1, &mut dd2);
+            return Grads { dd1, dd2, da1, da2 };
         }
-        g
+
+        use rayon::prelude::*;
+        let n_chunks = rayon::current_num_threads().max(1).min(n_blocks);
+        let chunk_len = n_blocks.div_ceil(n_chunks);
+        let results: Vec<(Vec<f32>, Vec<f32>)> = da1
+            .par_chunks_mut(chunk_len * m * nd)
+            .zip(da2.par_chunks_mut(chunk_len * m * nd))
+            .enumerate()
+            .map(|(c, (da1_c, da2_c))| {
+                let idx0 = c * chunk_len;
+                let idx1 = ((c + 1) * chunk_len).min(n_blocks);
+                let mut dd1_local = vec![0.0f32; nd * b];
+                let mut dd2_local = vec![0.0f32; nd * b];
+                run_range(idx0, idx1, da1_c, da2_c, &mut dd1_local, &mut dd2_local);
+                (dd1_local, dd2_local)
+            })
+            .collect();
+
+        let mut dd1 = vec![0.0f32; nd * b];
+        let mut dd2 = vec![0.0f32; nd * b];
+        for (l1, l2) in results {
+            for i in 0..dd1.len() { dd1[i] += l1[i]; }
+            for i in 0..dd2.len() { dd2[i] += l2[i]; }
+        }
+        Grads { dd1, dd2, da1, da2 }
     }
 }
 
