@@ -199,7 +199,7 @@ impl Ffn {
         let mut logits = vec![0.0f32; self.m];
         for (blk, slot) in logits.iter_mut().enumerate() {
             let row = &self.router_w[blk * self.cfg.hidden..(blk + 1) * self.cfg.hidden];
-            *slot = row.iter().zip(h).map(|(w, x)| w * x).sum();
+            *slot = crate::kernels::gemm::dot(row, h);
         }
         let (selected, gates) = self.route(&logits);
         FfnSelection { selected, gates, logits }
