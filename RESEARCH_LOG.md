@@ -3435,3 +3435,66 @@ copy, already-factored optimizer state, the embed table) is inherently
 sized, not wasteful. Compute — not memory — is this model's binding
 constraint at production shape (confirmed separately: ~34.5s/step, ~14.8
 tok/s at seq=512, 96 layers).
+
+### Follow-up: a compute-focused Fable review (back to throughput, at production scale specifically)
+
+With memory closed out, asked Fable one more time — compute throughput
+specifically at production shape, now that toy scale is exhausted and
+`FULL=1` actually runs. Fable profiled `FULL=1` fresh and made a sharp
+catch: **the profiling counters double-count the activation-checkpointing
+recompute** the same way the LM head was invisible before — every `*_FWD`
+Timer lives inside `layer.forward`, which `Model::backward` now calls a
+second time per layer (the recompute), so the `*_FWD` rows in the report
+count two passes, not one. Decomposed correctly: recompute tax is only
+**~12% of the step** (one forward pass ≈ 3.6s of the ~29.5s measured),
+not the dominant cost people might assume from "doubles every layer's
+forward compute." The real dominant cost is FFN_BWD gradient math itself
+(~35% of the step) — genuine, already-parallelized, bandwidth-bound
+compute, not overhead.
+
+Fable also did the honest math on selective/partial checkpointing (the
+obvious "trade some of the ~12GB spare RAM for less recompute" idea): it
+doesn't work the way it sounds. The current scheme already recomputes
+each layer exactly once — the theoretical minimum for single-pass
+recompute. Coarsening to "checkpoint every Kth layer" doesn't reduce
+recompute, it only *raises peak memory* (since retained layers skip
+recompute, at cost of holding their full activation cache). At current
+headroom (~12GB ÷ ~354MB/layer ≈ 33 layers retainable), retaining 33/96
+layers would cut recompute to 63 layers and save an estimated ~4%
+(~16.3 → ~17.0 tok/s) — real but marginal, for real complexity and 4-5x
+more activation RAM. Not worth it.
+
+The one thing Fable flagged as genuinely unexamined: `contract_all_blocks`
+(the dictionary-contraction tail of the two-phase Monarch backward,
+`monarch.rs`) is a serial `P×Q` double loop whose own doc comment
+correctly said "too small to parallelize" — at *toy* `dict_k=8`. Nobody
+had revisited that claim at production `dict_k=32` (4x heavier,
+independent of sequence length).
+
+**Measured before acting** (established practice this session — verify
+Fable's flags against real in-repo numbers before implementing): added a
+`MONARCH_CONTRACT` profiling counter. Confirmed: ~2.1s/step, ~6.6% of a
+whole production-shaped step, 100% serial.
+
+**Fixed:** parallelized `contract_all_blocks` over `(pp,qq)` blocks —
+`da1`/`da2` write disjointly per block (direct `par_chunks_mut`); `dd1`/
+`dd2` are shared dictionary-gradient accumulators every block contributes
+to, so each chunk accumulates a local copy, merged afterward — the same
+shape as the existing two-phase backward's `s1`/`s2` token-chunk
+accumulation. 102/102 tests pass unchanged (including the existing
+`backward_batch` gradcheck tests, which exercise this function
+indirectly).
+
+**Result:** `MONARCH_CONTRACT` itself dropped **~2.2x** (2086ms →
+~955ms/step). Since it was only ~6.6% of the whole step, overall step
+time (~30.7-32s/step, within this machine's run-to-run noise floor at
+this scale) didn't move measurably outside that noise — exactly matching
+Fable's own framing going in ("a clean, in-character win," never promised
+as a big multiplier).
+
+**Status:** per Fable's explicit, corroborated verdict: **~16 tok/s is
+close to the floor for this architecture/hardware/scale combination.**
+FFN_BWD is genuine, well-parallelized, bandwidth-bound compute on 6
+cores — not waste. No further cheap compute lever was found. This closes
+the compute side the same way the memory review closed the memory side:
+diminishing returns confirmed by measurement, not assumed.
