@@ -167,13 +167,31 @@ impl FlashAttention {
                     while j0 < j_end {
                         let j1 = (j0 + self.kv_block).min(j_end);
 
-                        // Block scores + block max.
+                        // Block scores + block max. Register-blocked in groups
+                        // of 4 keys: `dot4` loads `qi` once and reuses it
+                        // across all four scores, instead of reloading it once
+                        // per key the way four separate `dot()` calls would.
                         let mut block_max = f32::NEG_INFINITY;
-                        for j in j0..j1 {
-                            let kj = &k[(j * nkv + h_kv) * d..(j * nkv + h_kv) * d + d];
+                        let mut jj = j0;
+                        while jj + 4 <= j1 {
+                            let k0 = &k[(jj * nkv + h_kv) * d..(jj * nkv + h_kv) * d + d];
+                            let k1 = &k[((jj + 1) * nkv + h_kv) * d..((jj + 1) * nkv + h_kv) * d + d];
+                            let k2 = &k[((jj + 2) * nkv + h_kv) * d..((jj + 2) * nkv + h_kv) * d + d];
+                            let k3 = &k[((jj + 3) * nkv + h_kv) * d..((jj + 3) * nkv + h_kv) * d + d];
+                            let s4 = crate::kernels::gemm::dot4(qi, k0, k1, k2, k3);
+                            for lane in 0..4 {
+                                let s = self.scale * s4[lane];
+                                scores[jj + lane - j0] = s;
+                                block_max = block_max.max(s);
+                            }
+                            jj += 4;
+                        }
+                        while jj < j1 {
+                            let kj = &k[(jj * nkv + h_kv) * d..(jj * nkv + h_kv) * d + d];
                             let s = self.scale * dot(qi, kj);
-                            scores[j - j0] = s;
+                            scores[jj - j0] = s;
                             block_max = block_max.max(s);
+                            jj += 1;
                         }
 
                         let m_new = m.max(block_max);
@@ -267,22 +285,44 @@ impl FlashAttention {
                     // delta D_i = dot(dO_i, O_i)
                     let delta = dot(doi, oi);
 
-                    for j in 0..=i {
+                    let j_end = i + 1;
+                    let apply_j = |j: usize, s: f32, dp: f32, dk_acc: &mut [f32], dv_acc: &mut [f32], dq_c: &mut [f32]| {
                         let kvoff = (j * nkv + h_kv) * d;
                         let kj = &k[kvoff..kvoff + d];
-                        let vj = &v[kvoff..kvoff + d];
-
-                        let s = self.scale * dot(qi, kj);
                         let p = (s - lse_i).exp();
-                        let dp = dot(doi, vj);
                         let ds = p * (dp - delta);
+                        axpy(&mut dk_acc[kvoff..kvoff + d], self.scale * ds, qi);
+                        axpy(&mut dv_acc[kvoff..kvoff + d], p, doi);
+                        axpy(&mut dq_c[(ri * nq + h_q) * d..(ri * nq + h_q) * d + d], self.scale * ds, kj);
+                    };
 
-                        let dkj = &mut dk_acc[kvoff..kvoff + d];
-                        axpy(dkj, self.scale * ds, qi);
-                        let dvj = &mut dv_acc[kvoff..kvoff + d];
-                        axpy(dvj, p, doi);
-                        let dqi = &mut dq_c[(ri * nq + h_q) * d..(ri * nq + h_q) * d + d];
-                        axpy(dqi, self.scale * ds, kj);
+                    // Register-blocked in groups of 4 keys: `dot4` amortizes
+                    // `qi`/`doi`'s loads across all four scores/dp values
+                    // instead of reloading them once per key.
+                    let mut jj = 0;
+                    while jj + 4 <= j_end {
+                        let kvoff = |j: usize| (j * nkv + h_kv) * d;
+                        let k0 = &k[kvoff(jj)..kvoff(jj) + d];
+                        let k1 = &k[kvoff(jj + 1)..kvoff(jj + 1) + d];
+                        let k2 = &k[kvoff(jj + 2)..kvoff(jj + 2) + d];
+                        let k3 = &k[kvoff(jj + 3)..kvoff(jj + 3) + d];
+                        let s4 = crate::kernels::gemm::dot4(qi, k0, k1, k2, k3);
+                        let v0 = &v[kvoff(jj)..kvoff(jj) + d];
+                        let v1 = &v[kvoff(jj + 1)..kvoff(jj + 1) + d];
+                        let v2 = &v[kvoff(jj + 2)..kvoff(jj + 2) + d];
+                        let v3 = &v[kvoff(jj + 3)..kvoff(jj + 3) + d];
+                        let dp4 = crate::kernels::gemm::dot4(doi, v0, v1, v2, v3);
+                        for lane in 0..4 {
+                            apply_j(jj + lane, self.scale * s4[lane], dp4[lane], dk_acc, dv_acc, dq_c);
+                        }
+                        jj += 4;
+                    }
+                    while jj < j_end {
+                        let kvoff = (jj * nkv + h_kv) * d;
+                        let s = self.scale * dot(qi, &k[kvoff..kvoff + d]);
+                        let dp = dot(doi, &v[kvoff..kvoff + d]);
+                        apply_j(jj, s, dp, dk_acc, dv_acc, dq_c);
+                        jj += 1;
                     }
                 }
             }

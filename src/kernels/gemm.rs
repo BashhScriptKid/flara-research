@@ -260,9 +260,90 @@ unsafe fn dot_avx2(a: *const f32, b: *const f32, n: usize) -> f32 {
     }
 }
 
+/// Four dot products against a shared vector `a`: `[dot(a,b0), dot(a,b1),
+/// dot(a,b2), dot(a,b3)]`. Register-blocked — `a`'s vector loads are shared
+/// across all four accumulators instead of being reloaded once per `dot()`
+/// call, amortizing the load when `a` is reused against several `b`s in a
+/// row (e.g. one query row scored against several keys). AVX2+FMA when
+/// present; scalar fallback otherwise. All four slices must share `a`'s length.
+pub fn dot4(a: &[f32], b0: &[f32], b1: &[f32], b2: &[f32], b3: &[f32]) -> [f32; 4] {
+    debug_assert_eq!(a.len(), b0.len());
+    debug_assert_eq!(a.len(), b1.len());
+    debug_assert_eq!(a.len(), b2.len());
+    debug_assert_eq!(a.len(), b3.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: avx2 + fma confirmed present; slices share length `a.len()`.
+            return unsafe { dot4_avx2(a.as_ptr(), b0.as_ptr(), b1.as_ptr(), b2.as_ptr(), b3.as_ptr(), a.len()) };
+        }
+    }
+    [
+        a.iter().zip(b0).map(|(x, y)| x * y).sum(),
+        a.iter().zip(b1).map(|(x, y)| x * y).sum(),
+        a.iter().zip(b2).map(|(x, y)| x * y).sum(),
+        a.iter().zip(b3).map(|(x, y)| x * y).sum(),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot4_avx2(
+    a: *const f32, b0: *const f32, b1: *const f32, b2: *const f32, b3: *const f32, n: usize,
+) -> [f32; 4] {
+    use core::arch::x86_64::*;
+    unsafe {
+        let n8 = n - (n % 8);
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        let mut j = 0;
+        while j < n8 {
+            let av = _mm256_loadu_ps(a.add(j)); // loaded once, reused across all four
+            acc0 = _mm256_fmadd_ps(av, _mm256_loadu_ps(b0.add(j)), acc0);
+            acc1 = _mm256_fmadd_ps(av, _mm256_loadu_ps(b1.add(j)), acc1);
+            acc2 = _mm256_fmadd_ps(av, _mm256_loadu_ps(b2.add(j)), acc2);
+            acc3 = _mm256_fmadd_ps(av, _mm256_loadu_ps(b3.add(j)), acc3);
+            j += 8;
+        }
+        let hsum = |acc: __m256| -> f32 {
+            let hi = _mm256_extractf128_ps(acc, 1);
+            let lo = _mm256_castps256_ps128(acc);
+            let s = _mm_add_ps(hi, lo);
+            let s = _mm_hadd_ps(s, s);
+            let s = _mm_hadd_ps(s, s);
+            _mm_cvtss_f32(s)
+        };
+        let mut out = [hsum(acc0), hsum(acc1), hsum(acc2), hsum(acc3)];
+        while j < n {
+            out[0] += *a.add(j) * *b0.add(j);
+            out[1] += *a.add(j) * *b1.add(j);
+            out[2] += *a.add(j) * *b2.add(j);
+            out[3] += *a.add(j) * *b3.add(j);
+            j += 1;
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dot4_matches_four_dot_calls() {
+        let a: Vec<f32> = (0..37).map(|i| (i as f32) * 0.37 - 3.0).collect();
+        let b0: Vec<f32> = (0..37).map(|i| (i as f32) * 0.11 + 1.0).collect();
+        let b1: Vec<f32> = (0..37).map(|i| (i as f32) * -0.05 + 2.0).collect();
+        let b2: Vec<f32> = (0..37).map(|i| (i as f32) * 0.23 - 1.5).collect();
+        let b3: Vec<f32> = (0..37).map(|i| (i as f32) * 0.02 + 0.5).collect();
+        let got = dot4(&a, &b0, &b1, &b2, &b3);
+        let want = [dot(&a, &b0), dot(&a, &b1), dot(&a, &b2), dot(&a, &b3)];
+        for i in 0..4 {
+            assert!((got[i] - want[i]).abs() < 1e-3, "dot4[{i}] {} vs {}", got[i], want[i]);
+        }
+    }
 
     #[test]
     fn avx2_matches_scalar() {
