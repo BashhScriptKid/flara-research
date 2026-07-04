@@ -3094,3 +3094,68 @@ attention dot products), not undiscovered waste. From the original
 420ms/step post-swap regression to **238-244ms/step (~1050 tok/s)** — a
 1.7-1.8x improvement, and comfortably faster than the 306.5ms/step
 pre-swap baseline this entire effort was trying to reach parity with.
+
+---
+
+## 2026-07-04 — Attention-core parallelization + register-blocking (the two deferred levers, landed)
+
+With single-threaded optimization exhausted, picked up the two levers
+explicitly deferred above.
+
+### Parallelize `attn_flash.rs`/`attn_swa.rs` over query rows
+
+Both kernels had zero rayon usage — every query row computed serially,
+despite forward being embarrassingly parallel (row `i`'s output depends
+only on causal/windowed keys, never on another row). Backward's dK/dV do
+accumulate across rows sharing a key, so the parallel split reused the
+same per-chunk-local-accumulator-then-merge pattern already established
+for the Monarch two-phase backward: row-chunk workers (`rayon::current_num_threads()`-sized
+chunks, same as `monarch.rs`) write to local `dk`/`dv` buffers, summed
+afterward; `dq` needs no merge since each row's gradient is independent.
+Below `PARALLEL_THRESHOLD=8` rows, the unmodified sequential path runs —
+same threshold/rationale as the Monarch kernels.
+
+Correctness: added `forward_parallel_matches_naive_softmax` (t=16, checked
+against the existing `naive()` O(T²) reference — untouched by the change)
+and `backward_parallel_chunking_matches_single_chunk` (compares a forced
+1-thread run against a forced 8-thread run via local `rayon::ThreadPool`
+instances, isolating just the chunk/merge logic) to both files. Along the
+way, an FD-based gradcheck attempt at t=16 failed — but reproduced
+identically on the *original, unmodified* file (confirmed via `git
+stash`), revealing a pre-existing finite-difference tolerance limitation
+at that scale unrelated to this change. Dropped the FD approach at t=16 in
+favor of the chunk-comparison test, which sidesteps FD precision entirely.
+
+**Measured** (train_small_lod shape, LTO release binary): `ATTN_CORE_FWD`
+21.1ms/step → 10.2ms/step, `ATTN_CORE_BWD` 44ms/step → 15.8ms/step. Total
+step 238-244ms/step → 216-230ms/step; wall-clock throughput **~1100
+tok/s** (up from ~1050) — a smaller relative gain than attention's own
+drop, because FFN (Monarch) is now the larger share of the step. Committed
+`49e9de2`.
+
+### Register-block the score/dp dot products (Opus's flagged real-but-risky lever)
+
+Added `gemm::dot4(a, b0,b1,b2,b3)` — loads the shared vector `a` once and
+reuses it across four FMA accumulators, instead of reloading it once per
+`dot()` call. Wired into both kernels' forward score/block-max loop and
+backward score+dp loop, processing keys in groups of 4 with a scalar
+remainder loop for counts not divisible by 4.
+
+Correctness: `dot4_matches_four_dot_calls` in `gemm.rs`; all existing
+attention tests (naive/gradcheck/parallel-chunking) still pass unmodified
+(97/97 total).
+
+**Measured:** `ATTN_CORE_FWD`/`ATTN_CORE_BWD` changed within run-to-run
+noise — no clear win at this scale. Consistent with Opus's original
+caveat that this lever's payoff was smaller and less certain than
+row-parallelization. Kept anyway since it's correctness-verified, not a
+regression, and should matter more at larger `head_dim`/production scale
+where the `qi`/`doi` reload cost is a larger fraction of per-key work.
+Committed `8d8c5fd`.
+
+**Status:** both explicitly-deferred perf levers from the prior entry are
+now landed and verified. Attention is no longer a meaningfully serial
+bottleneck. The only performance-adjacent item left on the board is the
+frozen-dictionary experiment — which is a training-quality question, not
+a kernel-speed one, and needs real training runs (not benchmarks) to
+answer honestly.
