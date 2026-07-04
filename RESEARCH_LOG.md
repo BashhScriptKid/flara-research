@@ -3397,3 +3397,41 @@ workaround) — the full production spec now actually runs on this machine.
 Remaining, per Fable's punch list: a longer sanity run past the ~1200-step
 toy horizon, and confirming eval/logging is trustworthy unattended — both
 flagged as good-to-have insurance, not blockers.
+
+### Follow-up: a memory-specific Fable review (not throughput)
+
+With activation checkpointing making peak activation memory O(1) layer
+instead of O(n_layers), asked Fable to review memory specifically — is
+there real headroom left, now that the model actually fits (`FULL=1`
+measured 1.90GB peak RSS at seq=256, comfortably inside 14GB)? Fable
+profiled fresh (didn't trust the summary above), traced every claimed
+buffer to a specific line, and checked the obvious suspects: AdaFactor is
+factored everywhere including the embedding matrix (not a full
+`[vocab,hidden]` second moment); the embedding table isn't duplicated in
+the LM head; `BufPool` is bounded in practice; checkpointing correctly
+holds only one layer's Monarch caches at a time. All clean.
+
+Found two genuine, zero-tradeoff wastes in `src/model/model.rs`:
+1. `LayerReplayState.input` was never read anywhere — every consumer
+   already derives a layer's input from the previous layer's `.out` (or
+   the embedding lookup for layer 0). Pure duplication, ~86MB at
+   production shape.
+2. `backward`'s per-layer loop cloned `lg.d_hidden` into `d_x`, then
+   retained the *original* `lg` (d_hidden included) inside
+   `layer_grads_rev` until the whole `ModelGrads` dropped — but
+   `d_hidden` is a per-token activation gradient, deliberately never read
+   again downstream (`LayerGrads::add`/`scale` explicitly skip it).
+   Switched to `std::mem::take` — moves instead of clones, and leaves
+   nothing retaining a dead copy.
+
+Removed both (102/102 tests still pass — both were correctness-neutral,
+confirmed by grep showing zero readers before removing). Measured,
+`FULL=1` seq=256: peak RSS **1.90GB → 1.73GB** (~170MB, matching Fable's
+estimate almost exactly).
+
+**Status:** Fable's verdict, corroborated by the measurement: memory is
+now at genuine diminishing returns. What's left (weights, one gradient
+copy, already-factored optimizer state, the embed table) is inherently
+sized, not wasteful. Compute — not memory — is this model's binding
+constraint at production shape (confirmed separately: ~34.5s/step, ~14.8
+tok/s at seq=512, 96 layers).
