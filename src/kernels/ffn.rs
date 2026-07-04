@@ -90,6 +90,22 @@ pub struct FfnForwardBatch {
     pub gates: Vec<Vec<f32>>,
 }
 
+impl FfnForwardBatch {
+    /// Return every `BufPool`-sourced buffer this holds (`up`/`gate`/`act` and
+    /// the three `zs` caches) for reuse, when this `FfnForwardBatch` is being
+    /// discarded without ever reaching `backward_batch` (which would
+    /// otherwise be the one to give them back) -- e.g. activation
+    /// checkpointing's throwaway initial forward pass (see `Model::forward`).
+    pub fn discard_into_pool(self, pool: &mut crate::kernels::scratch::BufPool) {
+        pool.give(self.up);
+        pool.give(self.gate);
+        pool.give(self.act);
+        pool.give(self.up_cache.zs);
+        pool.give(self.gate_cache.zs);
+        pool.give(self.down_cache.zs);
+    }
+}
+
 /// Routing decision for one token, produced by [`Ffn::select`] *before* the heavy
 /// compute. Exposing this seam lets the caller resolve the router early
 /// and prefetch the selected coefficient tiles while their cache lines are

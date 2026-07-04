@@ -92,6 +92,23 @@ pub struct LayerForward {
     pub wo_fc: FwdCache,
 }
 
+impl LayerForward {
+    /// Return every `BufPool`-sourced buffer this holds (the four attention
+    /// `zs` caches plus the FFN's, via `FfnForwardBatch::discard_into_pool`)
+    /// for reuse, when this `LayerForward` is being discarded without ever
+    /// reaching `TransformerLayer::backward` (which would otherwise be the
+    /// one to give them back) -- activation checkpointing's throwaway
+    /// initial forward pass (see `Model::forward`) only needs a handful of
+    /// cheap fields out of this, not the full cache.
+    pub fn discard_into_pool(self, pool: &mut crate::kernels::scratch::BufPool) {
+        pool.give(self.wq_fc.zs);
+        pool.give(self.wk_fc.zs);
+        pool.give(self.wv_fc.zs);
+        pool.give(self.wo_fc.zs);
+        self.ffn_fwds.discard_into_pool(pool);
+    }
+}
+
 /// Gradients for one layer. `d_hidden` flows to the layer below; the rest are
 /// parameter grads. Probe grads are populated only when an upstream probe
 /// gradient is supplied; the probe is gradient-stopped, so it never touches

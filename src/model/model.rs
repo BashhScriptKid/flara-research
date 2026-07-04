@@ -11,9 +11,21 @@
 //!   ids ─lookup E─► x ─[layer × N]─► x ─RMSNorm─► h ─h·Eᵀ─► logits[T, vocab]
 //! ```
 //!
-//! The forward stores every layer's [`LayerForward`] activation cache so the (next
-//! increment) backward can run without recomputation. Activation checkpointing —
-//! trading that storage for recompute — is a deferred memory optimization.
+//! **Activation checkpointing**: `forward` does *not* retain every layer's full
+//! [`LayerForward`] activation cache (the Monarch `zs` caches and FFN
+//! intermediates dominate memory — measured at ~354MB/layer at production
+//! width, making the full 96-layer spec impossible to fit in RAM at all; see
+//! RESEARCH_LOG.md 2026-07-05). Instead it keeps only the cheap bits each
+//! layer's full cache would otherwise be needed for outside of `backward`
+//! itself ([`LayerReplayState`] — the layer's input, output, probe
+//! probability, and FFN routing decision — a few `t·hidden`-sized buffers,
+//! not the `t·(hidden²/block)`-sized `zs` caches). `backward` recomputes each
+//! layer's full `LayerForward` from its saved input, immediately before that
+//! layer's own backward call, discarding it right after — so peak activation
+//! memory is `O(1 layer)` instead of `O(n_layers)`, at the cost of ~doubling
+//! each layer's forward compute (recomputed once here, once in `backward`).
+//! Recompute is exact (deterministic, no dropout/randomness in this codebase)
+//! so this changes memory and speed only, not the computed gradients.
 
 use crate::kernels::fft::init_coeffs_random;
 use crate::kernels::norm;
@@ -22,14 +34,37 @@ use crate::model::config::ModelConfig;
 use crate::kernels::optimizer::{AdaFactor, AdaFactorState};
 use crate::model::layer::{LayerCheckpoint, LayerForward, LayerGrads, LayerOptState, TransformerLayer};
 
+/// The cheap per-layer state `Model::forward`/`probe_consistency` need
+/// outside of `Model::backward`'s recompute-then-consume loop — see the
+/// module doc's "activation checkpointing" note. Not to be confused with
+/// [`crate::model::layer::LayerCheckpoint`] (a *weight* snapshot for disk
+/// save/load — an unrelated, pre-existing concept with a similar name).
+pub struct LayerReplayState {
+    /// This layer's forward input (previous layer's `out`, or the embedding
+    /// lookup for layer 0) — enough for `backward` to recompute the full
+    /// `LayerForward` on demand.
+    pub input: Vec<f32>,
+    /// This layer's output (`= layer_replay[l+1].input`, kept redundantly
+    /// for clarity/convenience — negligible cost next to the caches this
+    /// replaces).
+    pub out: Vec<f32>,
+    /// Per-token early-exit probability, length `T`.
+    pub probe_p: Vec<f32>,
+    /// Per-token FFN routing decision (block indices selected) — needed by
+    /// callers that check routing stability across forward calls (e.g.
+    /// gradcheck tests skipping non-smooth top-k-flip coordinates).
+    pub ffn_selected: Vec<Vec<usize>>,
+}
+
 /// Cached forward state for the whole model, consumed by the backward pass.
 pub struct ModelForward {
     /// Next-token logits, `[T, vocab]` row-major.
     pub logits: Vec<f32>,
     /// The input token ids (needed to scatter embedding gradients).
     pub token_ids: Vec<usize>,
-    /// Per-layer activation caches, `n_layers` of them, in forward order.
-    pub layer_fwds: Vec<LayerForward>,
+    /// Per-layer cheap replay state, `n_layers` of them, in forward order —
+    /// see the module doc's "activation checkpointing" note.
+    pub layer_replay: Vec<LayerReplayState>,
     /// Output of the last layer / input to the final norm, `[T, H]`.
     pub final_x: Vec<f32>,
     /// Final-norm output (the LM-head input), `[T, H]`.
@@ -260,11 +295,24 @@ impl Model {
 
         let mut x = self.embed_lookup(ids);
 
-        let mut layer_fwds = Vec::with_capacity(self.layers.len());
+        // Activation checkpointing (see module doc): each `lf` here is a full,
+        // expensive LayerForward, but only used transiently to seed the next
+        // layer's input and extract a few cheap fields -- `backward`
+        // recomputes it fresh from `layer_replay[l].input` when it actually
+        // needs the rest. Pool-sourced buffers this `lf` holds are given back
+        // immediately (`discard_into_pool`) since nothing else will.
+        let mut layer_replay = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
+            let input = x.clone();
             let lf = layer.forward(&self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2, &self.rope, &x, t, pool);
             x = lf.out.clone();
-            layer_fwds.push(lf);
+            layer_replay.push(LayerReplayState {
+                input,
+                out: lf.out.clone(),
+                probe_p: lf.probe_p.clone(),
+                ffn_selected: lf.ffn_fwds.selected.clone(),
+            });
+            lf.discard_into_pool(pool);
         }
         let final_x = x;
 
@@ -281,7 +329,7 @@ impl Model {
         let mut logits = vec![0.0f32; t * v];
         crate::kernels::gemm::logits_from_embed(&normed_final, &self.embed, &mut logits, t, h, v);
 
-        ModelForward { logits, token_ids: ids.to_vec(), layer_fwds, final_x, normed_final, rinv_final }
+        ModelForward { logits, token_ids: ids.to_vec(), layer_replay, final_x, normed_final, rinv_final }
     }
 
     /// Reverse of [`forward`](Model::forward). `d_logits` is the gradient w.r.t.
@@ -347,9 +395,9 @@ impl Model {
                 grads.push(Vec::new());
                 continue;
             }
-            let input: &[f32] = if l == 0 { &embed_x } else { &fwd.layer_fwds[l - 1].out };
+            let input: &[f32] = if l == 0 { &embed_x } else { &fwd.layer_replay[l - 1].out };
             let early = self.early_logits(input, t);
-            let pp = &fwd.layer_fwds[l].probe_p;
+            let pp = &fwd.layer_replay[l].probe_p;
             let mut dpl = vec![0.0f32; t];
             for ti in 0..t {
                 let tgt = if argmax(&early[ti * v..(ti + 1) * v]) == final_arg[ti] {
@@ -415,13 +463,13 @@ impl Model {
         }
 
         // --- layer stack, in reverse; the shared dictionary grads sum across layers ---
+        // Activation checkpointing (see module doc): each layer's full
+        // LayerForward is recomputed here, immediately before that same
+        // layer's backward call, from the cheap `layer_replay[l].input`
+        // saved by `forward` -- rather than being retained (expensively)
+        // from the original forward pass. Recompute is exact/deterministic,
+        // so this changes memory and speed only, not the gradients.
         let embed_x = self.embed_lookup(&fwd.token_ids);
-        // Every layer's output, needed as the *next* layer's backward input --
-        // extracted before `fwd.layer_fwds` is consumed by value below (each
-        // LayerForward is moved into that layer's own backward call so its
-        // pooled buffers, e.g. the Monarch `zs` caches, can be recycled).
-        let layer_outs: Vec<Vec<f32>> = fwd.layer_fwds.iter().map(|lf| lf.out.clone()).collect();
-        let mut layer_fwds = fwd.layer_fwds;
         let mut d_x = d_final_x;
         let mut d_mono_d1: Vec<f32> = Vec::new();
         let mut d_mono_d2: Vec<f32> = Vec::new();
@@ -430,14 +478,15 @@ impl Model {
         let mut layer_grads_rev = Vec::with_capacity(self.layers.len());
         for l in (0..self.layers.len()).rev() {
             // Layer l's forward input is the previous layer's output (or the embedding).
-            let input = if l == 0 { &embed_x } else { &layer_outs[l - 1] };
+            let input = if l == 0 { &embed_x } else { &fwd.layer_replay[l - 1].out };
             let lpp = d_probe_p.and_then(|p| {
                 let s = p[l].as_slice();
                 (!s.is_empty()).then_some(s)
             });
-            // `l` is always the last remaining index (we pop in strictly
-            // decreasing order), so `.pop()` gives layer `l`'s own LayerForward.
-            let this_fwd = layer_fwds.pop().expect("layer_fwds/layers length mismatch");
+            let this_fwd = self.layers[l].forward(
+                &self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2,
+                &self.rope, input, t, pool,
+            );
             let lg = self.layers[l].backward(
                 &self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2,
                 &self.rope, input, this_fwd, &d_x, lpp, t, pool,
@@ -579,7 +628,7 @@ mod tests {
         let mut pool = crate::kernels::scratch::BufPool::new();
         let fwd = m.forward(&ids, &mut pool);
         assert_eq!(fwd.logits.len(), ids.len() * v);
-        assert_eq!(fwd.layer_fwds.len(), n);
+        assert_eq!(fwd.layer_replay.len(), n);
         assert!(fwd.logits.iter().all(|x| x.is_finite()));
     }
 
@@ -647,7 +696,7 @@ mod tests {
         // Base FFN routing per (layer, token), to detect top-k kinks under
         // perturbation -- computed before `backward` consumes `fwd` by value.
         let sel_of = |f: &ModelForward| -> Vec<Vec<usize>> {
-            f.layer_fwds.iter().flat_map(|lf| lf.ffn_fwds.selected.clone()).collect()
+            f.layer_replay.iter().flat_map(|lr| lr.ffn_selected.clone()).collect()
         };
         let base_sel = sel_of(&fwd);
         let grads = m.backward(fwd, &d_logits, None, &mut pool);
