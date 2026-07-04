@@ -178,13 +178,17 @@ pub struct Checkpoint {
 impl Model {
     /// Capture all learned parameters into a serializable checkpoint.
     pub fn to_checkpoint(&self) -> Checkpoint {
+        // Checkpoint.embed stays fp32 on disk (simpler than teaching the
+        // serialized format about fp16 too) -- convert at this boundary.
+        let mut embed_f32 = vec![0.0f32; self.embed.len()];
+        crate::kernels::f16_simd::f16_to_f32(&self.embed, &mut embed_f32);
         Checkpoint {
             cfg: self.cfg.clone(),
             mono_d1: self.mono_d1.clone(),
             mono_d2: self.mono_d2.clone(),
             ffn_mono_d1: self.ffn_mono_d1.clone(),
             ffn_mono_d2: self.ffn_mono_d2.clone(),
-            embed: self.embed.clone(),
+            embed: embed_f32,
             final_norm_gain: self.final_norm_gain.clone(),
             layers: self.layers.iter().map(|l| l.to_checkpoint()).collect(),
         }
@@ -198,7 +202,7 @@ impl Model {
         m.mono_d2 = c.mono_d2.clone();
         m.ffn_mono_d1 = c.ffn_mono_d1.clone();
         m.ffn_mono_d2 = c.ffn_mono_d2.clone();
-        m.embed = c.embed.clone();
+        m.embed = c.embed.iter().map(|&x| half::f16::from_f32(x)).collect();
         m.final_norm_gain = c.final_norm_gain.clone();
         for (layer, lc) in m.layers.iter_mut().zip(&c.layers) {
             layer.load_checkpoint(lc);
@@ -246,8 +250,22 @@ pub struct Model {
     /// (up/gate/down) — separate from the attention one above.
     ffn_mono_d1: Vec<f32>,
     ffn_mono_d2: Vec<f32>,
-    /// Tied token embedding `E`, `[vocab, hidden]` row-major.
-    embed: Vec<f32>,
+    /// Tied token embedding `E`, `[vocab, hidden]` row-major. Stored fp16
+    /// (fp16-migration branch, RESEARCH_LOG.md 2026-07-05): this table
+    /// dominates the tied LM head's memory-bandwidth-bound sweep
+    /// (`logits_from_embed`/`head_backward`), so halving its bytes-per-
+    /// element is a real win on this hardware even without native fp16
+    /// compute (see `src/kernels/f16_simd.rs`'s module doc). The AdaFactor
+    /// update itself still runs in fp32 (`apply_grad` converts in and out
+    /// around the optimizer step); only the persistent storage is narrowed.
+    embed: Vec<half::f16>,
+    /// Persistent fp32 scratch for `apply_grad`'s embed step (expand fp16 ->
+    /// fp32, run AdaFactor, narrow back) — reused every step instead of a
+    /// fresh `vec![0.0; vocab*hidden]`, which would otherwise touch a new
+    /// ~vocab*hidden*4-byte region every call and inflate peak RSS by
+    /// roughly what fp16 storage was supposed to save (measured: it did,
+    /// see RESEARCH_LOG.md 2026-07-05).
+    embed_scratch: Vec<f32>,
     final_norm_gain: Vec<f32>,
     rope: Rope,
     layers: Vec<TransformerLayer>,
@@ -260,13 +278,14 @@ impl Model {
         let mono_m = (cfg.block as f64).sqrt() as usize;
         let (mono_d1, mono_d2) = crate::kernels::monarch::init_shared_atoms(cfg.dict_k, mono_m, seed ^ 0xA7A7);
         let (ffn_mono_d1, ffn_mono_d2) = crate::kernels::monarch::init_shared_atoms(cfg.dict_k, mono_m, seed ^ 0xB8B8);
-        let embed = init_coeffs_random(cfg.vocab * cfg.hidden, seed ^ 0xE3BE, 0.02);
+        let embed_scratch = init_coeffs_random(cfg.vocab * cfg.hidden, seed ^ 0xE3BE, 0.02);
+        let embed: Vec<half::f16> = embed_scratch.iter().map(|&x| half::f16::from_f32(x)).collect();
         let layers = (0..cfg.n_layers)
             .map(|i| TransformerLayer::new(&cfg, i, seed.wrapping_add(i as u64 * 0x9E37)))
             .collect();
         let rope = Rope::new(cfg.head_dim, cfg.max_seq, cfg.rope_base);
         let final_norm_gain = vec![1.0; cfg.hidden];
-        Self { cfg, mono_d1, mono_d2, ffn_mono_d1, ffn_mono_d2, embed, final_norm_gain, rope, layers }
+        Self { cfg, mono_d1, mono_d2, ffn_mono_d1, ffn_mono_d2, embed, embed_scratch, final_norm_gain, rope, layers }
     }
 
     #[inline]
@@ -274,13 +293,16 @@ impl Model {
         &self.cfg
     }
 
-    /// Embed `ids` into the residual stream, `[T, H]` row-major.
+    /// Embed `ids` into the residual stream, `[T, H]` row-major. The rest of
+    /// the model still computes in fp32 (this migration only narrows
+    /// *storage*, see the `embed` field doc), so each looked-up row is
+    /// converted back to fp32 here.
     fn embed_lookup(&self, ids: &[usize]) -> Vec<f32> {
         let h = self.cfg.hidden;
         let mut x = vec![0.0f32; ids.len() * h];
         for (ti, &id) in ids.iter().enumerate() {
             debug_assert!(id < self.cfg.vocab, "token id {id} out of vocab");
-            x[ti * h..(ti + 1) * h].copy_from_slice(&self.embed[id * h..(id + 1) * h]);
+            crate::kernels::f16_simd::f16_to_f32(&self.embed[id * h..(id + 1) * h], &mut x[ti * h..(ti + 1) * h]);
         }
         x
     }
@@ -560,7 +582,16 @@ impl Model {
     /// gradient bundle. Each shared dictionary steps once from its model-level
     /// summed gradient; the per-layer copies are ignored.
     pub fn apply_grad(&mut self, g: &ModelGrads, st: &mut ModelOptState, af: &AdaFactor, lr: f32) {
-        af.step(&mut self.embed, &g.d_embed, &mut st.embed, lr);
+        // AdaFactor's update math runs in fp32 regardless of embed's fp16
+        // storage (see the field doc): expand into the persistent
+        // `embed_scratch` buffer, step as before, narrow the result back.
+        // Reusing `embed_scratch` (instead of a fresh vec! every call)
+        // matters: a fresh vocab*hidden-sized fp32 allocation every step
+        // touches a new region and raises the process's peak RSS by
+        // roughly what fp16 storage was supposed to save (measured).
+        crate::kernels::f16_simd::f16_to_f32(&self.embed, &mut self.embed_scratch);
+        af.step(&mut self.embed_scratch, &g.d_embed, &mut st.embed, lr);
+        crate::kernels::f16_simd::f32_to_f16(&self.embed_scratch, &mut self.embed);
 
         if !Self::FREEZE_DICT {
             // Shared Monarch attention dictionary: d1 then d2 concatenated for the optimizer.
@@ -709,11 +740,15 @@ mod tests {
         for _ in 0..24 {
             let i = (rng.0 as usize) % (vocab * m.config().hidden);
             rng.f(); // advance
+            // `H` (1e-3) is well above fp16's ULP at this magnitude (~1e-5
+            // for values around the 0.02 init scale), so the perturbation
+            // survives fp16 rounding; the existing loose tolerance below
+            // already absorbs the small residual rounding error this adds.
             let save = m.embed[i];
-            m.embed[i] = save + H;
+            m.embed[i] = half::f16::from_f32(save.to_f32() + H);
             let fp = m.forward(&ids, &mut pool);
             let lp = cross_entropy(&fp.logits, vocab, &targets).0;
-            m.embed[i] = save - H;
+            m.embed[i] = half::f16::from_f32(save.to_f32() - H);
             let fm = m.forward(&ids, &mut pool);
             let lm = cross_entropy(&fm.logits, vocab, &targets).0;
             m.embed[i] = save;

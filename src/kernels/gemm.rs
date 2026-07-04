@@ -21,7 +21,7 @@ const HEAD_PARALLEL_THRESHOLD: usize = 8;
 /// cores instead of one core alone bottlenecking on its own load latency
 /// (measured: this was ~82% of a production-shaped training step, entirely
 /// unparallelized — see RESEARCH_LOG.md 2026-07-04).
-pub fn logits_from_embed(normed: &[f32], embed: &[f32], out: &mut [f32], t: usize, h: usize, v: usize) {
+pub fn logits_from_embed(normed: &[f32], embed: &[half::f16], out: &mut [f32], t: usize, h: usize, v: usize) {
     if t < HEAD_PARALLEL_THRESHOLD {
         logits_from_embed_range(normed, embed, out, t, h, v);
     } else {
@@ -38,7 +38,7 @@ pub fn logits_from_embed(normed: &[f32], embed: &[f32], out: &mut [f32], t: usiz
 /// Same math as `logits_from_embed`, over a caller-chosen contiguous range of
 /// token rows (`normed`/`out` already sliced to that range) — the sequential
 /// per-chunk worker, and also used directly for `t < HEAD_PARALLEL_THRESHOLD`.
-fn logits_from_embed_range(normed: &[f32], embed: &[f32], out: &mut [f32], t: usize, h: usize, v: usize) {
+fn logits_from_embed_range(normed: &[f32], embed: &[half::f16], out: &mut [f32], t: usize, h: usize, v: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -50,20 +50,26 @@ fn logits_from_embed_range(normed: &[f32], embed: &[f32], out: &mut [f32], t: us
     logits_scalar(normed, embed, out, t, h, v);
 }
 
-fn logits_scalar(normed: &[f32], embed: &[f32], out: &mut [f32], t: usize, h: usize, v: usize) {
+fn logits_scalar(normed: &[f32], embed: &[half::f16], out: &mut [f32], t: usize, h: usize, v: usize) {
     for ti in 0..t {
         let row = &normed[ti * h..(ti + 1) * h];
         let dst = &mut out[ti * v..(ti + 1) * v];
         for (vid, lg) in dst.iter_mut().enumerate() {
             let e = &embed[vid * h..(vid + 1) * h];
-            *lg = row.iter().zip(e).map(|(a, b)| a * b).sum();
+            *lg = row.iter().zip(e).map(|(a, b)| a * b.to_f32()).sum();
         }
     }
 }
 
+/// `embed` is fp16-stored (see `src/kernels/f16_simd.rs`'s module doc): this
+/// CPU has no native fp16 arithmetic, so each row is converted to fp32 into a
+/// small, reused scratch buffer (cache-resident, cheap) immediately before
+/// the FMA loop below runs unchanged on that buffer. The bandwidth win is
+/// real: `embed` (the dominant cost here, `[v, h]`, far larger than cache) is
+/// read at half the bytes; the scratch buffer's own traffic stays in L1/L2.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn logits_avx2(normed: &[f32], embed: &[f32], out: &mut [f32], t: usize, h: usize, v: usize) {
+unsafe fn logits_avx2(normed: &[f32], embed: &[half::f16], out: &mut [f32], t: usize, h: usize, v: usize) {
     use core::arch::x86_64::*;
 
     // Horizontal sum of a __m256 into a scalar.
@@ -81,10 +87,12 @@ unsafe fn logits_avx2(normed: &[f32], embed: &[f32], out: &mut [f32], t: usize, 
 
     unsafe {
         let h16 = h - (h % 16);
+        let mut e_scratch = vec![0.0f32; h];
         for ti in 0..t {
             let row = normed.as_ptr().add(ti * h);
             for vid in 0..v {
-                let e = embed.as_ptr().add(vid * h);
+                crate::kernels::f16_simd::f16_to_f32(&embed[vid * h..(vid + 1) * h], &mut e_scratch);
+                let e = e_scratch.as_ptr();
                 let mut acc0 = _mm256_setzero_ps();
                 let mut acc1 = _mm256_setzero_ps();
                 let mut j = 0;
@@ -133,7 +141,7 @@ unsafe fn logits_avx2(normed: &[f32], embed: &[f32], out: &mut [f32], t: usize, 
 /// inner range) and would need cross-thread merging instead of disjoint writes.
 pub fn head_backward(
     d_logits: &[f32],
-    embed: &[f32],
+    embed: &[half::f16],
     normed: &[f32],
     d_normed: &mut [f32],
     d_embed: &mut [f32],
@@ -170,7 +178,7 @@ pub fn head_backward(
 /// `d_normed` already sliced to that range): `d_normed[ti] = Σ_vid
 /// d_logits[ti,vid] · embed[vid]`; dnf stays L1-resident. `d_normed` is
 /// accumulated into (caller zero-inits before the first call).
-fn head_backward_pass_a_range(d_logits: &[f32], embed: &[f32], d_normed: &mut [f32], t: usize, h: usize, v: usize) {
+fn head_backward_pass_a_range(d_logits: &[f32], embed: &[half::f16], d_normed: &mut [f32], t: usize, h: usize, v: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -186,7 +194,7 @@ fn head_backward_pass_a_range(d_logits: &[f32], embed: &[f32], d_normed: &mut [f
             let dlv = dl[vid];
             let e = &embed[vid * h..(vid + 1) * h];
             for j in 0..h {
-                dnf[j] += dlv * e[j];
+                dnf[j] += dlv * e[j].to_f32();
             }
         }
     }
@@ -227,7 +235,7 @@ fn head_backward_pass_b_range(
 #[target_feature(enable = "avx2,fma")]
 unsafe fn head_backward_pass_a_avx2(
     d_logits: &[f32],
-    embed: &[f32],
+    embed: &[half::f16],
     d_normed: &mut [f32],
     t: usize,
     h: usize,
@@ -236,6 +244,7 @@ unsafe fn head_backward_pass_a_avx2(
     use core::arch::x86_64::*;
     unsafe {
         let h8 = h - (h % 8);
+        let mut e_scratch = vec![0.0f32; h];
         // d_normed[ti] = Σ_vid d_logits[ti,vid] · embed[vid].
         for ti in 0..t {
             let dl = d_logits.as_ptr().add(ti * v);
@@ -243,7 +252,8 @@ unsafe fn head_backward_pass_a_avx2(
             for vid in 0..v {
                 let dlv = *dl.add(vid);
                 let dlb = _mm256_set1_ps(dlv);
-                let e = embed.as_ptr().add(vid * h);
+                crate::kernels::f16_simd::f16_to_f32(&embed[vid * h..(vid + 1) * h], &mut e_scratch);
+                let e = e_scratch.as_ptr();
                 let mut j = 0;
                 while j < h8 {
                     let acc = _mm256_fmadd_ps(dlb, _mm256_loadu_ps(e.add(j)), _mm256_loadu_ps(dnf.add(j)));
@@ -441,7 +451,7 @@ mod tests {
         // remainder all at once.
         let (t, h, v) = (3usize, 44usize, 7usize);
         let normed: Vec<f32> = (0..t * h).map(|i| (i as f32 * 0.017).sin()).collect();
-        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32 * 0.013).cos()).collect();
+        let embed: Vec<half::f16> = (0..v * h).map(|i| half::f16::from_f32((i as f32 * 0.013).cos())).collect();
 
         let mut want = vec![0.0f32; t * v];
         logits_scalar(&normed, &embed, &mut want, t, h, v);
@@ -456,7 +466,7 @@ mod tests {
 
     /// Pure-scalar reference (no AVX2, no parallelism) for `head_backward_*_matches_scalar`.
     fn head_backward_naive(
-        d_logits: &[f32], embed: &[f32], normed: &[f32],
+        d_logits: &[f32], embed: &[half::f16], normed: &[f32],
         d_normed: &mut [f32], d_embed: &mut [f32], t: usize, h: usize, v: usize,
     ) {
         for ti in 0..t {
@@ -466,7 +476,7 @@ mod tests {
                 let dlv = dl[vid];
                 let e = &embed[vid * h..(vid + 1) * h];
                 for j in 0..h {
-                    dnf[j] += dlv * e[j];
+                    dnf[j] += dlv * e[j].to_f32();
                 }
             }
         }
@@ -486,7 +496,7 @@ mod tests {
     fn head_backward_avx2_matches_scalar() {
         let (t, h, v) = (3usize, 44usize, 7usize);
         let d_logits: Vec<f32> = (0..t * v).map(|i| (i as f32 * 0.021).sin()).collect();
-        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32 * 0.013).cos()).collect();
+        let embed: Vec<half::f16> = (0..v * h).map(|i| half::f16::from_f32((i as f32 * 0.013).cos())).collect();
         let normed: Vec<f32> = (0..t * h).map(|i| (i as f32 * 0.017).sin()).collect();
 
         // d_embed starts non-zero to exercise accumulation.
@@ -514,7 +524,7 @@ mod tests {
     fn head_backward_parallel_matches_scalar() {
         let (t, h, v) = (16usize, 44usize, 20usize);
         let d_logits: Vec<f32> = (0..t * v).map(|i| (i as f32 * 0.021).sin()).collect();
-        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32 * 0.013).cos()).collect();
+        let embed: Vec<half::f16> = (0..v * h).map(|i| half::f16::from_f32((i as f32 * 0.013).cos())).collect();
         let normed: Vec<f32> = (0..t * h).map(|i| (i as f32 * 0.017).sin()).collect();
         let de0: Vec<f32> = (0..v * h).map(|i| (i as f32 * 0.005).cos()).collect();
 
@@ -539,7 +549,7 @@ mod tests {
     fn logits_from_embed_parallel_matches_scalar() {
         let (t, h, v) = (16usize, 44usize, 9usize);
         let normed: Vec<f32> = (0..t * h).map(|i| (i as f32 * 0.031).sin()).collect();
-        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32 * 0.019).cos()).collect();
+        let embed: Vec<half::f16> = (0..v * h).map(|i| half::f16::from_f32((i as f32 * 0.019).cos())).collect();
 
         let mut want = vec![0.0f32; t * v];
         logits_scalar(&normed, &embed, &mut want, t, h, v);
