@@ -3302,3 +3302,98 @@ roughly double, again.
 through 2026-07-04 arc. Every flagged item has now been measured and
 resolved, several (this one included) by a wide margin past the original
 estimate. Nothing performance-related remains open on this thread.
+
+---
+
+## 2026-07-05 — Fable training-commitment review, then closing the two hard blockers
+
+Asked Fable a differently-framed question than the perf arc above: not
+"what's the next optimization" but "is this ready for someone to actually
+commit real time to training it." Fable profiled a production-shaped
+8-layer slice directly (rebuilt, ran `TRAIN_SMALL_LOD` and a
+production-shaped config itself) and found the real bottleneck nobody had
+looked at: **`FULL=1` (the true 96-layer, hidden-896 production spec)
+doesn't fit in this machine's 14GB RAM at all**, and a measurable
+production-shaped step spent **~82% of its time in the tied LM head**
+(`gemm.rs`'s `logits_from_embed`/`head_backward`), completely
+unparallelized and outside every existing profiling counter — every
+optimization in the arc above had targeted the ~18% of a production step
+that stays small at that shape. Fable's verdict: **not ready to commit
+yet** — fix the head parallelism and verify checkpoint resume first, since
+at the then-current throughput a week of training bought only ~8-10M
+tokens, too few to prove the architecture learns anything.
+
+### Parallelized the tied LM head
+
+`logits_from_embed` (forward) and `head_backward`'s two passes sweep the
+full `[vocab, hidden]` embedding table for every row — memory-bandwidth-
+not compute-bound. Chunked over token rows (forward, pass A) and vocab
+rows (pass B) via rayon, same threshold/pattern as attention/Monarch;
+split the combined AVX2 kernel into independently-parallelizable
+`head_backward_pass_a_avx2`/`_pass_b_avx2`. New parallel-path correctness
+tests; 102/102 total.
+
+**Measured, honestly:** ~30-35% reduction at a production-shaped 8-layer
+slice (11.66s/step -> ~7.6-8.3s/step) — real, but well short of a naive
+"82% single-threaded on 12 threads ⇒ big multiple" expectation, because
+memory-bandwidth-bound work doesn't scale with core count the way
+compute-bound work does; the shared memory controller becomes the limit.
+
+### Verified checkpoint resume for real
+
+The existing `roundtrip_preserves_params_and_opt_state` test only
+exercises save/load in-process — never a real kill-and-restart. Added
+`CKPT_EVERY` (checkpoint interval override) and let `RESUME=1` opt a
+`CKPT_TAG`'d run back into resuming (tagged runs default to fresh, to
+protect the real checkpoint). Ran a real training process, `SIGKILL`'d it
+mid-run past a checkpoint save, restarted, confirmed correct resume from
+the saved step with sensible continued loss descent (no reset, no
+divergence). Note: the data reader's position isn't checkpointed, so a
+resumed run's batch sequence isn't bit-identical to an uninterrupted one
+— state-consistent, not replay-exact, fine for training.
+
+### RAM-fitting config, then the user caught the real lever: activation checkpointing
+
+Measured empirically (not estimated): ~354MB/layer, ~420MB fixed, at
+production width/seq. 12 layers (4.68GB) verified safe; 16 layers (5.96GB)
+right at the edge with no margin. This would have been the plan — a
+reduced-depth config — until the user pointed out `model.rs`'s own
+docstring already flagged the real fix: **"activation checkpointing —
+trading storage for recompute — is a deferred memory optimization."**
+
+Implemented it. `Model::forward` no longer retains every layer's full,
+expensive `LayerForward` (the Monarch `zs` caches + FFN intermediates that
+account for essentially all of that ~354MB/layer); it keeps only a cheap
+per-layer `LayerReplayState` (input, output, probe probability, FFN
+routing decision — a handful of `t·hidden`-sized buffers, not the
+`t·hidden²/block`-sized `zs` caches). `Model::backward` recomputes each
+layer's full `LayerForward` from its saved input immediately before that
+layer's own backward call, then discards it the same way — so peak
+activation memory is `O(1 layer)` instead of `O(n_layers)`. Recompute is
+exact (deterministic, no dropout anywhere in this codebase), so this is a
+pure memory/speed tradeoff, not a quality one — confirmed by the existing
+gradcheck tests passing unchanged. Added `discard_into_pool` on
+`LayerForward`/`FfnForwardBatch` so the throwaway initial-forward pass's
+pooled buffers (`zs`, FFN `up`/`gate`/`act`) get returned to `BufPool`
+instead of leaking to a plain drop, preserving the pooling win built
+2026-07-04. (Named the new struct `LayerReplayState`, not `LayerCheckpoint`
+— that name was already taken by an unrelated, pre-existing concept, a
+*weight* snapshot for disk save/load.)
+
+**Result: 16-layer slice peak RSS 5.96GB -> 1.07GB (~5.5x). The actual
+96-layer `FULL=1` spec — previously unable to even allocate — now runs
+successfully at 2.34GB RSS**, ~34.5s/step, ~14.8 tok/s. Honestly: the
+throughput number lands back almost exactly at Fable's original
+pre-any-fix estimate, since the head parallelization's ~30% reduction and
+this change's ~30-50% recompute overhead largely offset each other. **The
+win is feasibility, not speed** — this config could not run at all
+before, and now runs with 3-4GB of headroom to spare.
+
+**Status:** two of Fable's three hard training-commitment blockers are
+now resolved (LM head parallelism, checkpoint resume) and the third
+(RAM feasibility) is resolved by a better mechanism than originally
+planned (activation checkpointing instead of a reduced-layer-count
+workaround) — the full production spec now actually runs on this machine.
+Remaining, per Fable's punch list: a longer sanity run past the ~1200-step
+toy horizon, and confirming eval/logging is trustworthy unattended — both
+flagged as good-to-have insurance, not blockers.
