@@ -98,6 +98,10 @@ pub struct FlashAttention {
 
 
 impl FlashAttention {
+    /// Below this many query rows, rayon dispatch overhead isn't worth it —
+    /// same threshold/rationale as `SharedMonarchProj` (see monarch.rs).
+    const PARALLEL_THRESHOLD: usize = 8;
+
     pub fn new(n_q_heads: usize, n_kv_heads: usize, head_dim: usize, kv_block: usize) -> Self {
         assert!(n_q_heads % n_kv_heads == 0, "n_q_heads must be a multiple of n_kv_heads");
         assert!(kv_block > 0, "kv_block must be positive");
@@ -124,6 +128,12 @@ impl FlashAttention {
 
     /// Flash attention forward. Writes attention output into `out` (same shape
     /// as `q`) and returns the per-row log-sum-exp, layout `[T, n_q_heads]`.
+    ///
+    /// Parallelizes over query rows `i` (independent — each row's output
+    /// depends only on causal keys `0..=i`, never on another row), the axis
+    /// with abundant work (`n_q_heads` is typically single digits, `T` is the
+    /// sequence length). Below `PARALLEL_THRESHOLD` rows, runs sequentially —
+    /// same rationale as the Monarch kernels (see monarch.rs).
     pub fn forward(&self, q: &[f32], k: &[f32], v: &[f32], out: &mut [f32]) -> Vec<f32> {
         let (nq, nkv, d) = (self.n_q_heads, self.n_kv_heads, self.head_dim);
         let t = self.seq_len(q);
@@ -133,57 +143,78 @@ impl FlashAttention {
         assert_eq!(out.len(), q.len(), "out shape mismatch");
 
         let mut lse = vec![0.0f32; t * nq];
-        let mut acc = vec![0.0f32; d];
-        let mut scores = vec![0.0f32; self.kv_block];
 
-        for h_q in 0..nq {
-            let h_kv = self.kv_head_of(h_q);
-            for i in 0..t {
-                let qi = &q[(i * nq + h_q) * d..(i * nq + h_q) * d + d];
+        // Computes rows `t0..t1` (absolute query index) into `out_c`/`lse_c`
+        // (offsets relative to `t0`, i.e. row `i` writes at `(i - t0)`).
+        let run_range = |t0: usize, t1: usize, out_c: &mut [f32], lse_c: &mut [f32]| {
+            let mut acc = vec![0.0f32; d];
+            let mut scores = vec![0.0f32; self.kv_block];
+            for i in t0..t1 {
+                let ri = i - t0;
+                for h_q in 0..nq {
+                    let h_kv = self.kv_head_of(h_q);
+                    let qi = &q[(i * nq + h_q) * d..(i * nq + h_q) * d + d];
 
-                let mut m = f32::NEG_INFINITY;
-                let mut l = 0.0f32;
-                for a in acc.iter_mut() {
-                    *a = 0.0;
-                }
-
-                // Causal: keys 0..=i, walked in tiles.
-                let j_end = i + 1;
-                let mut j0 = 0;
-                while j0 < j_end {
-                    let j1 = (j0 + self.kv_block).min(j_end);
-
-                    // Block scores + block max.
-                    let mut block_max = f32::NEG_INFINITY;
-                    for j in j0..j1 {
-                        let kj = &k[(j * nkv + h_kv) * d..(j * nkv + h_kv) * d + d];
-                        let s = self.scale * dot(qi, kj);
-                        scores[j - j0] = s;
-                        block_max = block_max.max(s);
+                    let mut m = f32::NEG_INFINITY;
+                    let mut l = 0.0f32;
+                    for a in acc.iter_mut() {
+                        *a = 0.0;
                     }
 
-                    let m_new = m.max(block_max);
-                    // exp(-inf) = 0 on the first block, so acc/l start cleanly.
-                    let correction = (m - m_new).exp();
-                    l *= correction;
-                    scale_acc(&mut acc, correction);
-                    for j in j0..j1 {
-                        let p = (scores[j - j0] - m_new).exp();
-                        l += p;
-                        let vj = &v[(j * nkv + h_kv) * d..(j * nkv + h_kv) * d + d];
-                        axpy(&mut acc, p, vj);
-                    }
-                    m = m_new;
-                    j0 = j1;
-                }
+                    // Causal: keys 0..=i, walked in tiles.
+                    let j_end = i + 1;
+                    let mut j0 = 0;
+                    while j0 < j_end {
+                        let j1 = (j0 + self.kv_block).min(j_end);
 
-                let inv_l = 1.0 / l;
-                let o = &mut out[(i * nq + h_q) * d..(i * nq + h_q) * d + d];
-                for dd in 0..d {
-                    o[dd] = acc[dd] * inv_l;
+                        // Block scores + block max.
+                        let mut block_max = f32::NEG_INFINITY;
+                        for j in j0..j1 {
+                            let kj = &k[(j * nkv + h_kv) * d..(j * nkv + h_kv) * d + d];
+                            let s = self.scale * dot(qi, kj);
+                            scores[j - j0] = s;
+                            block_max = block_max.max(s);
+                        }
+
+                        let m_new = m.max(block_max);
+                        // exp(-inf) = 0 on the first block, so acc/l start cleanly.
+                        let correction = (m - m_new).exp();
+                        l *= correction;
+                        scale_acc(&mut acc, correction);
+                        for j in j0..j1 {
+                            let p = (scores[j - j0] - m_new).exp();
+                            l += p;
+                            let vj = &v[(j * nkv + h_kv) * d..(j * nkv + h_kv) * d + d];
+                            axpy(&mut acc, p, vj);
+                        }
+                        m = m_new;
+                        j0 = j1;
+                    }
+
+                    let inv_l = 1.0 / l;
+                    let o = &mut out_c[(ri * nq + h_q) * d..(ri * nq + h_q) * d + d];
+                    for dd in 0..d {
+                        o[dd] = acc[dd] * inv_l;
+                    }
+                    lse_c[ri * nq + h_q] = m + l.ln();
                 }
-                lse[i * nq + h_q] = m + l.ln();
             }
+        };
+
+        if t < Self::PARALLEL_THRESHOLD {
+            run_range(0, t, out, &mut lse);
+        } else {
+            use rayon::prelude::*;
+            let n_chunks = rayon::current_num_threads().max(1).min(t);
+            let chunk_len = t.div_ceil(n_chunks);
+            out.par_chunks_mut(chunk_len * nq * d)
+                .zip(lse.par_chunks_mut(chunk_len * nq))
+                .enumerate()
+                .for_each(|(c, (out_c, lse_c))| {
+                    let t0 = c * chunk_len;
+                    let t1 = (t0 + chunk_len).min(t);
+                    run_range(t0, t1, out_c, lse_c);
+                });
         }
         lse
     }
@@ -217,6 +248,46 @@ impl FlashAttention {
         assert_eq!(dk.len(), k.len(), "dk shape mismatch");
         assert_eq!(dv.len(), v.len(), "dv shape mismatch");
 
+        // dq[i] depends only on row i (independent per row); dk/dv accumulate
+        // contributions from every row i >= j that attends to key j, so a
+        // parallel split over rows needs per-chunk local dk/dv accumulators
+        // merged afterward (same pattern as the Monarch two-phase backward's
+        // token-chunked accumulation — see monarch.rs).
+        let run_range = |t0: usize, t1: usize, dq_c: &mut [f32], dk_acc: &mut [f32], dv_acc: &mut [f32]| {
+            for i in t0..t1 {
+                let ri = i - t0;
+                for h_q in 0..nq {
+                    let h_kv = self.kv_head_of(h_q);
+                    let qoff = (i * nq + h_q) * d;
+                    let qi = &q[qoff..qoff + d];
+                    let oi = &out[qoff..qoff + d];
+                    let doi = &d_out[qoff..qoff + d];
+                    let lse_i = lse[i * nq + h_q];
+
+                    // delta D_i = dot(dO_i, O_i)
+                    let delta = dot(doi, oi);
+
+                    for j in 0..=i {
+                        let kvoff = (j * nkv + h_kv) * d;
+                        let kj = &k[kvoff..kvoff + d];
+                        let vj = &v[kvoff..kvoff + d];
+
+                        let s = self.scale * dot(qi, kj);
+                        let p = (s - lse_i).exp();
+                        let dp = dot(doi, vj);
+                        let ds = p * (dp - delta);
+
+                        let dkj = &mut dk_acc[kvoff..kvoff + d];
+                        axpy(dkj, self.scale * ds, qi);
+                        let dvj = &mut dv_acc[kvoff..kvoff + d];
+                        axpy(dvj, p, doi);
+                        let dqi = &mut dq_c[(ri * nq + h_q) * d..(ri * nq + h_q) * d + d];
+                        axpy(dqi, self.scale * ds, kj);
+                    }
+                }
+            }
+        };
+
         for x in dq.iter_mut() {
             *x = 0.0;
         }
@@ -227,34 +298,30 @@ impl FlashAttention {
             *x = 0.0;
         }
 
-        for h_q in 0..nq {
-            let h_kv = self.kv_head_of(h_q);
-            for i in 0..t {
-                let qoff = (i * nq + h_q) * d;
-                let qi = &q[qoff..qoff + d];
-                let oi = &out[qoff..qoff + d];
-                let doi = &d_out[qoff..qoff + d];
-                let lse_i = lse[i * nq + h_q];
-
-                // delta D_i = dot(dO_i, O_i)
-                let delta = dot(doi, oi);
-
-                for j in 0..=i {
-                    let kvoff = (j * nkv + h_kv) * d;
-                    let kj = &k[kvoff..kvoff + d];
-                    let vj = &v[kvoff..kvoff + d];
-
-                    let s = self.scale * dot(qi, kj);
-                    let p = (s - lse_i).exp();
-                    let dp = dot(doi, vj);
-                    let ds = p * (dp - delta);
-
-                    let dkj = &mut dk[kvoff..kvoff + d];
-                    axpy(dkj, self.scale * ds, qi);
-                    let dvj = &mut dv[kvoff..kvoff + d];
-                    axpy(dvj, p, doi);
-                    let dqi = &mut dq[qoff..qoff + d];
-                    axpy(dqi, self.scale * ds, kj);
+        if t < Self::PARALLEL_THRESHOLD {
+            run_range(0, t, dq, dk, dv);
+        } else {
+            use rayon::prelude::*;
+            let n_chunks = rayon::current_num_threads().max(1).min(t);
+            let chunk_len = t.div_ceil(n_chunks);
+            let results: Vec<(Vec<f32>, Vec<f32>)> = dq
+                .par_chunks_mut(chunk_len * nq * d)
+                .enumerate()
+                .map(|(c, dq_c)| {
+                    let t0 = c * chunk_len;
+                    let t1 = (t0 + chunk_len).min(t);
+                    let mut dk_local = vec![0.0f32; dk.len()];
+                    let mut dv_local = vec![0.0f32; dv.len()];
+                    run_range(t0, t1, dq_c, &mut dk_local, &mut dv_local);
+                    (dk_local, dv_local)
+                })
+                .collect();
+            for (dk_local, dv_local) in results {
+                for i in 0..dk.len() {
+                    dk[i] += dk_local[i];
+                }
+                for i in 0..dv.len() {
+                    dv[i] += dv_local[i];
                 }
             }
         }
@@ -458,6 +525,71 @@ mod tests {
         for &i in &[0usize, 5, 11, 19, 31] {
             assert!(close(central(&k, i, 1), dk[i]), "dk[{i}]: fd vs an {}", dk[i]);
             assert!(close(central(&v, i, 2), dv[i]), "dv[{i}]: fd vs an {}", dv[i]);
+        }
+    }
+
+    /// `t` here (16) exceeds `PARALLEL_THRESHOLD` (8), exercising the
+    /// row-chunked rayon path in `forward` — checked against the same
+    /// untouched `naive()` reference the sequential path is checked against.
+    #[test]
+    fn forward_parallel_matches_naive_softmax() {
+        let fa = FlashAttention::new(4, 2, 4, 2);
+        let (t, nq, nkv, d) = (16, 4, 2, 4);
+        let mut rng = Lcg(0x7A11_9001);
+        let q = rand_buf(&mut rng, t * nq * d);
+        let k = rand_buf(&mut rng, t * nkv * d);
+        let v = rand_buf(&mut rng, t * nkv * d);
+
+        let mut out = vec![0.0f32; q.len()];
+        fa.forward(&q, &k, &v, &mut out);
+        let ref_out = naive(&fa, &q, &k, &v);
+        for i in 0..out.len() {
+            assert!((out[i] - ref_out[i]).abs() < 1e-5, "out[{i}] {} vs {}", out[i], ref_out[i]);
+        }
+    }
+
+    /// `backward`'s row-chunked dk/dv-merge path (`t=16 >= PARALLEL_THRESHOLD`)
+    /// is exercised regardless of thread count (chunk count = `min(threads, t)`),
+    /// so a single-chunk run (forced via a 1-thread pool) and a many-chunk run
+    /// (forced via an 8-thread pool) both take the parallel branch but split
+    /// the accumulation differently — comparing them directly isolates whether
+    /// the chunking/merge logic is correct, without depending on finite-
+    /// difference precision at this scale (found, separately, to be too tight
+    /// for FD gradchecks at t=16 even on the untouched pre-parallel code —
+    /// a pre-existing FD-tolerance limitation, not a parallelization bug).
+    #[test]
+    fn backward_parallel_chunking_matches_single_chunk() {
+        let fa = FlashAttention::new(4, 2, 4, 2);
+        let (t, nq, nkv, d) = (16, 4, 2, 4);
+        let mut rng = Lcg(0x7A11_9002);
+        let q = rand_buf(&mut rng, t * nq * d);
+        let k = rand_buf(&mut rng, t * nkv * d);
+        let v = rand_buf(&mut rng, t * nkv * d);
+        let r = rand_buf(&mut rng, t * nq * d);
+
+        let mut out = vec![0.0f32; q.len()];
+        let lse = fa.forward(&q, &k, &v, &mut out);
+
+        let run = |n_threads: usize| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
+            pool.install(|| {
+                let mut dq = vec![0.0f32; q.len()];
+                let mut dk = vec![0.0f32; k.len()];
+                let mut dv = vec![0.0f32; v.len()];
+                fa.backward(&q, &k, &v, &out, &lse, &r, &mut dq, &mut dk, &mut dv);
+                (dq, dk, dv)
+            })
+        };
+
+        let (dq1, dk1, dv1) = run(1); // single chunk (chunk_len == t)
+        let (dq8, dk8, dv8) = run(8); // 8 chunks of 2 rows each
+
+        for i in 0..dq1.len() {
+            assert!((dq1[i] - dq8[i]).abs() < 1e-4, "dq[{i}]: 1-chunk {} vs 8-chunk {}", dq1[i], dq8[i]);
+        }
+        for i in 0..dk1.len() {
+            assert!((dk1[i] - dk8[i]).abs() < 1e-4, "dk[{i}]: 1-chunk {} vs 8-chunk {}", dk1[i], dk8[i]);
+            assert!((dv1[i] - dv8[i]).abs() < 1e-4, "dv[{i}]: 1-chunk {} vs 8-chunk {}", dv1[i], dv8[i]);
         }
     }
 }
