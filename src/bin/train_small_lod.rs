@@ -128,8 +128,15 @@ fn main() {
     eprintln!("train/val split: {} / {} tokens", train_r.len(), val_r.len());
 
     // RESUME=0 forces a fresh run even if a checkpoint exists (default: resume).
-    // A CKPT_TAG'd run always starts fresh (see the CKPT_TAG comment above).
-    let resume = ckpt_tag.is_empty() && std::env::var("RESUME").ok().as_deref() != Some("0");
+    // A CKPT_TAG'd run defaults to fresh (see the CKPT_TAG comment above), but
+    // RESUME=1 explicitly opts a tagged run back into resuming -- needed to
+    // test the resume path itself without touching the real checkpoint.
+    let resume_env = std::env::var("RESUME").ok();
+    let resume = if ckpt_tag.is_empty() {
+        resume_env.as_deref() != Some("0")
+    } else {
+        resume_env.as_deref() == Some("1")
+    };
     let (mut model, mut opt, start_step) = if resume && ckpt_path.exists() {
         let (m, opt_state) = fydel::train::checkpoint::load(&ckpt_path)
             .expect("failed to load checkpoint for resume (set RESUME=0 to start fresh instead)");
@@ -157,7 +164,8 @@ fn main() {
     eprintln!("training small real-arch model ({} layers, {} full / {} sliding) from step {start_step} to {total_steps} …",
         model.config().n_layers, model.config().full_attn_layers,
         model.config().n_layers - model.config().full_attn_layers);
-    let hist = train(&mut model, &mut opt, &mut train_r, &train_cfg, Some((500, &ckpt_path)), 5, start_step);
+    let ckpt_every: usize = std::env::var("CKPT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+    let hist = train(&mut model, &mut opt, &mut train_r, &train_cfg, Some((ckpt_every, &ckpt_path)), 5, start_step);
 
     if let Some(last) = hist.last() {
         eprintln!("done: final ce {:.4} at step {}", last.ce, last.step);
