@@ -40,13 +40,10 @@ use crate::model::layer::{LayerCheckpoint, LayerForward, LayerGrads, LayerOptSta
 /// [`crate::model::layer::LayerCheckpoint`] (a *weight* snapshot for disk
 /// save/load — an unrelated, pre-existing concept with a similar name).
 pub struct LayerReplayState {
-    /// This layer's forward input (previous layer's `out`, or the embedding
-    /// lookup for layer 0) — enough for `backward` to recompute the full
+    /// This layer's output — also serves as the *next* layer's forward
+    /// input (or, for layer 0, the caller uses the embedding lookup
+    /// directly instead) — enough for `backward` to recompute the full
     /// `LayerForward` on demand.
-    pub input: Vec<f32>,
-    /// This layer's output (`= layer_replay[l+1].input`, kept redundantly
-    /// for clarity/convenience — negligible cost next to the caches this
-    /// replaces).
     pub out: Vec<f32>,
     /// Per-token early-exit probability, length `T`.
     pub probe_p: Vec<f32>,
@@ -298,16 +295,15 @@ impl Model {
         // Activation checkpointing (see module doc): each `lf` here is a full,
         // expensive LayerForward, but only used transiently to seed the next
         // layer's input and extract a few cheap fields -- `backward`
-        // recomputes it fresh from `layer_replay[l].input` when it actually
-        // needs the rest. Pool-sourced buffers this `lf` holds are given back
-        // immediately (`discard_into_pool`) since nothing else will.
+        // recomputes it fresh from the previous layer's saved `out` (or the
+        // embedding lookup, for layer 0) when it actually needs the rest.
+        // Pool-sourced buffers this `lf` holds are given back immediately
+        // (`discard_into_pool`) since nothing else will.
         let mut layer_replay = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            let input = x.clone();
             let lf = layer.forward(&self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2, &self.rope, &x, t, pool);
             x = lf.out.clone();
             layer_replay.push(LayerReplayState {
-                input,
                 out: lf.out.clone(),
                 probe_p: lf.probe_p.clone(),
                 ffn_selected: lf.ffn_fwds.selected.clone(),
@@ -487,7 +483,7 @@ impl Model {
                 &self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2,
                 &self.rope, input, t, pool,
             );
-            let lg = self.layers[l].backward(
+            let mut lg = self.layers[l].backward(
                 &self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2,
                 &self.rope, input, this_fwd, &d_x, lpp, t, pool,
             );
@@ -505,7 +501,12 @@ impl Model {
                 for (a, b) in d_ffn_mono_d1.iter_mut().zip(&lg.d_ffn_mono_d1) { *a += *b; }
                 for (a, b) in d_ffn_mono_d2.iter_mut().zip(&lg.d_ffn_mono_d2) { *a += *b; }
             }
-            d_x = lg.d_hidden.clone();
+            // `d_hidden` is never read again once this layer's LayerGrads is
+            // returned (LayerGrads::add/scale deliberately skip it -- it's a
+            // per-token activation gradient, not a parameter gradient), so
+            // take it (move, not clone) rather than retaining a redundant
+            // copy inside layer_grads_rev until the whole ModelGrads drops.
+            d_x = std::mem::take(&mut lg.d_hidden);
             layer_grads_rev.push(lg);
         }
         layer_grads_rev.reverse();
