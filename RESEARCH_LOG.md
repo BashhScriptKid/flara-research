@@ -3048,3 +3048,49 @@ parallel over query rows per Opus); register-block the attention
 score/`dv` dot products; evaluate the frozen-dictionary experiment for
 training-quality impact (2x additional backward speedup measured, not yet
 adopted — separate training decision from this performance thread).
+
+### Fable second opinion: "is there anything left?"
+
+Asked Fable to independently re-verify (not just trust the summary) and
+specifically hunt for siblings of the `gemm::dot` inlining fix that Opus's
+audit might have missed. Fable re-derived everything from the current
+code (confirmed `#[inline]` is really on `dot`, the two-phase backward is
+really what's in `monarch.rs`), then found one real miss:
+
+**`Ffn::select` (`src/kernels/ffn.rs:197-204`) computed router logits with
+a plain scalar `row.iter().zip(h).map(|(w,x)| w*x).sum()`** instead of
+`gemm::dot` — the exact same class of oversight (missing the AVX2+FMA
+path), just at a different call site. 3072 calls/step (256 tokens × 12
+layers) in scalar code fully accounted for `FFN_SELECT`'s measured cost.
+One-line fix, near-zero risk (same function, same shapes, already
+correctness-proven elsewhere in the codebase).
+
+Also flagged, correctly rated as marginal and not applied: `backward_batch`
+(and its rows/cols siblings) re-runs `expand_all_blocks` on the same
+`d1`/`d2`/`a1`/`a2` the forward pass already expanded — redundant
+`~1.7M MACs/layer`, an estimated 1-2% of a step. Fixable by caching `eff`
+in `FwdCache`, but a real memory-vs-compute tradeoff, not a free win — left
+alone.
+
+Fable's tok/s sanity check: a step is ~4-5 GFLOP, so ~1050 tok/s (after
+the fix below) implies ~18-20 GFLOP/s achieved on this AVX2 CPU with a
+~30%-serial attention core — plausible, no hidden order-of-magnitude waste
+found.
+
+**Applied the one confirmed fix:** `Ffn::select` now calls `gemm::dot`
+(`src/kernels/ffn.rs`). 92/92 tests still pass. Measured (same
+`TRAIN_SMALL_LOD=1` harness): `FFN_SELECT` 8.8ms/step → 1.7ms/step; total
+step **238-244ms/step** (down from 264-270ms, ~10% further reduction).
+Wall-clock throughput now **~1050 tok/s** at seq_len=256 (up from ~949).
+Committed as `aae5657`.
+
+**Status, final for this thread:** two independent reviews (Opus, then
+Fable specifically checking Opus's blind spots) agree single-threaded
+optimization in the hot training-step path is now genuinely exhausted at
+this shape — the remaining sub-block breakdown is dominated by FFN (~44%)
+and the still-serial attention core (~30%), exactly the known, explicitly
+deferred levers (attention-core parallelization, register-blocked
+attention dot products), not undiscovered waste. From the original
+420ms/step post-swap regression to **238-244ms/step (~1050 tok/s)** — a
+1.7-1.8x improvement, and comfortably faster than the 306.5ms/step
+pre-swap baseline this entire effort was trying to reach parity with.
