@@ -3498,3 +3498,98 @@ FFN_BWD is genuine, well-parallelized, bandwidth-bound compute on 6
 cores — not waste. No further cheap compute lever was found. This closes
 the compute side the same way the memory review closed the memory side:
 diminishing returns confirmed by measurement, not assumed.
+
+---
+
+## 2026-07-05/06 — `fp16-migration` branch: storage-format experiment, four stages, diminishing returns confirmed
+
+With both compute and memory declared at genuine diminishing returns on
+`master`, opened a new branch (`fp16-migration`) to explore a different
+axis entirely: fp16 storage. Verified upfront (not assumed) that this CPU
+(AVX2, Zen2, no AVX-512FP16/BF16) has **no native fp16 arithmetic units**
+— only `F16C`'s conversion instructions (`VCVTPH2PS`/`VCVTPS2PH`). So
+unlike GPU/TPU mixed-precision training (which gets its win from native
+low-precision tensor-core hardware), fp16 here is a **storage format
+only**: every kernel converts to fp32 immediately before computing and
+back before storing. The benefit is halved memory/bandwidth footprint,
+not faster FMA.
+
+### Stage 1: conversion primitives (`src/kernels/f16_simd.rs`)
+
+`f16_to_f32`/`f32_to_f16` (bulk AVX2+F16C conversion, scalar fallback) and
+`dot_f16`, using the `half` crate (a previously-declared-but-unused
+Cargo dependency). Tests confirm AVX2 conversion matches `half::f16`'s
+own conversion bit-for-bit.
+
+### Stage 2: the tied embedding table (117MB, the highest-bandwidth-impact target)
+
+Converted `Model.embed` to `Vec<half::f16>`. `logits_from_embed`/
+`head_backward`'s embed-reading pass convert each row into a small reused
+fp32 scratch buffer right before the existing FMA loop, which runs
+unchanged — the hot AVX2 math itself was never touched, only the
+conversion at its boundary.
+
+**Caught a real footgun before reporting a win**: the first
+implementation's `apply_grad` (AdaFactor needs fp32 for its update math)
+allocated a *fresh* fp32 scratch buffer every step — touching a new
+~117MB region every call, which raised peak RSS by roughly what fp16
+storage was supposed to save. Confirmed via worktree A/B against the
+pre-fp16 commit (1.99GB before → 2.05GB after, a real *increase*, not a
+decrease). Fixed by giving `Model` a persistent `embed_scratch` field,
+reused every step — this eliminated the repeated allocator churn but
+(learned honestly, not assumed) did *not* reduce peak RSS further, since
+`/usr/bin/time`'s max-RSS is a high-water mark that never decreases once
+a region is touched, transient or persistent.
+
+**Result**: throughput ~5-7% faster (interleaved A/B, twice, consistent).
+Peak memory unchanged net (the embed table's own ~59MB reduction
+canceled by the footgun above).
+
+### Stage 3: Monarch's `zs` activation cache (the single largest buffer this whole arc's optimization work centered on)
+
+Cleaner case than the embed table: `zs` is write-once/read-once per step
+with **no gradient/accumulator counterpart**, so no fp32-master-copy
+footgun risk at all. Critically, `apply_block`/`apply_block_avx2` — the
+hottest kernel in the codebase, called hundreds of thousands of times per
+step at production scale — was **deliberately left untouched**: all fp16
+conversion happens at the caller boundary (the three
+`forward_*_batch`/`backward_*_batch` methods' per-token/per-block loops),
+never inside the dense AVX2 math itself. `BufPool` gained a parallel fp16
+free-list (`take_f16_uninit`/`give_f16`) since fp32 and fp16 buffers of
+the same element count aren't interchangeable.
+
+**Result**: combined with stage 2, throughput ~8-9% faster (two
+interleaved A/B pairs, consistent both times); peak RSS 1.94GB, close to
+the original 1.99GB pre-fp16 baseline — `zs`'s real reduction finally
+showing through, unlike stage 2 alone.
+
+### Stage 4: FFN's `up`/`gate`/`act` (same write-once/read-once shape as `zs`)
+
+Landed for consistency (correctness-neutral, `BufPool` infrastructure
+already existed) but **confirmed diminishing returns**: these buffers are
+~18.9MB/layer combined at production shape — roughly 14x smaller than
+`zs`'s per-projection footprint. Measured: essentially flat versus stage
+3 (~31.4-32.1s vs ~31.5-31.7s), no meaningful further improvement. This
+is the expected, honestly-reported result, not a surprise — the whole
+point of measuring each stage separately (rather than batching all four
+and reporting one combined number) was to find exactly this: which
+specific buffers matter and which don't.
+
+**Correctness throughout**: 106/106 tests pass at every stage, including
+the full gradcheck suite (`backward_batch_matches_summed_looped_backward`,
+`shared_monarch_proj_gradcheck`, `compute_batch_matches_looped_compute_and_backward`,
+and the rest) — all still validated against the *original, untouched*
+fp32 reference implementations, confirming fp16 storage changes memory
+and bandwidth only, not the computed gradients (as expected for a
+storage-format change with fp32 compute throughout).
+
+**Status:** `fp16-migration` branch has captured its real value (~8-9%
+throughput, roughly memory-neutral) via stages 2-3. Stage 4 confirmed the
+remaining untouched candidates (Monarch's `a1`/`a2` coefficients, `d1`/
+`d2` shared dictionaries, attention's `q`/`k`/`v`/`attn_out`) would likely
+show similarly small returns — `d1`/`d2` especially are already tiny and
+cache-resident (nd·b ≈ 8KB), so fp16 there would add conversion overhead
+for no bandwidth benefit at all. Not merged to `master` — remains an
+experimental branch pending a decision on whether an 8-9% throughput
+win is worth the added `half`-crate dependency and fp16-conversion
+surface area across the codebase permanently.
