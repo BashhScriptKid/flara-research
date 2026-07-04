@@ -3159,3 +3159,65 @@ bottleneck. The only performance-adjacent item left on the board is the
 frozen-dictionary experiment — which is a training-quality question, not
 a kernel-speed one, and needs real training runs (not benchmarks) to
 answer honestly.
+
+---
+
+## 2026-07-04 — Frozen-dictionary experiment: the quality side, finally measured
+
+Closed the last open item from the 2026-07-03 frozen-dictionary entry: the
+~2x backward speedup was measured in isolation back then, but never
+evaluated for training quality (freezing the shared atom dictionary
+changes model capacity/expressiveness, not just speed). Wired it into the
+live model to test that honestly.
+
+Added `Model::FREEZE_DICT` (`src/model/model.rs`) — same const-ablation
+pattern as `attn_proj.rs`'s `DENSE_ATTN`. When `true`, `apply_grad` simply
+skips the `af.step(...)` calls for both shared Monarch dictionaries
+(attention and FFN); only the per-block coefficients (`a1`/`a2`) keep
+learning. This deliberately reuses the *existing, unmodified* two-phase
+backward — `dd1`/`dd2` are still computed exactly as before, just
+discarded here — so testing the quality question didn't require touching
+or risking the hot backward kernels at all. (The actual `dd1`/`dd2`-skipping
+kernel from the 2026-07-03 entry, `bwd_block_avx2_hoisted_frozen`, remains
+unwired — it predates the two-phase restructuring and doesn't fit the
+current batched architecture; wiring it in for the real speed win is a
+separate follow-up, only worth doing if the quality result below were more
+favorable.)
+
+Also added two env knobs to `train_small_lod.rs` for a fast, isolated A/B:
+`CKPT_TAG` (routes a run to its own checkpoint file and always starts
+fresh, never resuming from or touching the real `fydel_small_lod.ckpt`)
+and `TOTAL_STEPS` (env-overridable step count, for a shorter run than the
+default 3000).
+
+**Experiment:** two runs, same config/seed, 1200 steps each — one with
+`FREEZE_DICT=false` (baseline), one with `true`.
+
+```
+                held-out CE (nats)   final training-window CE
+baseline               2.0640              1.8113
+frozen                 2.0871              1.8786
+```
+
+Frozen costs **~0.023 nats (~1.1% relative) worse held-out CE** — a real,
+measurable quality cost, not free. Training-CE gap (1.88 vs 1.81) points
+the same direction. Small at this step count/scale, but not nothing, and
+there's no reason to expect it to shrink at longer training — if anything
+a frozen random dictionary caps representable directions permanently,
+so the gap plausibly persists or widens over a full run.
+
+**Decision:** `FREEZE_DICT` stays `false` (off) by default. The
+equal-capacity finding from 2026-07-03 already closed the
+accessibility/speed question (Monarch beats BasisMatmul at every scale,
+backward included) without needing this lever, and freezing the dictionary
+has a real, measured quality cost. `FREEZE_DICT` remains in the codebase
+as a documented, available ablation — not adopted, not recommended as a
+default — for anyone who wants to trade a chunk of that ~1% quality for
+the ~2x backward speedup this specific sub-block later, with eyes open.
+
+**Status:** this closes the full arc from the 2026-07-02/03/04 sessions.
+Every item raised — the post-swap regression, the equal-capacity
+crossover scare, the single-thread audit, attention parallelization, and
+the frozen-dictionary quality question — has been measured (not
+guessed) and resolved. Nothing performance-related remains open on this
+thread.
