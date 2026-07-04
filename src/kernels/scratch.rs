@@ -30,6 +30,11 @@
 #[derive(Default)]
 pub struct BufPool {
     free: Vec<Vec<f32>>,
+    /// Separate free list for fp16-stored buffers (e.g. Monarch's `zs`
+    /// cache, fp16-migration branch RESEARCH_LOG.md 2026-07-05) -- kept
+    /// apart from `free` since an `f32` and an `half::f16` buffer of the
+    /// same element count aren't interchangeable (different byte sizes).
+    free16: Vec<Vec<half::f16>>,
 }
 
 impl BufPool {
@@ -66,6 +71,22 @@ impl BufPool {
     pub fn give(&mut self, buf: Vec<f32>) {
         self.free.push(buf);
     }
+
+    /// fp16 equivalent of `take_uninit` -- write-before-read buffers only
+    /// (no `take_f16_zeroed`: nothing fp16-stored in this codebase is an
+    /// accumulator, per `f16_simd`'s module doc).
+    pub fn take_f16_uninit(&mut self, len: usize) -> Vec<half::f16> {
+        if let Some(pos) = self.free16.iter().position(|b| b.len() == len) {
+            self.free16.swap_remove(pos)
+        } else {
+            vec![half::f16::from_f32(0.0); len]
+        }
+    }
+
+    /// fp16 equivalent of `give`.
+    pub fn give_f16(&mut self, buf: Vec<half::f16>) {
+        self.free16.push(buf);
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +122,16 @@ mod tests {
         let buf = pool.take_zeroed(16); // no 16-length buffer in the pool
         assert_eq!(buf.len(), 16);
         assert!(buf.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn f16_take_after_give_reuses_the_same_allocation() {
+        let mut pool = BufPool::new();
+        let buf = pool.take_f16_uninit(1024);
+        let ptr_before = buf.as_ptr();
+        pool.give_f16(buf);
+        let buf2 = pool.take_f16_uninit(1024);
+        assert_eq!(buf2.as_ptr(), ptr_before, "expected the exact same allocation back");
+        assert_eq!(buf2.len(), 1024);
     }
 }

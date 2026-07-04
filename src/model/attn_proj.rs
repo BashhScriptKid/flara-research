@@ -176,7 +176,7 @@ impl AttnProj {
 
     /// Slice a single token's cache slice out of a batched `forward_batch`
     /// cache (no-op / empty for the dense path).
-    pub fn zs_at<'a>(&self, cache: &'a FwdCache, token: usize) -> &'a [f32] {
+    pub fn zs_at<'a>(&self, cache: &'a FwdCache, token: usize) -> &'a [half::f16] {
         match &self.kind {
             ProjKind::Monarch { proj } => proj.zs_at(cache, token),
             ProjKind::Dense { .. } => &[],
@@ -185,7 +185,7 @@ impl AttnProj {
 
     /// VJP. `dy` is the gradient w.r.t. the projection output; `zs` is this
     /// token's cache slice from `forward_batch` (ignored by the dense path).
-    pub fn backward(&self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dy: &[f32]) -> ProjGrads {
+    pub fn backward(&self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[half::f16], dy: &[f32]) -> ProjGrads {
         debug_assert_eq!(x.len(), self.in_, "projection input shape mismatch");
         debug_assert_eq!(dy.len(), self.out, "projection grad-output shape mismatch");
         match &self.kind {

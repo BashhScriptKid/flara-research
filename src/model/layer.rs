@@ -101,10 +101,10 @@ impl LayerForward {
     /// initial forward pass (see `Model::forward`) only needs a handful of
     /// cheap fields out of this, not the full cache.
     pub fn discard_into_pool(self, pool: &mut crate::kernels::scratch::BufPool) {
-        pool.give(self.wq_fc.zs);
-        pool.give(self.wk_fc.zs);
-        pool.give(self.wv_fc.zs);
-        pool.give(self.wo_fc.zs);
+        pool.give_f16(self.wq_fc.zs);
+        pool.give_f16(self.wk_fc.zs);
+        pool.give_f16(self.wv_fc.zs);
+        pool.give_f16(self.wo_fc.zs);
         self.ffn_fwds.discard_into_pool(pool);
     }
 }

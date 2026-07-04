@@ -188,7 +188,16 @@ pub struct SharedMonarchMatmul {
 }
 
 pub struct FwdCache {
-    pub zs: Vec<f32>,
+    /// Stored fp16 (fp16-migration branch, RESEARCH_LOG.md 2026-07-05): this
+    /// is the single largest buffer `BufPool` manages, written once per
+    /// token per block in forward and read back once per token per block in
+    /// backward's phase1 -- a real, contained bandwidth/memory win, unlike
+    /// the tied embedding table (no accumulator/gradient counterpart needs a
+    /// persistent fp32 "master copy" here). The hot `apply_block`/
+    /// `apply_block_avx2` kernel that PRODUCES this value is deliberately
+    /// left untouched (fp32 throughout) -- conversion happens once at the
+    /// caller boundary, right after that kernel returns, not inside it.
+    pub zs: Vec<half::f16>,
 }
 
 pub struct Grads {
@@ -325,6 +334,7 @@ impl SharedMonarchMatmul {
                 );
             }
         });
+        let zs = { let mut z16 = vec![half::f16::from_f32(0.0); zs.len()]; crate::kernels::f16_simd::f32_to_f16(&zs, &mut z16); z16 };
         (y, FwdCache { zs })
     }
 
@@ -348,6 +358,7 @@ impl SharedMonarchMatmul {
                 );
             }
         }
+        let zs = { let mut z16 = vec![half::f16::from_f32(0.0); zs.len()]; crate::kernels::f16_simd::f32_to_f16(&zs, &mut z16); z16 };
         (y, FwdCache { zs })
     }
 
@@ -534,20 +545,28 @@ impl SharedMonarchMatmul {
                 );
             }
         });
+        let zs = { let mut z16 = vec![half::f16::from_f32(0.0); zs.len()]; crate::kernels::f16_simd::f32_to_f16(&zs, &mut z16); z16 };
         (y, FwdCache { zs })
     }
 
     /// Slice a single token's `zs` out of a batched `forward_batch` cache
     /// (or pass `token = 0` for a single-token `forward` cache).
     #[inline]
-    pub fn zs_at<'a>(&self, cache: &'a FwdCache, token: usize) -> &'a [f32] {
+    pub fn zs_at<'a>(&self, cache: &'a FwdCache, token: usize) -> &'a [half::f16] {
         let per_token = self.p * self.q * self.m * self.m;
         &cache.zs[token * per_token..(token + 1) * per_token]
     }
 
-    pub fn backward(&self, x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32]) -> Grads {
+    pub fn backward(&self, x: &[f32], zs: &[half::f16], dout: &[f32], dx: &mut [f32]) -> Grads {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
+        // Not the hot path (used by tests/research bins only -- production
+        // goes through backward_batch/rows/cols_batch's per-block-boundary
+        // conversion); one bulk convert here is simplest and correctness-
+        // equivalent.
+        let mut zs_f32 = vec![0.0f32; zs.len()];
+        crate::kernels::f16_simd::f16_to_f32(zs, &mut zs_f32);
+        let zs = &zs_f32[..];
         let mut g = Grads {
             dd1: vec![0.0f32; nd * b],
             dd2: vec![0.0f32; nd * b],
@@ -754,6 +773,7 @@ impl SharedMonarchProj {
                 );
             }
         });
+        let zs = { let mut z16 = vec![half::f16::from_f32(0.0); zs.len()]; crate::kernels::f16_simd::f32_to_f16(&zs, &mut z16); z16 };
         (y, FwdCache { zs })
     }
 
@@ -777,6 +797,7 @@ impl SharedMonarchProj {
                 );
             }
         }
+        let zs = { let mut z16 = vec![half::f16::from_f32(0.0); zs.len()]; crate::kernels::f16_simd::f32_to_f16(&zs, &mut z16); z16 };
         (y, FwdCache { zs })
     }
 
@@ -824,21 +845,23 @@ impl SharedMonarchProj {
         // assigned exactly once across the pp/qq loop), so `take_uninit`
         // skips a wasted zero-fill pass on top of skipping the allocation.
         let mut y   = pool.take_zeroed(n_tokens * p * b);
-        let mut zs  = pool.take_uninit(n_tokens * p * q * b);
+        let mut zs  = pool.take_f16_uninit(n_tokens * p * q * b);
 
-        let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [f32]| {
+        let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [half::f16]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
             let mut y1 = vec![0.0f32; b];
+            let mut z_f32 = vec![0.0f32; b];
             for pp in 0..p {
                 let ypp = &mut y_t[pp * b..(pp + 1) * b];
                 for qq in 0..q {
                     let idx = pp * q + qq;
-                    let z = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     SharedMonarchMatmul::apply_block(
                         &eff1_all[idx * m * b..(idx + 1) * m * b],
                         &eff2_all[idx * m * b..(idx + 1) * m * b],
-                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, z, ypp,
+                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
                     );
+                    let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                    crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
                 }
             }
         };
@@ -889,6 +912,7 @@ impl SharedMonarchProj {
         // Phase 1: accumulate s1/s2 (p*q*m*b each) and dx for tokens t0..t1
         // — shared by both the sequential and rayon-chunked callers below.
         let run_range = |t0: usize, t1: usize, s1: &mut [f32], s2: &mut [f32], dx_out: &mut [f32]| {
+            let mut z_f32 = vec![0.0f32; b];
             for t in t0..t1 {
                 for pp in 0..p {
                     let dout_pp = &dout[t * out_dim + pp * b..t * out_dim + (pp + 1) * b];
@@ -897,11 +921,12 @@ impl SharedMonarchProj {
                         let eff1 = &eff1_all[idx * m * b..(idx + 1) * m * b];
                         let eff2 = &eff2_all[idx * m * b..(idx + 1) * m * b];
                         let x_blk = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
-                        let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        let z16 = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        crate::kernels::f16_simd::f16_to_f32(z16, &mut z_f32);
                         let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
                         let s1_blk = &mut s1[idx * m * b..(idx + 1) * m * b];
                         let s2_blk = &mut s2[idx * m * b..(idx + 1) * m * b];
-                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, z, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
                     }
                 }
             }
@@ -913,7 +938,7 @@ impl SharedMonarchProj {
             let mut dx_full = vec![0.0f32; n_tokens * in_dim];
             run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
             dx.copy_from_slice(&dx_full);
-            pool.give(zs);
+            pool.give_f16(zs);
             return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
         }
 
@@ -937,23 +962,26 @@ impl SharedMonarchProj {
             for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
-        pool.give(zs);
+        pool.give_f16(zs);
         SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
     }
 
     /// Slice a single token's `zs` out of a batched `forward_batch` cache (or
     /// pass `token = 0` for a single-token `forward` cache).
     #[inline]
-    pub fn zs_at<'a>(&self, cache: &'a FwdCache, token: usize) -> &'a [f32] {
+    pub fn zs_at<'a>(&self, cache: &'a FwdCache, token: usize) -> &'a [half::f16] {
         let per_token = self.p * self.q * self.m * self.m;
         &cache.zs[token * per_token..(token + 1) * per_token]
     }
 
     pub fn backward(
-        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32],
+        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[half::f16], dout: &[f32], dx: &mut [f32],
     ) -> Grads {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
+        let mut zs_f32 = vec![0.0f32; zs.len()];
+        crate::kernels::f16_simd::f16_to_f32(zs, &mut zs_f32);
+        let zs = &zs_f32[..];
         let mut g = Grads {
             dd1: vec![0.0f32; nd * b],
             dd2: vec![0.0f32; nd * b],
@@ -1077,6 +1105,7 @@ impl SharedMonarchProj {
                 );
             }
         }
+        let zs = { let mut z16 = vec![half::f16::from_f32(0.0); zs.len()]; crate::kernels::f16_simd::f32_to_f16(&zs, &mut z16); z16 };
         (y, FwdCache { zs })
     }
 
@@ -1104,6 +1133,7 @@ impl SharedMonarchProj {
                 );
             }
         }
+        let zs = { let mut z16 = vec![half::f16::from_f32(0.0); zs.len()]; crate::kernels::f16_simd::f32_to_f16(&zs, &mut z16); z16 };
         (y, FwdCache { zs })
     }
 
@@ -1111,11 +1141,14 @@ impl SharedMonarchProj {
     /// output blocks were produced, so only they contribute gradient; `dx`
     /// still spans the full input (every `qq` fed every active `pp`).
     pub fn backward_rows(
-        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32],
+        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[half::f16], dout: &[f32], dx: &mut [f32],
         active_p: &[usize],
     ) -> Grads {
         let (q, m, nd) = (self.q, self.m, self.nd);
         let b = m * m;
+        let mut zs_f32 = vec![0.0f32; zs.len()];
+        crate::kernels::f16_simd::f16_to_f32(zs, &mut zs_f32);
+        let zs = &zs_f32[..];
         let mut g = Grads {
             dd1: vec![0.0f32; nd * b],
             dd2: vec![0.0f32; nd * b],
@@ -1144,11 +1177,14 @@ impl SharedMonarchProj {
     /// receives gradient, but only `active_q` input blocks fed the forward, so
     /// only they get nonzero coefficient/dict/`dx` gradient.
     pub fn backward_cols(
-        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32],
+        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[half::f16], dout: &[f32], dx: &mut [f32],
         active_q: &[usize],
     ) -> Grads {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
+        let mut zs_f32 = vec![0.0f32; zs.len()];
+        crate::kernels::f16_simd::f16_to_f32(zs, &mut zs_f32);
+        let zs = &zs_f32[..];
         let mut g = Grads {
             dd1: vec![0.0f32; nd * b],
             dd2: vec![0.0f32; nd * b],
@@ -1192,21 +1228,23 @@ impl SharedMonarchProj {
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
         let mut y  = pool.take_zeroed(n_tokens * p * b);
-        let mut zs = pool.take_uninit(n_tokens * p * q * b);
+        let mut zs = pool.take_f16_uninit(n_tokens * p * q * b);
 
-        let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [f32]| {
+        let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [half::f16]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
             let mut y1 = vec![0.0f32; b];
+            let mut z_f32 = vec![0.0f32; b];
             for &pp in &active_p[t] {
                 debug_assert!(pp < p, "active row-block {pp} out of range");
                 let ypp = &mut y_t[pp * b..(pp + 1) * b];
                 for qq in 0..q {
                     let idx = pp * q + qq;
-                    let z = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     SharedMonarchMatmul::apply_block(
                         &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, z, ypp,
+                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
                     );
+                    let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                    crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
                 }
             }
         };
@@ -1237,21 +1275,23 @@ impl SharedMonarchProj {
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
         let mut y  = pool.take_zeroed(n_tokens * p * b);
-        let mut zs = pool.take_uninit(n_tokens * p * q * b);
+        let mut zs = pool.take_f16_uninit(n_tokens * p * q * b);
 
-        let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [f32]| {
+        let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [half::f16]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
             let mut y1 = vec![0.0f32; b];
+            let mut z_f32 = vec![0.0f32; b];
             for pp in 0..p {
                 let ypp = &mut y_t[pp * b..(pp + 1) * b];
                 for &qq in &active_q[t] {
                     debug_assert!(qq < q, "active col-block {qq} out of range");
                     let idx = pp * q + qq;
-                    let z = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     SharedMonarchMatmul::apply_block(
                         &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, z, ypp,
+                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
                     );
+                    let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                    crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
                 }
             }
         };
@@ -1288,6 +1328,7 @@ impl SharedMonarchProj {
         let FwdCache { zs } = cache;
 
         let run_range = |t0: usize, t1: usize, s1: &mut [f32], s2: &mut [f32], dx_out: &mut [f32]| {
+            let mut z_f32 = vec![0.0f32; b];
             for t in t0..t1 {
                 let dout_t = &dout[t * out_dim..(t + 1) * out_dim];
                 for &pp in &active_p[t] {
@@ -1298,11 +1339,12 @@ impl SharedMonarchProj {
                         let eff1 = &eff1_all[idx * m * b..(idx + 1) * m * b];
                         let eff2 = &eff2_all[idx * m * b..(idx + 1) * m * b];
                         let x_blk = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
-                        let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        let z16 = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        crate::kernels::f16_simd::f16_to_f32(z16, &mut z_f32);
                         let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
                         let s1_blk = &mut s1[idx * m * b..(idx + 1) * m * b];
                         let s2_blk = &mut s2[idx * m * b..(idx + 1) * m * b];
-                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, z, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
                     }
                 }
             }
@@ -1314,7 +1356,7 @@ impl SharedMonarchProj {
             let mut dx_full = vec![0.0f32; n_tokens * in_dim];
             run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
             dx.copy_from_slice(&dx_full);
-            pool.give(zs);
+            pool.give_f16(zs);
             return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
         }
 
@@ -1338,7 +1380,7 @@ impl SharedMonarchProj {
             for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
-        pool.give(zs);
+        pool.give_f16(zs);
         SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
     }
 
@@ -1359,6 +1401,7 @@ impl SharedMonarchProj {
         let FwdCache { zs } = cache;
 
         let run_range = |t0: usize, t1: usize, s1: &mut [f32], s2: &mut [f32], dx_out: &mut [f32]| {
+            let mut z_f32 = vec![0.0f32; b];
             for t in t0..t1 {
                 let dout_t = &dout[t * out_dim..(t + 1) * out_dim];
                 for pp in 0..p {
@@ -1369,11 +1412,12 @@ impl SharedMonarchProj {
                         let eff1 = &eff1_all[idx * m * b..(idx + 1) * m * b];
                         let eff2 = &eff2_all[idx * m * b..(idx + 1) * m * b];
                         let x_blk = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
-                        let z = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        let z16 = &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b];
+                        crate::kernels::f16_simd::f16_to_f32(z16, &mut z_f32);
                         let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
                         let s1_blk = &mut s1[idx * m * b..(idx + 1) * m * b];
                         let s2_blk = &mut s2[idx * m * b..(idx + 1) * m * b];
-                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, z, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
                     }
                 }
             }
@@ -1385,7 +1429,7 @@ impl SharedMonarchProj {
             let mut dx_full = vec![0.0f32; n_tokens * in_dim];
             run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
             dx.copy_from_slice(&dx_full);
-            pool.give(zs);
+            pool.give_f16(zs);
             return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
         }
 
@@ -1409,7 +1453,7 @@ impl SharedMonarchProj {
             for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
-        pool.give(zs);
+        pool.give_f16(zs);
         SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
     }
 
@@ -2179,8 +2223,8 @@ mod tests {
             let zs_batch_t = mm.zs_at(&cache_batch, t);
             assert_eq!(zs_batch_t.len(), cache_t.zs.len());
             for i in 0..zs_batch_t.len() {
-                assert!((zs_batch_t[i] - cache_t.zs[i]).abs() < 1e-6,
-                    "token {t} zs idx {i}: batch={} looped={}", zs_batch_t[i], cache_t.zs[i]);
+                let (a, b) = (zs_batch_t[i].to_f32(), cache_t.zs[i].to_f32());
+                assert!((a - b).abs() < 1e-6, "token {t} zs idx {i}: batch={a} looped={b}");
             }
         }
     }

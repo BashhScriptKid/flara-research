@@ -100,9 +100,9 @@ impl FfnForwardBatch {
         pool.give(self.up);
         pool.give(self.gate);
         pool.give(self.act);
-        pool.give(self.up_cache.zs);
-        pool.give(self.gate_cache.zs);
-        pool.give(self.down_cache.zs);
+        pool.give_f16(self.up_cache.zs);
+        pool.give_f16(self.gate_cache.zs);
+        pool.give_f16(self.down_cache.zs);
     }
 }
 
