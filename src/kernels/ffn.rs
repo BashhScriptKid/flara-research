@@ -78,9 +78,13 @@ pub struct FfnForward {
 /// `backward_batch` needs.
 pub struct FfnForwardBatch {
     pub out: Vec<f32>,
-    up: Vec<f32>,
-    gate: Vec<f32>,
-    act: Vec<f32>,
+    /// Stored fp16 (fp16-migration branch, RESEARCH_LOG.md 2026-07-05):
+    /// write-once-per-step (in `compute_batch`), read-once-per-step (in
+    /// `backward_batch`) -- same shape as Monarch's `zs` cache, no
+    /// gradient/accumulator counterpart needing an fp32 master copy.
+    up: Vec<half::f16>,
+    gate: Vec<half::f16>,
+    act: Vec<half::f16>,
     up_cache: FwdCache,
     gate_cache: FwdCache,
     down_cache: FwdCache,
@@ -97,9 +101,9 @@ impl FfnForwardBatch {
     /// otherwise be the one to give them back) -- e.g. activation
     /// checkpointing's throwaway initial forward pass (see `Model::forward`).
     pub fn discard_into_pool(self, pool: &mut crate::kernels::scratch::BufPool) {
-        pool.give(self.up);
-        pool.give(self.gate);
-        pool.give(self.act);
+        pool.give_f16(self.up);
+        pool.give_f16(self.gate);
+        pool.give_f16(self.act);
         pool.give_f16(self.up_cache.zs);
         pool.give_f16(self.gate_cache.zs);
         pool.give_f16(self.down_cache.zs);
@@ -299,8 +303,22 @@ impl Ffn {
 
         let (out, down_cache) = self.down_proj.forward_cols_batch(mono_d1, mono_d2, &act, &active_p, t_len, pool);
 
+        // up/gate/act are needed as fp32 above (the routing loop and the
+        // forward_cols_batch call); convert to fp16 for storage now that
+        // they're done being computed, giving the fp32 originals back to
+        // the pool (same "convert once at the boundary" pattern as zs).
+        let mut up16 = pool.take_f16_uninit(up.len());
+        crate::kernels::f16_simd::f32_to_f16(&up, &mut up16);
+        pool.give(up);
+        let mut gate16 = pool.take_f16_uninit(gate.len());
+        crate::kernels::f16_simd::f32_to_f16(&gate, &mut gate16);
+        pool.give(gate);
+        let mut act16 = pool.take_f16_uninit(act.len());
+        crate::kernels::f16_simd::f32_to_f16(&act, &mut act16);
+        pool.give(act);
+
         FfnForwardBatch {
-            out, up, gate, act, up_cache, gate_cache, down_cache,
+            out, up: up16, gate: gate16, act: act16, up_cache, gate_cache, down_cache,
             selected: sels.iter().map(|s| s.selected.clone()).collect(),
             gates: sels.iter().map(|s| s.gates.clone()).collect(),
         }
@@ -400,13 +418,27 @@ impl Ffn {
         pool: &mut crate::kernels::scratch::BufPool,
     ) -> FfnGradsBatch {
         let (b, f, hh) = (self.cfg.block, self.cfg.ffn, self.cfg.hidden);
-        let FfnForwardBatch { up, gate, act, up_cache, gate_cache, down_cache, selected, gates, .. } = fwd;
+        let FfnForwardBatch { up: up16, gate: gate16, act: act16, up_cache, gate_cache, down_cache, selected, gates, .. } = fwd;
+
+        // Convert each fp16-stored buffer to fp32 once at the boundary,
+        // giving the fp16 original back to its pool immediately (mirrors
+        // compute_batch's fp32 -> fp16 conversion in reverse).
+        let mut act = pool.take_uninit(act16.len());
+        crate::kernels::f16_simd::f16_to_f32(&act16, &mut act);
+        pool.give_f16(act16);
 
         let mut d_act = vec![0.0f32; t_len * f];
         let g_down: MonarchGrads = self.down_proj.backward_cols_batch(
             mono_d1, mono_d2, &act, down_cache, d_out, &mut d_act, &selected, t_len, pool,
         );
         pool.give(act); // not read again below
+
+        let mut up = pool.take_uninit(up16.len());
+        crate::kernels::f16_simd::f16_to_f32(&up16, &mut up);
+        pool.give_f16(up16);
+        let mut gate = pool.take_uninit(gate16.len());
+        crate::kernels::f16_simd::f16_to_f32(&gate16, &mut gate);
+        pool.give_f16(gate16);
 
         let mut d_up = vec![0.0f32; t_len * f];
         let mut d_gate = vec![0.0f32; t_len * f];
