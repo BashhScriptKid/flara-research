@@ -268,7 +268,7 @@ impl Ffn {
         let (up, up_cache) = self.up_proj.forward_rows_batch(mono_d1, mono_d2, h, &active_p, t_len, pool);
         let (gate, gate_cache) = self.gate_proj.forward_rows_batch(mono_d1, mono_d2, h, &active_p, t_len, pool);
 
-        let mut act = vec![0.0f32; t_len * f];
+        let mut act = pool.take_zeroed(t_len * f);
         for t in 0..t_len {
             let sel = &sels[t];
             for (si, &blk) in sel.selected.iter().enumerate() {
@@ -390,6 +390,7 @@ impl Ffn {
         let g_down: MonarchGrads = self.down_proj.backward_cols_batch(
             mono_d1, mono_d2, &act, down_cache, d_out, &mut d_act, &selected, t_len, pool,
         );
+        pool.give(act); // not read again below
 
         let mut d_up = vec![0.0f32; t_len * f];
         let mut d_gate = vec![0.0f32; t_len * f];
@@ -411,6 +412,8 @@ impl Ffn {
                 }
             }
         }
+        pool.give(up);   // not read again below
+        pool.give(gate); // not read again below
 
         let mut d_h = vec![0.0f32; t_len * hh];
         let g_up: MonarchGrads = self.up_proj.backward_rows_batch(
