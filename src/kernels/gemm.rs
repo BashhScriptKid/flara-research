@@ -6,10 +6,39 @@
 //! auto-vectorize because float reduction is not associative; the AVX2 path uses
 //! explicit FMA accumulators (two, to hide latency) and a horizontal sum.
 
+/// Below this many token rows, rayon dispatch overhead isn't worth it — same
+/// rationale/threshold as the attention and Monarch kernels.
+const HEAD_PARALLEL_THRESHOLD: usize = 8;
+
 /// `out[ti*v + vid] = Σ_j normed[ti*h + j] · embed[vid*h + j]`, i.e. `normed · Eᵀ`
 /// where `normed` is `[t, h]` row-major and `embed` is `[v, h]` row-major.
 /// Dispatches to AVX2+FMA when the CPU supports it, else a scalar fallback.
+///
+/// Parallelizes over token rows (`t`) when there are enough of them —
+/// `embed` (`[v, h]`, typically far larger than L2/L3) is swept in full for
+/// every row, so this is memory-bandwidth-bound; splitting the sweep across
+/// cores lets the memory controller service concurrent reads from several
+/// cores instead of one core alone bottlenecking on its own load latency
+/// (measured: this was ~82% of a production-shaped training step, entirely
+/// unparallelized — see RESEARCH_LOG.md 2026-07-04).
 pub fn logits_from_embed(normed: &[f32], embed: &[f32], out: &mut [f32], t: usize, h: usize, v: usize) {
+    if t < HEAD_PARALLEL_THRESHOLD {
+        logits_from_embed_range(normed, embed, out, t, h, v);
+    } else {
+        use rayon::prelude::*;
+        let n_chunks = rayon::current_num_threads().max(1).min(t);
+        let chunk_len = t.div_ceil(n_chunks);
+        normed.par_chunks(chunk_len * h).zip(out.par_chunks_mut(chunk_len * v)).for_each(|(normed_c, out_c)| {
+            let t_c = normed_c.len() / h;
+            logits_from_embed_range(normed_c, embed, out_c, t_c, h, v);
+        });
+    }
+}
+
+/// Same math as `logits_from_embed`, over a caller-chosen contiguous range of
+/// token rows (`normed`/`out` already sliced to that range) — the sequential
+/// per-chunk worker, and also used directly for `t < HEAD_PARALLEL_THRESHOLD`.
+fn logits_from_embed_range(normed: &[f32], embed: &[f32], out: &mut [f32], t: usize, h: usize, v: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -95,6 +124,13 @@ unsafe fn logits_avx2(normed: &[f32], embed: &[f32], out: &mut [f32], t: usize, 
 /// `d_normed[ti] += Σ_vid d_logits[ti,vid]·embed[vid]` and
 /// `d_embed[vid] += Σ_ti d_logits[ti,vid]·normed[ti]`. `d_normed` is overwritten
 /// (caller zero-inits); `d_embed` is accumulated into (tied head + scatter share it).
+/// Both passes sweep the full `embed`/`normed` table for every row they
+/// process (same memory-bandwidth-bound shape as `logits_from_embed`), so
+/// each is parallelized independently over its own natural disjoint-output
+/// axis: pass A over token rows (`d_normed` is `[t, h]`), pass B over vocab
+/// rows (`d_embed` is `[v, h]`) — never over the *other* axis, since that's
+/// exactly where the accumulation happens (`dnf`/`de` sum over the full
+/// inner range) and would need cross-thread merging instead of disjoint writes.
 pub fn head_backward(
     d_logits: &[f32],
     embed: &[f32],
@@ -105,28 +141,44 @@ pub fn head_backward(
     h: usize,
     v: usize,
 ) {
+    if t < HEAD_PARALLEL_THRESHOLD {
+        head_backward_pass_a_range(d_logits, embed, d_normed, t, h, v);
+    } else {
+        use rayon::prelude::*;
+        let n_chunks = rayon::current_num_threads().max(1).min(t);
+        let chunk_len = t.div_ceil(n_chunks);
+        d_logits.par_chunks(chunk_len * v).zip(d_normed.par_chunks_mut(chunk_len * h)).for_each(|(dl_c, dn_c)| {
+            let t_c = dn_c.len() / h;
+            head_backward_pass_a_range(dl_c, embed, dn_c, t_c, h, v);
+        });
+    }
+
+    if v < HEAD_PARALLEL_THRESHOLD {
+        head_backward_pass_b_range(d_logits, normed, d_embed, t, h, v, 0);
+    } else {
+        use rayon::prelude::*;
+        let n_chunks = rayon::current_num_threads().max(1).min(v);
+        let chunk_len = v.div_ceil(n_chunks);
+        d_embed.par_chunks_mut(chunk_len * h).enumerate().for_each(|(c, de_c)| {
+            let vid0 = c * chunk_len;
+            head_backward_pass_b_range(d_logits, normed, de_c, t, h, v, vid0);
+        });
+    }
+}
+
+/// Pass A over a caller-chosen contiguous range of token rows (`d_logits`/
+/// `d_normed` already sliced to that range): `d_normed[ti] = Σ_vid
+/// d_logits[ti,vid] · embed[vid]`; dnf stays L1-resident. `d_normed` is
+/// accumulated into (caller zero-inits before the first call).
+fn head_backward_pass_a_range(d_logits: &[f32], embed: &[f32], d_normed: &mut [f32], t: usize, h: usize, v: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: avx2 + fma confirmed present.
-            unsafe { head_backward_avx2(d_logits, embed, normed, d_normed, d_embed, t, h, v) };
+            unsafe { head_backward_pass_a_avx2(d_logits, embed, d_normed, t, h, v) };
             return;
         }
     }
-    head_backward_scalar(d_logits, embed, normed, d_normed, d_embed, t, h, v);
-}
-
-fn head_backward_scalar(
-    d_logits: &[f32],
-    embed: &[f32],
-    normed: &[f32],
-    d_normed: &mut [f32],
-    d_embed: &mut [f32],
-    t: usize,
-    h: usize,
-    v: usize,
-) {
-    // Pass A: d_normed[ti] = Σ_vid d_logits[ti,vid] · embed[vid]; dnf stays L1-resident.
     for ti in 0..t {
         let dl = &d_logits[ti * v..(ti + 1) * v];
         let dnf = &mut d_normed[ti * h..(ti + 1) * h];
@@ -138,11 +190,29 @@ fn head_backward_scalar(
             }
         }
     }
-    // Pass B: d_embed[vid] += Σ_ti d_logits[ti,vid] · normed[ti]. With vid outermost,
-    // each de row is written once instead of once per token — cutting d_embed write
-    // traffic ~t× (the cache-residency win; this loop was bandwidth-bound when fused).
-    for vid in 0..v {
-        let de = &mut d_embed[vid * h..(vid + 1) * h];
+}
+
+/// Pass B over a caller-chosen contiguous range of vocab rows (`d_embed`
+/// already sliced to that range, starting at absolute vocab index `vid0`):
+/// `d_embed[vid] += Σ_ti d_logits[ti,vid] · normed[ti]`. With vid outermost,
+/// each de row is written once instead of once per token — cutting d_embed
+/// write traffic ~t× (the cache-residency win; this loop was bandwidth-bound
+/// when fused).
+fn head_backward_pass_b_range(
+    d_logits: &[f32], normed: &[f32], d_embed: &mut [f32], t: usize, h: usize, v: usize, vid0: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: avx2 + fma confirmed present.
+            unsafe { head_backward_pass_b_avx2(d_logits, normed, d_embed, t, h, v, vid0) };
+            return;
+        }
+    }
+    let v_c = d_embed.len() / h;
+    for vc in 0..v_c {
+        let vid = vid0 + vc;
+        let de = &mut d_embed[vc * h..(vc + 1) * h];
         for ti in 0..t {
             let dlv = d_logits[ti * v + vid];
             let nf = &normed[ti * h..(ti + 1) * h];
@@ -155,12 +225,10 @@ fn head_backward_scalar(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn head_backward_avx2(
+unsafe fn head_backward_pass_a_avx2(
     d_logits: &[f32],
     embed: &[f32],
-    normed: &[f32],
     d_normed: &mut [f32],
-    d_embed: &mut [f32],
     t: usize,
     h: usize,
     v: usize,
@@ -168,7 +236,7 @@ unsafe fn head_backward_avx2(
     use core::arch::x86_64::*;
     unsafe {
         let h8 = h - (h % 8);
-        // Pass A: d_normed[ti] = Σ_vid d_logits[ti,vid] · embed[vid].
+        // d_normed[ti] = Σ_vid d_logits[ti,vid] · embed[vid].
         for ti in 0..t {
             let dl = d_logits.as_ptr().add(ti * v);
             let dnf = d_normed.as_mut_ptr().add(ti * h);
@@ -188,10 +256,32 @@ unsafe fn head_backward_avx2(
                 }
             }
         }
-        // Pass B: d_embed[vid] += Σ_ti d_logits[ti,vid] · normed[ti]; de written once
+    }
+}
+
+/// `d_embed` is already sliced to this chunk's vocab rows (`v_c = d_embed.len()/h`
+/// of them); `vid0` is that chunk's starting absolute vocab index, used to
+/// index into the un-sliced `d_logits`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn head_backward_pass_b_avx2(
+    d_logits: &[f32],
+    normed: &[f32],
+    d_embed: &mut [f32],
+    t: usize,
+    h: usize,
+    v: usize,
+    vid0: usize,
+) {
+    use core::arch::x86_64::*;
+    unsafe {
+        let h8 = h - (h % 8);
+        let v_c = d_embed.len() / h;
+        // d_embed[vid] += Σ_ti d_logits[ti,vid] · normed[ti]; de written once
         // per vid (cache-resident across the ti loop) instead of once per token.
-        for vid in 0..v {
-            let de = d_embed.as_mut_ptr().add(vid * h);
+        for vc in 0..v_c {
+            let vid = vid0 + vc;
+            let de = d_embed.as_mut_ptr().add(vc * h);
             for ti in 0..t {
                 let dlv = *d_logits.as_ptr().add(ti * v + vid);
                 let dlb = _mm256_set1_ps(dlv);
@@ -364,6 +454,34 @@ mod tests {
         }
     }
 
+    /// Pure-scalar reference (no AVX2, no parallelism) for `head_backward_*_matches_scalar`.
+    fn head_backward_naive(
+        d_logits: &[f32], embed: &[f32], normed: &[f32],
+        d_normed: &mut [f32], d_embed: &mut [f32], t: usize, h: usize, v: usize,
+    ) {
+        for ti in 0..t {
+            let dl = &d_logits[ti * v..(ti + 1) * v];
+            let dnf = &mut d_normed[ti * h..(ti + 1) * h];
+            for vid in 0..v {
+                let dlv = dl[vid];
+                let e = &embed[vid * h..(vid + 1) * h];
+                for j in 0..h {
+                    dnf[j] += dlv * e[j];
+                }
+            }
+        }
+        for vid in 0..v {
+            let de = &mut d_embed[vid * h..(vid + 1) * h];
+            for ti in 0..t {
+                let dlv = d_logits[ti * v + vid];
+                let nf = &normed[ti * h..(ti + 1) * h];
+                for j in 0..h {
+                    de[j] += dlv * nf[j];
+                }
+            }
+        }
+    }
+
     #[test]
     fn head_backward_avx2_matches_scalar() {
         let (t, h, v) = (3usize, 44usize, 7usize);
@@ -376,7 +494,7 @@ mod tests {
 
         let mut dn_want = vec![0.0f32; t * h];
         let mut de_want = de0.clone();
-        head_backward_scalar(&d_logits, &embed, &normed, &mut dn_want, &mut de_want, t, h, v);
+        head_backward_naive(&d_logits, &embed, &normed, &mut dn_want, &mut de_want, t, h, v);
 
         let mut dn_got = vec![0.0f32; t * h];
         let mut de_got = de0.clone();
@@ -387,6 +505,50 @@ mod tests {
         }
         for (x, y) in de_want.iter().zip(&de_got) {
             assert!((x - y).abs() < 1e-4, "d_embed: {x} vs {y}");
+        }
+    }
+
+    /// Same as `head_backward_avx2_matches_scalar` but with `t`/`v` large
+    /// enough to exercise the rayon-parallel branches in both passes.
+    #[test]
+    fn head_backward_parallel_matches_scalar() {
+        let (t, h, v) = (16usize, 44usize, 20usize);
+        let d_logits: Vec<f32> = (0..t * v).map(|i| (i as f32 * 0.021).sin()).collect();
+        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32 * 0.013).cos()).collect();
+        let normed: Vec<f32> = (0..t * h).map(|i| (i as f32 * 0.017).sin()).collect();
+        let de0: Vec<f32> = (0..v * h).map(|i| (i as f32 * 0.005).cos()).collect();
+
+        let mut dn_want = vec![0.0f32; t * h];
+        let mut de_want = de0.clone();
+        head_backward_naive(&d_logits, &embed, &normed, &mut dn_want, &mut de_want, t, h, v);
+
+        let mut dn_got = vec![0.0f32; t * h];
+        let mut de_got = de0.clone();
+        head_backward(&d_logits, &embed, &normed, &mut dn_got, &mut de_got, t, h, v);
+
+        for (x, y) in dn_want.iter().zip(&dn_got) {
+            assert!((x - y).abs() < 1e-3, "d_normed: {x} vs {y}");
+        }
+        for (x, y) in de_want.iter().zip(&de_got) {
+            assert!((x - y).abs() < 1e-3, "d_embed: {x} vs {y}");
+        }
+    }
+
+    /// `logits_from_embed`'s rayon-parallel branch (t >= HEAD_PARALLEL_THRESHOLD).
+    #[test]
+    fn logits_from_embed_parallel_matches_scalar() {
+        let (t, h, v) = (16usize, 44usize, 9usize);
+        let normed: Vec<f32> = (0..t * h).map(|i| (i as f32 * 0.031).sin()).collect();
+        let embed: Vec<f32> = (0..v * h).map(|i| (i as f32 * 0.019).cos()).collect();
+
+        let mut want = vec![0.0f32; t * v];
+        logits_scalar(&normed, &embed, &mut want, t, h, v);
+
+        let mut got = vec![0.0f32; t * v];
+        logits_from_embed(&normed, &embed, &mut got, t, h, v);
+
+        for (x, y) in want.iter().zip(&got) {
+            assert!((x - y).abs() < 1e-4, "mismatch: scalar {x} vs parallel {y}");
         }
     }
 
