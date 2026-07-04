@@ -3221,3 +3221,84 @@ crossover scare, the single-thread audit, attention parallelization, and
 the frozen-dictionary quality question — has been measured (not
 guessed) and resolved. Nothing performance-related remains open on this
 thread.
+
+---
+
+## 2026-07-04 — `FwdCache.zs` allocation footprint: reused via a recycling pool, ~2x step time
+
+Picked up the one item still sitting on the shelf from Fable's original
+2026-07-03 review: the `FwdCache.zs`/`y` buffers were re-`vec![0.0; n]`'d
+fresh every call, every layer, every step. Originally estimated ~5% of a
+step (Fable, revised down from a rougher ~20%) — re-checked with a
+standalone alloc+dealloc+zero-fill microbenchmark at matching scale before
+starting, since that 5% estimate predated every speedup landed since, and
+the same *fixed* allocation cost is a bigger fraction of a much smaller
+step now. Measured ~19ms/step, ~8-9% of the (pre-this-change) ~216-230ms
+step — worth doing.
+
+### Scoping arrived at the real design in stages
+
+First pass assumed a naive shared/global scratch buffer would work; investigation
+found `zs` genuinely needs to survive from one layer's forward call until
+that *same* layer's backward call, potentially 20+ other calls later —
+ruling out a single shared buffer (each layer/projection needs its own
+slot) and any lifetime-borrowed design (Rust can't express "mutate now,
+read later, guaranteed non-overlapping" without `unsafe` pointers or
+`RefCell`, not without threading real lifetimes through `FwdCache`,
+`LayerForward`, `FfnForwardBatch`, `ModelForward`). User confirmed the
+"full redesign" scope after this was made explicit (asked twice, as the
+real scope kept growing beyond the initial estimate).
+
+### The actual mechanism: a take/give recycling pool, not literal lifetimes
+
+Landed `src/kernels/scratch.rs`'s `BufPool`: buffers stay fully owned
+(`Vec<f32>`, moved around exactly as before) — the only change is where a
+fresh buffer's memory comes from. `take_zeroed`/`take_uninit` pull a
+same-length buffer back out of a free list if one was previously `give`n
+back (a `Vec::resize`-cost operation, no syscall); `give` returns a buffer
+for the next call to reuse. Sidesteps the lifetime problem entirely: no
+`unsafe`, no `RefCell`, no generic lifetime parameters anywhere.
+
+Threaded explicitly through the whole call chain (the "explicit
+workspace/arena parameter" option from the initial scoping question):
+`SharedMonarchProj`'s six batch methods (drawing `y`/`zs` from the pool;
+`zs` specifically switches `backward_batch`/`backward_rows_batch`/
+`backward_cols_batch` from taking `zs: &[f32]` to taking `cache: FwdCache`
+by value, so the buffer can be extracted and given back right after use)
+→ `AttnProj` (copies `y` out immediately and gives it straight back — same
+call, no cross-step lifetime needed) → `Ffn` (up/gate/out escape into
+`FfnForwardBatch` for the whole step, so aren't pooled the same way; their
+`zs`-equivalent caches still are) → `TransformerLayer`/`Model`
+(forward/backward both take `pool: &mut BufPool`) → the training loop
+(owns one `BufPool` for the entire run, not per-step).
+
+`take_uninit` (for `zs`, pure write-before-read — every element assigned
+exactly once across the block loop, never accumulated into) skips the
+zero-fill pass entirely, not just the allocation; `take_zeroed` (for `y`,
+which *is* accumulated into) still zeros, same as before.
+
+About 40 test call sites across `monarch.rs`/`ffn.rs`/`layer.rs`/
+`model.rs`/`train/{optim,checkpoint,loop}.rs` needed updating — mechanical
+but not risk-free: a few tests read a `LayerForward`/`FfnForwardBatch`
+field *after* the call that now consumes it by value, needing the read
+reordered before the consuming call (e.g. cloning `fwd.ffn_fwds.selected`
+before `backward` moves `fwd`), and one test calling `backward` twice on
+the same forward cache needed a second, independent `forward` call instead
+(neither `LayerForward` nor `FwdCache` derive `Clone`).
+
+**Result: 100/100 tests pass, and the win is much bigger than scoped.**
+Measured (train_small_lod shape, LTO release binary): total step time
+**216-230ms/step → ~114-122ms/step — roughly 2x**, far past the ~8-9% the
+standalone microbenchmark predicted. The gap: `take_uninit` also skips
+`zs`'s zero-fill pass entirely (the microbenchmark zeroed every buffer,
+including ones that don't need it), and the isolated microbenchmark
+almost certainly understated real allocator/page-fault cost under an
+actual 12-layer model's live memory pressure versus a clean, repeated
+alloc/dealloc loop with nothing else competing for the allocator. Wall-clock
+throughput: **~2100-2200 tok/s** at seq_len=256, up from ~1100 —
+roughly double, again.
+
+**Status:** this was the last item on the board from the 2026-07-02
+through 2026-07-04 arc. Every flagged item has now been measured and
+resolved, several (this one included) by a wide margin past the original
+estimate. Nothing performance-related remains open on this thread.
