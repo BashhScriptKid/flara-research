@@ -11,3 +11,4 @@ pub mod optimizer;
 pub mod probe;
 pub mod profiling;
 pub mod rope;
+pub mod scratch;

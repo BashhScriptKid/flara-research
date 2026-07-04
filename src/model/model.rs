@@ -254,7 +254,7 @@ impl Model {
     }
 
     /// Forward a single sequence of token ids → logits, caching activations.
-    pub fn forward(&self, ids: &[usize]) -> ModelForward {
+    pub fn forward(&self, ids: &[usize], pool: &mut crate::kernels::scratch::BufPool) -> ModelForward {
         let (h, v) = (self.cfg.hidden, self.cfg.vocab);
         let t = ids.len();
 
@@ -262,7 +262,7 @@ impl Model {
 
         let mut layer_fwds = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            let lf = layer.forward(&self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2, &self.rope, &x, t);
+            let lf = layer.forward(&self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2, &self.rope, &x, t, pool);
             x = lf.out.clone();
             layer_fwds.push(lf);
         }
@@ -369,9 +369,10 @@ impl Model {
 
     pub fn backward(
         &self,
-        fwd: &ModelForward,
+        fwd: ModelForward,
         d_logits: &[f32],
         d_probe_p: Option<&[Vec<f32>]>,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> ModelGrads {
         let (h, v) = (self.cfg.hidden, self.cfg.vocab);
         let t = fwd.token_ids.len();
@@ -415,6 +416,12 @@ impl Model {
 
         // --- layer stack, in reverse; the shared dictionary grads sum across layers ---
         let embed_x = self.embed_lookup(&fwd.token_ids);
+        // Every layer's output, needed as the *next* layer's backward input --
+        // extracted before `fwd.layer_fwds` is consumed by value below (each
+        // LayerForward is moved into that layer's own backward call so its
+        // pooled buffers, e.g. the Monarch `zs` caches, can be recycled).
+        let layer_outs: Vec<Vec<f32>> = fwd.layer_fwds.iter().map(|lf| lf.out.clone()).collect();
+        let mut layer_fwds = fwd.layer_fwds;
         let mut d_x = d_final_x;
         let mut d_mono_d1: Vec<f32> = Vec::new();
         let mut d_mono_d2: Vec<f32> = Vec::new();
@@ -423,14 +430,17 @@ impl Model {
         let mut layer_grads_rev = Vec::with_capacity(self.layers.len());
         for l in (0..self.layers.len()).rev() {
             // Layer l's forward input is the previous layer's output (or the embedding).
-            let input = if l == 0 { &embed_x } else { &fwd.layer_fwds[l - 1].out };
+            let input = if l == 0 { &embed_x } else { &layer_outs[l - 1] };
             let lpp = d_probe_p.and_then(|p| {
                 let s = p[l].as_slice();
                 (!s.is_empty()).then_some(s)
             });
+            // `l` is always the last remaining index (we pop in strictly
+            // decreasing order), so `.pop()` gives layer `l`'s own LayerForward.
+            let this_fwd = layer_fwds.pop().expect("layer_fwds/layers length mismatch");
             let lg = self.layers[l].backward(
                 &self.mono_d1, &self.mono_d2, &self.ffn_mono_d1, &self.ffn_mono_d2,
-                &self.rope, input, &fwd.layer_fwds[l], &d_x, lpp, t,
+                &self.rope, input, this_fwd, &d_x, lpp, t, pool,
             );
             if d_mono_d1.is_empty() {
                 d_mono_d1 = lg.d_mono_d1.clone();
@@ -566,7 +576,8 @@ mod tests {
         let (v, n) = (c.vocab, c.n_layers);
         let mut m = Model::new(c, 0xABCD);
         let ids = [1usize, 5, 0, 9, 3];
-        let fwd = m.forward(&ids);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let fwd = m.forward(&ids, &mut pool);
         assert_eq!(fwd.logits.len(), ids.len() * v);
         assert_eq!(fwd.layer_fwds.len(), n);
         assert!(fwd.logits.iter().all(|x| x.is_finite()));
@@ -576,8 +587,9 @@ mod tests {
     fn forward_is_deterministic() {
         let mut m = Model::new(tiny_cfg(), 0x11);
         let ids = [2usize, 2, 7, 1];
-        let a = m.forward(&ids).logits;
-        let b = m.forward(&ids).logits;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let a = m.forward(&ids, &mut pool).logits;
+        let b = m.forward(&ids, &mut pool).logits;
         assert_eq!(a, b);
     }
 
@@ -587,8 +599,9 @@ mod tests {
         let c = tiny_cfg();
         let v = c.vocab;
         let mut m = Model::new(c, 0x77);
-        let base = m.forward(&[3usize, 8, 1, 4]).logits;
-        let perturbed = m.forward(&[3usize, 8, 1, 12]).logits; // only last id changed
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let base = m.forward(&[3usize, 8, 1, 4], &mut pool).logits;
+        let perturbed = m.forward(&[3usize, 8, 1, 12], &mut pool).logits; // only last id changed
         for vid in 0..v {
             assert!((base[vid] - perturbed[vid]).abs() < 1e-6, "future token leaked into logits[0]");
         }
@@ -627,15 +640,17 @@ mod tests {
         let ids = [4usize, 1, 6, 2, 4]; // token 4 repeats ⇒ exercises scatter accumulation
         let targets = [1usize, 6, 2, 4, 0];
 
-        let fwd = m.forward(&ids);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let fwd = m.forward(&ids, &mut pool);
         let (_, d_logits) = cross_entropy(&fwd.logits, vocab, &targets);
-        let grads = m.backward(&fwd, &d_logits, None);
 
-        // Base FFN routing per (layer, token), to detect top-k kinks under perturbation.
+        // Base FFN routing per (layer, token), to detect top-k kinks under
+        // perturbation -- computed before `backward` consumes `fwd` by value.
         let sel_of = |f: &ModelForward| -> Vec<Vec<usize>> {
             f.layer_fwds.iter().flat_map(|lf| lf.ffn_fwds.selected.clone()).collect()
         };
         let base_sel = sel_of(&fwd);
+        let grads = m.backward(fwd, &d_logits, None, &mut pool);
 
         const H: f32 = 1e-3;
         let mut rng = Lcg(0xBEEF);
@@ -646,10 +661,10 @@ mod tests {
             rng.f(); // advance
             let save = m.embed[i];
             m.embed[i] = save + H;
-            let fp = m.forward(&ids);
+            let fp = m.forward(&ids, &mut pool);
             let lp = cross_entropy(&fp.logits, vocab, &targets).0;
             m.embed[i] = save - H;
-            let fm = m.forward(&ids);
+            let fm = m.forward(&ids, &mut pool);
             let lm = cross_entropy(&fm.logits, vocab, &targets).0;
             m.embed[i] = save;
             if sel_of(&fp) != base_sel || sel_of(&fm) != base_sel {

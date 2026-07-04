@@ -258,12 +258,15 @@ impl Ffn {
     /// shared dictionary is still weight-only and batch-wide (see
     /// `SharedMonarchProj::forward_rows_batch`/`forward_cols_batch`), so it's
     /// still done once instead of once per token. `h` is `[t_len, hidden]`.
-    pub fn compute_batch(&self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32], sels: &[FfnSelection], t_len: usize) -> FfnForwardBatch {
+    pub fn compute_batch(
+        &self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32], sels: &[FfnSelection], t_len: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
+    ) -> FfnForwardBatch {
         let (b, f) = (self.cfg.block, self.cfg.ffn);
         let active_p: Vec<Vec<usize>> = sels.iter().map(|s| s.selected.clone()).collect();
 
-        let (up, up_cache) = self.up_proj.forward_rows_batch(mono_d1, mono_d2, h, &active_p, t_len);
-        let (gate, gate_cache) = self.gate_proj.forward_rows_batch(mono_d1, mono_d2, h, &active_p, t_len);
+        let (up, up_cache) = self.up_proj.forward_rows_batch(mono_d1, mono_d2, h, &active_p, t_len, pool);
+        let (gate, gate_cache) = self.gate_proj.forward_rows_batch(mono_d1, mono_d2, h, &active_p, t_len, pool);
 
         let mut act = vec![0.0f32; t_len * f];
         for t in 0..t_len {
@@ -278,7 +281,7 @@ impl Ffn {
             }
         }
 
-        let (out, down_cache) = self.down_proj.forward_cols_batch(mono_d1, mono_d2, &act, &active_p, t_len);
+        let (out, down_cache) = self.down_proj.forward_cols_batch(mono_d1, mono_d2, &act, &active_p, t_len, pool);
 
         FfnForwardBatch {
             out, up, gate, act, up_cache, gate_cache, down_cache,
@@ -377,26 +380,28 @@ impl Ffn {
     /// once (see `SharedMonarchProj::backward_rows_batch`/
     /// `backward_cols_batch`) instead of once per token.
     pub fn backward_batch(
-        &self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32], fwd: &FfnForwardBatch, d_out: &[f32], t_len: usize,
+        &self, mono_d1: &[f32], mono_d2: &[f32], h: &[f32], fwd: FfnForwardBatch, d_out: &[f32], t_len: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> FfnGradsBatch {
         let (b, f, hh) = (self.cfg.block, self.cfg.ffn, self.cfg.hidden);
+        let FfnForwardBatch { up, gate, act, up_cache, gate_cache, down_cache, selected, gates, .. } = fwd;
 
         let mut d_act = vec![0.0f32; t_len * f];
         let g_down: MonarchGrads = self.down_proj.backward_cols_batch(
-            mono_d1, mono_d2, &fwd.act, &fwd.down_cache.zs, d_out, &mut d_act, &fwd.selected, t_len,
+            mono_d1, mono_d2, &act, down_cache, d_out, &mut d_act, &selected, t_len, pool,
         );
 
         let mut d_up = vec![0.0f32; t_len * f];
         let mut d_gate = vec![0.0f32; t_len * f];
-        let mut d_w: Vec<Vec<f32>> = fwd.selected.iter().map(|s| vec![0.0f32; s.len()]).collect();
+        let mut d_w: Vec<Vec<f32>> = selected.iter().map(|s| vec![0.0f32; s.len()]).collect();
         for t in 0..t_len {
-            for (si, &blk) in fwd.selected[t].iter().enumerate() {
-                let w = fwd.gates[t][si];
+            for (si, &blk) in selected[t].iter().enumerate() {
+                let w = gates[t][si];
                 for j in blk * b..(blk + 1) * b {
                     let idx = t * f + j;
-                    let gate_pre = fwd.gate[idx];
+                    let gate_pre = gate[idx];
                     let g = gate_pre.max(0.0);
-                    let upj = fwd.up[idx];
+                    let upj = up[idx];
                     let da = d_act[idx];
                     d_up[idx] = da * g * w;
                     if gate_pre > 0.0 {
@@ -409,11 +414,11 @@ impl Ffn {
 
         let mut d_h = vec![0.0f32; t_len * hh];
         let g_up: MonarchGrads = self.up_proj.backward_rows_batch(
-            mono_d1, mono_d2, h, &fwd.up_cache.zs, &d_up, &mut d_h, &fwd.selected, t_len,
+            mono_d1, mono_d2, h, up_cache, &d_up, &mut d_h, &selected, t_len, pool,
         );
         let mut d_h_gate = vec![0.0f32; t_len * hh];
         let g_gate: MonarchGrads = self.gate_proj.backward_rows_batch(
-            mono_d1, mono_d2, h, &fwd.gate_cache.zs, &d_gate, &mut d_h_gate, &fwd.selected, t_len,
+            mono_d1, mono_d2, h, gate_cache, &d_gate, &mut d_h_gate, &selected, t_len, pool,
         );
         for i in 0..t_len * hh {
             d_h[i] += d_h_gate[i];
@@ -421,8 +426,8 @@ impl Ffn {
 
         let mut d_router_w = vec![0.0f32; self.m * hh];
         for t in 0..t_len {
-            let sel = &fwd.selected[t];
-            let gates_t = &fwd.gates[t];
+            let sel = &selected[t];
+            let gates_t = &gates[t];
             let dotp: f32 = d_w[t].iter().zip(gates_t).map(|(dw, w)| dw * w).sum();
             let h_t = &h[t * hh..(t + 1) * hh];
             for (si, &blk) in sel.iter().enumerate() {
@@ -802,9 +807,11 @@ mod tests {
         let h: Vec<f32> = (0..t_len * hh).map(|_| rng.f()).collect();
         let d_out: Vec<f32> = (0..t_len * hh).map(|_| rng.f() * 0.1).collect();
 
+        let mut pool = crate::kernels::scratch::BufPool::new();
         let sels = ffn.select_batch(&h, t_len);
-        let fwd_batch = ffn.compute_batch(&d1, &d2, &h, &sels, t_len);
-        let g_batch = ffn.backward_batch(&d1, &d2, &h, &fwd_batch, &d_out, t_len);
+        let fwd_batch = ffn.compute_batch(&d1, &d2, &h, &sels, t_len, &mut pool);
+        let fwd_batch_out = fwd_batch.out.clone(); // `backward_batch` consumes `fwd_batch` by value
+        let g_batch = ffn.backward_batch(&d1, &d2, &h, fwd_batch, &d_out, t_len, &mut pool);
 
         let mut d_router_w_looped = vec![0.0f32; ffn.m * hh];
         let mut d_mono_d1_looped = vec![0.0f32; d1.len()];
@@ -817,7 +824,7 @@ mod tests {
             let fwd_t = ffn.compute(&d1, &d2, h_t, sel);
 
             for j in 0..hh {
-                let got = fwd_batch.out[t * hh + j];
+                let got = fwd_batch_out[t * hh + j];
                 assert!((got - fwd_t.out[j]).abs() < 1e-5, "token {t} out[{j}]: batch={got} looped={}", fwd_t.out[j]);
             }
 

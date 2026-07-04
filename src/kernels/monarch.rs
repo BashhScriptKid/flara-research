@@ -811,14 +811,20 @@ impl SharedMonarchProj {
     /// small `P`: it lost real multi-core parallelism without a
     /// compensating win, since reconstruction wasn't forward's bottleneck
     /// per token to begin with.
-    pub fn forward_batch(&self, d1: &[f32], d2: &[f32], x: &[f32], n_tokens: usize) -> (Vec<f32>, FwdCache) {
+    pub fn forward_batch(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], n_tokens: usize, pool: &mut crate::kernels::scratch::BufPool,
+    ) -> (Vec<f32>, FwdCache) {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let in_dim = q * b;
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
-        let mut y   = vec![0.0f32; n_tokens * p * b];
-        let mut zs  = vec![0.0f32; n_tokens * p * q * b];
+        // `y` is accumulated into (`out[..] += ..` in `apply_block`), so it
+        // must start zeroed; `zs` is pure write-before-read (every element
+        // assigned exactly once across the pp/qq loop), so `take_uninit`
+        // skips a wasted zero-fill pass on top of skipping the allocation.
+        let mut y   = pool.take_zeroed(n_tokens * p * b);
+        let mut zs  = pool.take_uninit(n_tokens * p * q * b);
 
         let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [f32]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
@@ -866,7 +872,8 @@ impl SharedMonarchProj {
     /// `backward_block_hoisted` loop, reassociated — see
     /// `phase1_plus_contract_matches_backward_block_hoisted`.
     pub fn backward_batch(
-        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32], n_tokens: usize,
+        &self, d1: &[f32], d2: &[f32], x: &[f32], cache: FwdCache, dout: &[f32], dx: &mut [f32], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> Grads {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
@@ -874,6 +881,10 @@ impl SharedMonarchProj {
         let out_dim = p * b;
         dx.iter_mut().for_each(|v| *v = 0.0);
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+        // `cache.zs` is only read here, from this point until it's returned
+        // to the pool below -- taking it by value (rather than the old
+        // `zs: &[f32]`) lets us recycle its allocation for next call.
+        let FwdCache { zs } = cache;
 
         // Phase 1: accumulate s1/s2 (p*q*m*b each) and dx for tokens t0..t1
         // — shared by both the sequential and rayon-chunked callers below.
@@ -902,6 +913,7 @@ impl SharedMonarchProj {
             let mut dx_full = vec![0.0f32; n_tokens * in_dim];
             run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
             dx.copy_from_slice(&dx_full);
+            pool.give(zs);
             return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
         }
 
@@ -925,6 +937,7 @@ impl SharedMonarchProj {
             for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
+        pool.give(zs);
         SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
     }
 
@@ -1171,14 +1184,15 @@ impl SharedMonarchProj {
     /// one entry per token.
     pub fn forward_rows_batch(
         &self, d1: &[f32], d2: &[f32], x: &[f32], active_p: &[Vec<usize>], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> (Vec<f32>, FwdCache) {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let in_dim = q * b;
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
-        let mut y  = vec![0.0f32; n_tokens * p * b];
-        let mut zs = vec![0.0f32; n_tokens * p * q * b];
+        let mut y  = pool.take_zeroed(n_tokens * p * b);
+        let mut zs = pool.take_uninit(n_tokens * p * q * b);
 
         let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [f32]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
@@ -1215,14 +1229,15 @@ impl SharedMonarchProj {
     /// zero outside the routed blocks).
     pub fn forward_cols_batch(
         &self, d1: &[f32], d2: &[f32], x: &[f32], active_q: &[Vec<usize>], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> (Vec<f32>, FwdCache) {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let in_dim = q * b;
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
-        let mut y  = vec![0.0f32; n_tokens * p * b];
-        let mut zs = vec![0.0f32; n_tokens * p * q * b];
+        let mut y  = pool.take_zeroed(n_tokens * p * b);
+        let mut zs = pool.take_uninit(n_tokens * p * q * b);
 
         let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [f32]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
@@ -1260,8 +1275,9 @@ impl SharedMonarchProj {
     /// `backward_batch` (accumulate `s1`/`s2` across the batch, contract once
     /// per block afterward), restricted per token to `active_p[t]`.
     pub fn backward_rows_batch(
-        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32],
+        &self, d1: &[f32], d2: &[f32], x: &[f32], cache: FwdCache, dout: &[f32], dx: &mut [f32],
         active_p: &[Vec<usize>], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> Grads {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
@@ -1269,6 +1285,7 @@ impl SharedMonarchProj {
         let out_dim = p * b;
         dx.iter_mut().for_each(|v| *v = 0.0);
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+        let FwdCache { zs } = cache;
 
         let run_range = |t0: usize, t1: usize, s1: &mut [f32], s2: &mut [f32], dx_out: &mut [f32]| {
             for t in t0..t1 {
@@ -1297,6 +1314,7 @@ impl SharedMonarchProj {
             let mut dx_full = vec![0.0f32; n_tokens * in_dim];
             run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
             dx.copy_from_slice(&dx_full);
+            pool.give(zs);
             return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
         }
 
@@ -1320,6 +1338,7 @@ impl SharedMonarchProj {
             for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
+        pool.give(zs);
         SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
     }
 
@@ -1327,8 +1346,9 @@ impl SharedMonarchProj {
     /// restricting the *input* col-blocks per token instead of the output
     /// row-blocks. Every output block contributes gradient (not restricted).
     pub fn backward_cols_batch(
-        &self, d1: &[f32], d2: &[f32], x: &[f32], zs: &[f32], dout: &[f32], dx: &mut [f32],
+        &self, d1: &[f32], d2: &[f32], x: &[f32], cache: FwdCache, dout: &[f32], dx: &mut [f32],
         active_q: &[Vec<usize>], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> Grads {
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
@@ -1336,6 +1356,7 @@ impl SharedMonarchProj {
         let out_dim = p * b;
         dx.iter_mut().for_each(|v| *v = 0.0);
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+        let FwdCache { zs } = cache;
 
         let run_range = |t0: usize, t1: usize, s1: &mut [f32], s2: &mut [f32], dx_out: &mut [f32]| {
             for t in t0..t1 {
@@ -1364,6 +1385,7 @@ impl SharedMonarchProj {
             let mut dx_full = vec![0.0f32; n_tokens * in_dim];
             run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
             dx.copy_from_slice(&dx_full);
+            pool.give(zs);
             return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
         }
 
@@ -1387,6 +1409,7 @@ impl SharedMonarchProj {
             for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
+        pool.give(zs);
         SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
     }
 
@@ -2429,9 +2452,10 @@ mod tests {
         let x: Vec<f32> = randvec(n_tokens * in_dim, 0x1010);
         let dout: Vec<f32> = randvec(n_tokens * out_dim, 0x2020);
 
-        let (_, cache_batch) = proj.forward_batch(&d1, &d2, &x, n_tokens);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let (_, cache_batch) = proj.forward_batch(&d1, &d2, &x, n_tokens, &mut pool);
         let mut dx_batch = vec![0.0f32; n_tokens * in_dim];
-        let g_batch = proj.backward_batch(&d1, &d2, &x, &cache_batch.zs, &dout, &mut dx_batch, n_tokens);
+        let g_batch = proj.backward_batch(&d1, &d2, &x, cache_batch, &dout, &mut dx_batch, n_tokens, &mut pool);
 
         let mut g_looped = Grads {
             dd1: vec![0.0f32; nd * b],
@@ -2598,9 +2622,10 @@ mod tests {
             (0..n_active).map(|k| (t * 3 + k * 5) % p).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
         }).collect();
 
-        let (y_batch, cache_batch) = proj.forward_rows_batch(&d1, &d2, &x, &active_p, n_tokens);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let (y_batch, cache_batch) = proj.forward_rows_batch(&d1, &d2, &x, &active_p, n_tokens, &mut pool);
         let mut dx_batch = vec![0.0f32; n_tokens * in_dim];
-        let g_batch = proj.backward_rows_batch(&d1, &d2, &x, &cache_batch.zs, &dout, &mut dx_batch, &active_p, n_tokens);
+        let g_batch = proj.backward_rows_batch(&d1, &d2, &x, cache_batch, &dout, &mut dx_batch, &active_p, n_tokens, &mut pool);
 
         let mut g_looped_da1 = vec![0.0f32; p * q * m * nd];
         let mut g_looped_da2 = vec![0.0f32; p * q * m * nd];
@@ -2629,9 +2654,9 @@ mod tests {
         let active_q: Vec<Vec<usize>> = (0..n_tokens).map(|t| {
             (0..n_active).map(|k| (t * 2 + k * 7) % q).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
         }).collect();
-        let (y_batch, cache_batch) = proj.forward_cols_batch(&d1, &d2, &x, &active_q, n_tokens);
+        let (y_batch, cache_batch) = proj.forward_cols_batch(&d1, &d2, &x, &active_q, n_tokens, &mut pool);
         let mut dx_batch = vec![0.0f32; n_tokens * in_dim];
-        let g_batch = proj.backward_cols_batch(&d1, &d2, &x, &cache_batch.zs, &dout, &mut dx_batch, &active_q, n_tokens);
+        let g_batch = proj.backward_cols_batch(&d1, &d2, &x, cache_batch, &dout, &mut dx_batch, &active_q, n_tokens, &mut pool);
         for t in 0..n_tokens {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
             let dout_t = &dout[t * out_dim..(t + 1) * out_dim];

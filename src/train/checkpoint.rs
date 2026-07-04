@@ -86,9 +86,10 @@ mod tests {
 
     fn train_step(model: &mut Model, opt: &mut Optimizer, ids: &[usize], targets: &[usize]) {
         let vocab = model.config().vocab;
-        let f = model.forward(ids);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let f = model.forward(ids, &mut pool);
         let (_, dl) = cross_entropy(&f.logits, vocab, targets);
-        let g = model.backward(&f, &dl, None);
+        let g = model.backward(f, &dl, None, &mut pool);
         opt.step(model, &g, 0.05);
     }
 
@@ -104,7 +105,8 @@ mod tests {
         for _ in 0..5 {
             train_step(&mut model, &mut opt, &ids, &targets);
         }
-        let logits_before = model.forward(&ids).logits;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let logits_before = model.forward(&ids, &mut pool).logits;
 
         let path = std::env::temp_dir().join(format!("fydel_ckpt_{}.bin", std::process::id()));
         save(&model, opt.state(), &path).unwrap();
@@ -112,7 +114,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         // Parameters restored: bit-identical logits.
-        let logits_after = model2.forward(&ids).logits;
+        let logits_after = model2.forward(&ids, &mut pool).logits;
         assert_eq!(logits_before.len(), logits_after.len());
         for (a, b) in logits_before.iter().zip(&logits_after) {
             assert_eq!(a.to_bits(), b.to_bits(), "param mismatch after reload");
@@ -125,8 +127,8 @@ mod tests {
         let mut o2 = Optimizer::from_parts(af(), opt_state2);
         train_step(&mut m1, &mut o1, &ids, &targets);
         train_step(&mut m2, &mut o2, &ids, &targets);
-        let l1 = m1.forward(&ids).logits;
-        let l2 = m2.forward(&ids).logits;
+        let l1 = m1.forward(&ids, &mut pool).logits;
+        let l2 = m2.forward(&ids, &mut pool).logits;
         for (a, b) in l1.iter().zip(&l2) {
             assert_eq!(a.to_bits(), b.to_bits(), "post-step mismatch ⇒ optimizer state not restored");
         }

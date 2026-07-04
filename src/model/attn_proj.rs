@@ -149,11 +149,15 @@ impl AttnProj {
     /// (Monarch path) — `x` is `[t_len, in_]`, output written to `y` which is
     /// `[t_len, out]`. Returns the cache `backward` needs for the Monarch path
     /// (empty for dense, which doesn't need one).
-    pub fn forward_batch(&self, d1: &[f32], d2: &[f32], x: &[f32], y: &mut [f32], t_len: usize) -> FwdCache {
+    pub fn forward_batch(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], y: &mut [f32], t_len: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
+    ) -> FwdCache {
         match &self.kind {
             ProjKind::Monarch { proj } => {
-                let (out, cache) = proj.forward_batch(d1, d2, x, t_len);
+                let (out, cache) = proj.forward_batch(d1, d2, x, t_len, pool);
                 y.copy_from_slice(&out);
+                pool.give(out);
                 cache
             }
             ProjKind::Dense { w } => {
@@ -215,11 +219,14 @@ impl AttnProj {
     /// path this reconstructs each weight block once and reuses it across
     /// every token (see [`SharedMonarchProj::backward_batch`]) instead of
     /// once per token, which is what `backward` called in a loop would do.
-    pub fn backward_batch(&self, d1: &[f32], d2: &[f32], x: &[f32], cache: &FwdCache, dy: &[f32], t_len: usize) -> ProjGradsBatch {
+    pub fn backward_batch(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], cache: FwdCache, dy: &[f32], t_len: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
+    ) -> ProjGradsBatch {
         match &self.kind {
             ProjKind::Monarch { proj } => {
                 let mut dx = vec![0.0f32; t_len * self.in_];
-                let g: MonarchGrads = proj.backward_batch(d1, d2, x, &cache.zs, dy, &mut dx, t_len);
+                let g: MonarchGrads = proj.backward_batch(d1, d2, x, cache, dy, &mut dx, t_len, pool);
                 let mut d_param = Vec::with_capacity(g.da1.len() + g.da2.len());
                 d_param.extend_from_slice(&g.da1);
                 d_param.extend_from_slice(&g.da2);

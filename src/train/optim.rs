@@ -81,12 +81,13 @@ mod tests {
         let af = AdaFactor { relative_step: false, ..AdaFactor::default() };
         let mut opt = Optimizer::with_config(&model, af);
 
-        let l0 = cross_entropy(&model.forward(&ids).logits, vocab, &targets).0;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let l0 = cross_entropy(&model.forward(&ids, &mut pool).logits, vocab, &targets).0;
         let mut last = l0;
         for _ in 0..300 {
-            let f = model.forward(&ids);
+            let f = model.forward(&ids, &mut pool);
             let (loss, d_logits) = cross_entropy(&f.logits, vocab, &targets);
-            let g = model.backward(&f, &d_logits, None);
+            let g = model.backward(f, &d_logits, None, &mut pool);
             opt.step(&mut model, &g, 0.05);
             last = loss;
         }
@@ -100,15 +101,16 @@ mod tests {
     fn grad_accum_equals_mean() {
         let mut model = Model::new(tiny_cfg(), 0x5EED);
         let vocab = model.config().vocab;
-        let mut batch = |ids: &[usize], tgt: &[usize]| {
-            let f = model.forward(ids);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let mut batch = |ids: &[usize], tgt: &[usize], pool: &mut crate::kernels::scratch::BufPool| {
+            let f = model.forward(ids, pool);
             let (_, dl) = cross_entropy(&f.logits, vocab, tgt);
-            model.backward(&f, &dl, None)
+            model.backward(f, &dl, None, pool)
         };
-        let g1 = batch(&[1, 2, 3, 4, 5, 6, 7, 8], &[2, 3, 4, 5, 6, 7, 8, 1]);
-        let g2 = batch(&[8, 7, 6, 5, 4, 3, 2, 1], &[7, 6, 5, 4, 3, 2, 1, 8]);
+        let g1 = batch(&[1, 2, 3, 4, 5, 6, 7, 8], &[2, 3, 4, 5, 6, 7, 8, 1], &mut pool);
+        let g2 = batch(&[8, 7, 6, 5, 4, 3, 2, 1], &[7, 6, 5, 4, 3, 2, 1, 8], &mut pool);
 
-        let mut acc = batch(&[1, 2, 3, 4, 5, 6, 7, 8], &[2, 3, 4, 5, 6, 7, 8, 1]);
+        let mut acc = batch(&[1, 2, 3, 4, 5, 6, 7, 8], &[2, 3, 4, 5, 6, 7, 8, 1], &mut pool);
         acc.add(&g2);
         acc.scale(0.5);
 

@@ -53,9 +53,10 @@ fn eval_loss<B: BatchSource>(model: &Model, src: &mut B, seq_len: usize, n_windo
     let vocab = model.config().vocab;
     let mut total = 0.0f32;
     let mut n = 0usize;
+    let mut pool = fydel::kernels::scratch::BufPool::new();
     for _ in 0..n_windows {
         let Some((ids, targets)) = src.next_batch(seq_len) else { break };
-        let fwd = model.forward(&ids);
+        let fwd = model.forward(&ids, &mut pool);
         let (ce, _) = cross_entropy(&fwd.logits, vocab, &targets);
         total += ce;
         n += 1;

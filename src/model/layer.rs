@@ -318,6 +318,7 @@ impl TransformerLayer {
         rope: &Rope,
         hidden: &[f32],
         t_len: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> LayerForward {
         let cfg = &self.cfg;
         let (h, qd, kvd, hd) = (cfg.hidden, cfg.q_dim(), cfg.kv_dim(), cfg.head_dim);
@@ -347,9 +348,9 @@ impl TransformerLayer {
         let wv_fc;
         {
             let _t = Timer::start(&profiling::QKV_FWD);
-            wq_fc = self.wq.forward_batch(mono_d1, mono_d2, &normed, &mut q, t_len);
-            wk_fc = self.wk.forward_batch(mono_d1, mono_d2, &normed, &mut k, t_len);
-            wv_fc = self.wv.forward_batch(mono_d1, mono_d2, &normed, &mut v, t_len);
+            wq_fc = self.wq.forward_batch(mono_d1, mono_d2, &normed, &mut q, t_len, pool);
+            wk_fc = self.wk.forward_batch(mono_d1, mono_d2, &normed, &mut k, t_len, pool);
+            wv_fc = self.wv.forward_batch(mono_d1, mono_d2, &normed, &mut v, t_len, pool);
         }
 
         for ti in 0..t_len {
@@ -371,7 +372,7 @@ impl TransformerLayer {
         let mut o_proj = vec![0.0f32; t_len * qd];
         let wo_fc = {
             let _t = Timer::start(&profiling::WO_FWD);
-            self.wo.forward_batch(mono_d1, mono_d2, &attn_out, &mut o_proj, t_len)
+            self.wo.forward_batch(mono_d1, mono_d2, &attn_out, &mut o_proj, t_len, pool)
         };
         for ti in 0..t_len {
             let oi = &o_proj[ti * qd..(ti + 1) * qd];
@@ -403,7 +404,7 @@ impl TransformerLayer {
         };
         let ffn_fwds = {
             let _t = Timer::start(&profiling::FFN_FWD);
-            self.ffn.compute_batch(ffn_d1, ffn_d2, &normed2, &sels, t_len)
+            self.ffn.compute_batch(ffn_d1, ffn_d2, &normed2, &sels, t_len, pool)
         };
         let mut out = vec![0.0f32; t_len * h];
         for ti in 0..t_len {
@@ -449,10 +450,11 @@ impl TransformerLayer {
         ffn_d2: &[f32],
         rope: &Rope,
         hidden: &[f32],
-        fwd: &LayerForward,
+        fwd: LayerForward,
         d_out: &[f32],
         d_probe_p: Option<&[f32]>,
         t_len: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> LayerGrads {
         let cfg = &self.cfg;
         let (h, qd, kvd, hd) = (cfg.hidden, cfg.q_dim(), cfg.kv_dim(), cfg.head_dim);
@@ -492,7 +494,7 @@ impl TransformerLayer {
         }
         let fg = {
             let _t = Timer::start(&profiling::FFN_BWD);
-            self.ffn.backward_batch(ffn_d1, ffn_d2, &fwd.normed2, &fwd.ffn_fwds, &d_ffn_out, t_len)
+            self.ffn.backward_batch(ffn_d1, ffn_d2, &fwd.normed2, fwd.ffn_fwds, &d_ffn_out, t_len, pool)
         };
         add_f(&mut g.d_up_coeffs, &fg.d_up_coeffs);
         add_f(&mut g.d_gate_coeffs, &fg.d_gate_coeffs);
@@ -541,7 +543,7 @@ impl TransformerLayer {
         }
         let wo_g = {
             let _t = Timer::start(&profiling::WO_BWD);
-            self.wo.backward_batch(mono_d1, mono_d2, &fwd.attn_out, &fwd.wo_fc, &d_oi_all, t_len)
+            self.wo.backward_batch(mono_d1, mono_d2, &fwd.attn_out, fwd.wo_fc, &d_oi_all, t_len, pool)
         };
         let d_attn_out = wo_g.d_x;
         add_f(&mut g.d_wo, &wo_g.d_param);
@@ -583,9 +585,9 @@ impl TransformerLayer {
         let wv_g;
         {
             let _t = Timer::start(&profiling::QKV_BWD);
-            wq_g = self.wq.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wq_fc, &dq, t_len);
-            wk_g = self.wk.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wk_fc, &dk, t_len);
-            wv_g = self.wv.backward_batch(mono_d1, mono_d2, &fwd.normed, &fwd.wv_fc, &dv, t_len);
+            wq_g = self.wq.backward_batch(mono_d1, mono_d2, &fwd.normed, fwd.wq_fc, &dq, t_len, pool);
+            wk_g = self.wk.backward_batch(mono_d1, mono_d2, &fwd.normed, fwd.wk_fc, &dk, t_len, pool);
+            wv_g = self.wv.backward_batch(mono_d1, mono_d2, &fwd.normed, fwd.wv_fc, &dv, t_len, pool);
         }
         add_f(&mut g.d_wq, &wq_g.d_param);
         add_f(&mut g.d_wk, &wk_g.d_param);
@@ -742,7 +744,8 @@ mod tests {
         let mut rng = Lcg(0x1234);
         let hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
 
-        let fwd = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let fwd = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool);
         assert_eq!(fwd.out.len(), t * c.hidden);
         assert_eq!(fwd.probe_p.len(), t);
         assert_eq!(fwd.ffn_fwds.selected.len(), t);
@@ -764,11 +767,13 @@ mod tests {
         let mut rng = Lcg(0x77);
         let mut hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
 
-        let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t).out;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool).out;
         for j in (t - 1) * c.hidden..t * c.hidden {
             hidden[j] += 1.5;
         }
-        let perturbed = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t).out;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let perturbed = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool).out;
         for j in 0..c.hidden {
             assert!((base[j] - perturbed[j]).abs() < 1e-7, "future token leaked into token 0");
         }
@@ -785,11 +790,13 @@ mod tests {
         let t = 5;
         let mut rng = Lcg(0x99);
         let mut hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
-        let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t).out;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool).out;
         for j in (t - 1) * c.hidden..t * c.hidden {
             hidden[j] += 2.0;
         }
-        let perturbed = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t).out;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let perturbed = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool).out;
         for j in 0..c.hidden {
             assert!((base[j] - perturbed[j]).abs() < 1e-7, "future leaked (sliding)");
         }
@@ -811,9 +818,10 @@ mod tests {
         let hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
         let r: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect(); // loss=Σ out·r ⇒ d_out=r
 
-        let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t);
-        let grads = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, &base, &r, None, t);
-        let base_sel: Vec<Vec<usize>> = base.ffn_fwds.selected.clone();
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool);
+        let base_sel: Vec<Vec<usize>> = base.ffn_fwds.selected.clone(); // `backward` consumes `base` by value
+        let grads = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, base, &r, None, t, &mut pool);
 
         let loss = |fwd: &LayerForward| -> f32 { fwd.out.iter().zip(&r).map(|(o, rr)| o * rr).sum() };
         let sel_stable = |fwd: &LayerForward| fwd.ffn_fwds.selected == base_sel;
@@ -823,9 +831,11 @@ mod tests {
         for i in 0..t * c.hidden {
             let mut hp = hidden.clone();
             hp[i] += H;
-            let fp = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hp, t);
+            let mut pool = crate::kernels::scratch::BufPool::new();
+            let fp = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hp, t, &mut pool);
             hp[i] -= 2.0 * H;
-            let fm = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hp, t);
+            let mut pool = crate::kernels::scratch::BufPool::new();
+            let fm = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hp, t, &mut pool);
             // Skip coords where the FFN top-k routing flips (non-smooth kink).
             if !sel_stable(&fp) || !sel_stable(&fm) {
                 continue;
@@ -851,11 +861,16 @@ mod tests {
         let mut rng = Lcg(0xC0DE);
         let hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
         let d_out = vec![0.1f32; t * c.hidden];
-        let fwd = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let fwd = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool);
+        // `backward` consumes its LayerForward by value, and the two calls
+        // below need independent caches -- run forward twice (deterministic,
+        // same inputs) rather than cloning (LayerForward isn't Clone).
+        let fwd2 = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool);
 
-        let g_none = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, &fwd, &d_out, None, t);
+        let g_none = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, fwd, &d_out, None, t, &mut pool);
         let dp = vec![0.5f32; t];
-        let g_probe = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, &fwd, &d_out, Some(&dp), t);
+        let g_probe = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, fwd2, &d_out, Some(&dp), t, &mut pool);
 
         for j in 0..t * c.hidden {
             assert!((g_none.d_hidden[j] - g_probe.d_hidden[j]).abs() < 1e-12, "probe leaked into backbone");

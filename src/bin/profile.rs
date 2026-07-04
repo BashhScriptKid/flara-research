@@ -90,9 +90,10 @@ fn main() {
     let ids: Vec<usize> = (0..seq).map(|i| i.wrapping_mul(2654435761) % vocab).collect();
     let targets: Vec<usize> = (0..seq).map(|i| (i + 1).wrapping_mul(2654435761) % vocab).collect();
 
-    let run_step = |model: &mut Model, opt: &mut Optimizer, t: &mut [f64; 3]| {
+    let mut pool = fydel::kernels::scratch::BufPool::new();
+    let run_step = |model: &mut Model, opt: &mut Optimizer, t: &mut [f64; 3], pool: &mut fydel::kernels::scratch::BufPool| {
         let a = Instant::now();
-        let fwd = model.forward(&ids);
+        let fwd = model.forward(&ids, pool);
         t[0] += a.elapsed().as_secs_f64();
 
         if fwd_only { return; }
@@ -100,7 +101,7 @@ fn main() {
         let (_, d_logits) = cross_entropy(&fwd.logits, vocab, &targets);
 
         let b = Instant::now();
-        let g = model.backward(&fwd, &d_logits, None);
+        let g = model.backward(fwd, &d_logits, None, pool);
         t[1] += b.elapsed().as_secs_f64();
 
         let c = Instant::now();
@@ -110,14 +111,14 @@ fn main() {
 
     let mut warm = [0.0f64; 3];
     for _ in 0..warmup {
-        run_step(&mut model, &mut opt, &mut warm);
+        run_step(&mut model, &mut opt, &mut warm, &mut pool);
     }
     profiling::reset(); // drop warmup's contribution to the sub-block breakdown
 
     let mut t = [0.0f64; 3];
     let wall = Instant::now();
     for _ in 0..steps {
-        run_step(&mut model, &mut opt, &mut t);
+        run_step(&mut model, &mut opt, &mut t, &mut pool);
     }
     let wall = wall.elapsed().as_secs_f64();
 

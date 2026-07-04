@@ -81,6 +81,10 @@ pub fn train<B: BatchSource>(
 ) -> Vec<StepMetrics> {
     let vocab = model.config().vocab;
     let mut history = Vec::with_capacity(cfg.total_steps.saturating_sub(start_step));
+    // Persists across the whole run (not per-step/per-micro-batch) so the
+    // same handful of shapes' allocations get reused instead of round-
+    // tripping through the allocator every call (RESEARCH_LOG.md 2026-07-04).
+    let mut pool = crate::kernels::scratch::BufPool::new();
 
     for step in start_step..cfg.total_steps {
         let seq_len = cfg.seq_len(step);
@@ -93,7 +97,7 @@ pub fn train<B: BatchSource>(
 
         for _ in 0..cfg.micro_batches {
             let Some((ids, targets)) = src.next_batch(seq_len) else { break };
-            let fwd = model.forward(&ids);
+            let fwd = model.forward(&ids, &mut pool);
             let (ce, d_logits) = cross_entropy(&fwd.logits, vocab, &targets);
             // CALM: supervise every 8th layer's exit probe (cost control), and skip
             // probe decoding entirely while the anneal coefficient is ~0.
@@ -104,7 +108,7 @@ pub fn train<B: BatchSource>(
             } else {
                 (0.0, None)
             };
-            let g = model.backward(&fwd, &d_logits, d_probe_p.as_deref());
+            let g = model.backward(fwd, &d_logits, d_probe_p.as_deref(), &mut pool);
 
             ce_sum += ce;
             probe_sum += probe_bce;
