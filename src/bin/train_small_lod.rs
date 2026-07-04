@@ -90,11 +90,18 @@ fn load_val_reader() -> CorpusReader {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let full_attn = args.iter().any(|a| a == "--full-attn");
-    let ckpt_path = PathBuf::from(if full_attn {
-        "checkpoints/fydel_small_lod_full.ckpt"
+    // CKPT_TAG isolates ad-hoc experiments (e.g. the frozen-dictionary A/B,
+    // RESEARCH_LOG.md 2026-07-04) to their own checkpoint file, always
+    // starting fresh, so they never resume from or clobber the real
+    // fydel_small_lod.ckpt training run.
+    let ckpt_tag = std::env::var("CKPT_TAG").unwrap_or_default();
+    let ckpt_path = if !ckpt_tag.is_empty() {
+        PathBuf::from(format!("checkpoints/fydel_small_lod_{ckpt_tag}.ckpt"))
+    } else if full_attn {
+        PathBuf::from("checkpoints/fydel_small_lod_full.ckpt")
     } else {
-        "checkpoints/fydel_small_lod.ckpt"
-    });
+        PathBuf::from("checkpoints/fydel_small_lod.ckpt")
+    };
     if let Some(p) = ckpt_path.parent() {
         let _ = std::fs::create_dir_all(p);
     }
@@ -120,7 +127,8 @@ fn main() {
     eprintln!("train/val split: {} / {} tokens", train_r.len(), val_r.len());
 
     // RESUME=0 forces a fresh run even if a checkpoint exists (default: resume).
-    let resume = std::env::var("RESUME").ok().as_deref() != Some("0");
+    // A CKPT_TAG'd run always starts fresh (see the CKPT_TAG comment above).
+    let resume = ckpt_tag.is_empty() && std::env::var("RESUME").ok().as_deref() != Some("0");
     let (mut model, mut opt, start_step) = if resume && ckpt_path.exists() {
         let (m, opt_state) = fydel::train::checkpoint::load(&ckpt_path)
             .expect("failed to load checkpoint for resume (set RESUME=0 to start fresh instead)");
@@ -133,7 +141,7 @@ fn main() {
         (m, opt, 0)
     };
 
-    let total_steps = 3000;
+    let total_steps: usize = std::env::var("TOTAL_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
     let train_cfg = TrainConfig {
         total_steps,
         micro_batches: 4,

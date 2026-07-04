@@ -480,35 +480,53 @@ impl Model {
         }
     }
 
+    /// Ablation switch for the "frozen dictionary, learn coefficients only"
+    /// experiment (Opus review + `bwd_block_avx2_hoisted_frozen`,
+    /// RESEARCH_LOG.md 2026-07-03/04): when `true`, the shared Monarch
+    /// dictionaries (`mono_d1`/`mono_d2`, `ffn_mono_d1`/`ffn_mono_d2`) never
+    /// receive an optimizer update, i.e. they stay at their random
+    /// initialization for the whole run — only the per-block coefficients
+    /// (`a1`/`a2`) keep learning. This tests the *quality* side of freezing
+    /// (does a fixed random dictionary hurt loss enough to matter) using the
+    /// existing, unmodified two-phase backward — `dd1`/`dd2` are still
+    /// computed as normal, just discarded here, so this doesn't touch or risk
+    /// the hot backward kernels at all. The *speed* side (skipping the
+    /// `dd1`/`dd2` accumulation itself) was already measured in isolation via
+    /// `bench_frozen_dict.rs` (~2x backward speedup) and is a separate,
+    /// not-yet-done follow-up if this quality test comes back favorable.
+    pub const FREEZE_DICT: bool = false;
+
     /// Apply one AdaFactor step to every parameter from a (possibly accumulated)
     /// gradient bundle. Each shared dictionary steps once from its model-level
     /// summed gradient; the per-layer copies are ignored.
     pub fn apply_grad(&mut self, g: &ModelGrads, st: &mut ModelOptState, af: &AdaFactor, lr: f32) {
         af.step(&mut self.embed, &g.d_embed, &mut st.embed, lr);
 
-        // Shared Monarch attention dictionary: d1 then d2 concatenated for the optimizer.
-        let n1 = self.mono_d1.len();
-        let mut mp = Vec::with_capacity(n1 + self.mono_d2.len());
-        mp.extend_from_slice(&self.mono_d1);
-        mp.extend_from_slice(&self.mono_d2);
-        let mut mdg = vec![0.0f32; mp.len()];
-        mdg[..g.d_mono_d1.len()].copy_from_slice(&g.d_mono_d1);
-        mdg[n1..n1 + g.d_mono_d2.len()].copy_from_slice(&g.d_mono_d2);
-        af.step(&mut mp, &mdg, &mut st.mono_dict, lr);
-        self.mono_d1.copy_from_slice(&mp[..n1]);
-        self.mono_d2.copy_from_slice(&mp[n1..]);
+        if !Self::FREEZE_DICT {
+            // Shared Monarch attention dictionary: d1 then d2 concatenated for the optimizer.
+            let n1 = self.mono_d1.len();
+            let mut mp = Vec::with_capacity(n1 + self.mono_d2.len());
+            mp.extend_from_slice(&self.mono_d1);
+            mp.extend_from_slice(&self.mono_d2);
+            let mut mdg = vec![0.0f32; mp.len()];
+            mdg[..g.d_mono_d1.len()].copy_from_slice(&g.d_mono_d1);
+            mdg[n1..n1 + g.d_mono_d2.len()].copy_from_slice(&g.d_mono_d2);
+            af.step(&mut mp, &mdg, &mut st.mono_dict, lr);
+            self.mono_d1.copy_from_slice(&mp[..n1]);
+            self.mono_d2.copy_from_slice(&mp[n1..]);
 
-        // Shared Monarch FFN dictionary, same scheme.
-        let fn1 = self.ffn_mono_d1.len();
-        let mut fmp = Vec::with_capacity(fn1 + self.ffn_mono_d2.len());
-        fmp.extend_from_slice(&self.ffn_mono_d1);
-        fmp.extend_from_slice(&self.ffn_mono_d2);
-        let mut fmdg = vec![0.0f32; fmp.len()];
-        fmdg[..g.d_ffn_mono_d1.len()].copy_from_slice(&g.d_ffn_mono_d1);
-        fmdg[fn1..fn1 + g.d_ffn_mono_d2.len()].copy_from_slice(&g.d_ffn_mono_d2);
-        af.step(&mut fmp, &fmdg, &mut st.ffn_mono_dict, lr);
-        self.ffn_mono_d1.copy_from_slice(&fmp[..fn1]);
-        self.ffn_mono_d2.copy_from_slice(&fmp[fn1..]);
+            // Shared Monarch FFN dictionary, same scheme.
+            let fn1 = self.ffn_mono_d1.len();
+            let mut fmp = Vec::with_capacity(fn1 + self.ffn_mono_d2.len());
+            fmp.extend_from_slice(&self.ffn_mono_d1);
+            fmp.extend_from_slice(&self.ffn_mono_d2);
+            let mut fmdg = vec![0.0f32; fmp.len()];
+            fmdg[..g.d_ffn_mono_d1.len()].copy_from_slice(&g.d_ffn_mono_d1);
+            fmdg[fn1..fn1 + g.d_ffn_mono_d2.len()].copy_from_slice(&g.d_ffn_mono_d2);
+            af.step(&mut fmp, &fmdg, &mut st.ffn_mono_dict, lr);
+            self.ffn_mono_d1.copy_from_slice(&fmp[..fn1]);
+            self.ffn_mono_d2.copy_from_slice(&fmp[fn1..]);
+        }
 
         af.step(&mut self.final_norm_gain, &g.d_final_norm_gain, &mut st.final_norm, lr);
         for (l, layer) in self.layers.iter_mut().enumerate() {
