@@ -1,0 +1,9 @@
+    Finished `release` profile [optimized] target(s) in 0.08s
+     Running `target/release/profile`
+profile: 96 layers, hidden 896, ffn 3072, vocab 32768, seq 256, 3 steps
+--- ms/step (mean over 3 steps) ---
+forward   11940.96  (23.8%)
+backward  37994.84  (75.7%)
+optimizer   278.73  ( 0.6%)
+total     50214.52
+wall      50277.77  (0.0 steps/s)
