@@ -95,6 +95,53 @@ pub fn tokenize(tok: &Tokenizer, text: &str) -> Result<Vec<u32>, String> {
     Ok(enc.get_ids().to_vec())
 }
 
+/// Train a small BPE tokenizer directly on `corpus_text` (rather than loading one
+/// pretrained on a much larger, generic vocabulary) -- right-sizes the vocab to
+/// the actual corpus, which matters here beyond just tokenizer quality: `vocab`
+/// directly drives the tied LM head's memory-bandwidth cost (it sweeps the full
+/// `[vocab, hidden]` embedding table every step -- see RESEARCH_LOG.md
+/// 2026-07-04/05), so a restricted-domain corpus (e.g. TinyStories' ~1,500-word
+/// lexicon) with a right-sized vocab (e.g. 8192, vs. GPT-2's 50257) is a real,
+/// free win, not just a tokenization-quality nicety.
+///
+/// Cached at `cache_path`: if a tokenizer already exists there, it's loaded
+/// as-is (retraining is not idempotent-cheap) rather than retrained.
+pub fn train_bpe_tokenizer(corpus_text: &str, vocab_size: usize, cache_path: &Path) -> Result<Tokenizer, String> {
+    if cache_path.exists() {
+        return Tokenizer::from_file(cache_path).map_err(|e| e.to_string());
+    }
+    use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
+    use tokenizers::models::TrainerWrapper;
+    use tokenizers::normalizers::NFC;
+    use tokenizers::pre_tokenizers::whitespace::Whitespace;
+
+    let mut tokenizer = Tokenizer::new(BPE::default());
+    tokenizer.with_normalizer(Some(NFC));
+    tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+
+    let mut trainer: TrainerWrapper = BpeTrainerBuilder::new()
+        .vocab_size(vocab_size)
+        .min_frequency(2)
+        .special_tokens(vec![tokenizers::AddedToken::from("<unk>", true)])
+        .build()
+        .into();
+
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // `train_from_files` needs on-disk files; write the corpus to a temp file
+    // beside the cache path instead of requiring the caller to have one.
+    let tmp_path = cache_path.with_extension("corpus.tmp.txt");
+    std::fs::write(&tmp_path, corpus_text).map_err(|e| e.to_string())?;
+    tokenizer
+        .train_from_files(&mut trainer, vec![tmp_path.to_string_lossy().to_string()])
+        .map_err(|e| e.to_string())?;
+    std::fs::remove_file(&tmp_path).ok();
+
+    tokenizer.save(cache_path, false).map_err(|e| e.to_string())?;
+    Ok(tokenizer)
+}
+
 /// Fetch a tokenizer + text dataset from the Hugging Face hub (cached under
 /// `cache_dir`), tokenize at most `max_chars` of the text, and return the tokenizer
 /// (its vocab size should drive `ModelConfig::vocab`) alongside a ready reader.
@@ -129,6 +176,33 @@ mod tests {
     use crate::train::optim::Optimizer;
     use crate::train::r#loop::{TrainConfig, train};
     use crate::train::schedule::WsdSchedule;
+
+    #[test]
+    fn train_bpe_tokenizer_produces_working_tokenizer() {
+        // A tiny repetitive corpus so BPE has something to merge, keeping the
+        // requested vocab_size well above what's actually reachable (BPE
+        // trainers cap out at base-alphabet + merges + specials, whichever
+        // is smaller) -- this specifically checks training + round-trip
+        // tokenization work, not that any particular vocab_size is hit.
+        let corpus = "the cat sat on the mat. the cat ran. the dog sat on the mat too.".repeat(50);
+        let dir = std::env::temp_dir().join(format!("fydel_tok_test_{}", std::process::id()));
+        let cache_path = dir.join("tokenizer.json");
+        let _ = std::fs::remove_file(&cache_path);
+
+        let tok = train_bpe_tokenizer(&corpus, 64, &cache_path).expect("training failed");
+        assert!(cache_path.exists(), "tokenizer should be cached to disk");
+        assert!(tok.get_vocab_size(true) > 0);
+
+        let ids = tokenize(&tok, "the cat sat").expect("tokenize failed");
+        assert!(!ids.is_empty());
+
+        // Loading again should hit the cache (no retrain) and produce the
+        // same vocab.
+        let tok2 = train_bpe_tokenizer(&corpus, 64, &cache_path).expect("cached load failed");
+        assert_eq!(tok.get_vocab_size(true), tok2.get_vocab_size(true));
+
+        std::fs::remove_file(&cache_path).ok();
+    }
 
     #[test]
     fn reader_yields_shifted_windows_and_wraps() {

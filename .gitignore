@@ -3,6 +3,7 @@
 *.swo
 .idea/
 .data-cache/
+cache/
 checkpoints/
 *.ckpt
 *.step
