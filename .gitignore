@@ -1,2 +1,13 @@
-amdon-cli/
 .venv/
+projects/amdon-cli/AmDon/appsettings.json
+projects/amdon-cli/AmDon/memory.json
+projects/amdon-cli/AmDon/bin/
+projects/amdon-cli/AmDon/obj/
+research/jumping-seedling/target/
+research/jumping-seedling/.data-cache/
+research/jumping-seedling/cache/
+research/jumping-seedling/checkpoints/
+research/jumping-seedling/checkpoint*.bin
+research/jumping-seedling/.idea/
+research/jumping-seedling/.claude/
+research/jumping-seedling/run.log
