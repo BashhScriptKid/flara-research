@@ -1799,6 +1799,35 @@ impl SharedMonarchMatmul {
         }
     }
 
+    /// Same math as [`backward_block_phase1`], but `eff1`/`eff2`/`x_blk`/`z`/
+    /// `dout_pp` are fake-quantized to int16 before use (fresh scale each
+    /// call — the per-token activations get a fresh scale every call as a
+    /// real per-token quantization would; `eff1`/`eff2` being re-quantized
+    /// every token here is a reference-path inefficiency, not a correctness
+    /// concern, since a real implementation would quantize the batch's fixed
+    /// weights once per step, not per token). `s1`/`s2` accumulate in fp32,
+    /// matching the accumulation scheme validated in
+    /// `src/bin/int16_backward_accum_probe.rs` (RESEARCH_LOG.md 2026-07-05):
+    /// per-token quantization noise does not compound across a batch when the
+    /// running sum itself stays fp32. Reference/parity path only.
+    #[allow(clippy::too_many_arguments)]
+    fn backward_block_phase1_int16(
+        eff1: &[f32], eff2: &[f32], x_blk: &[f32], z: &[f32], dout_pp: &[f32], dx_blk: &mut [f32],
+        m: usize, s1: &mut [f32], s2: &mut [f32],
+    ) {
+        let mut eff1_q = eff1.to_vec();
+        let mut eff2_q = eff2.to_vec();
+        let mut x_q = x_blk.to_vec();
+        let mut z_q = z.to_vec();
+        let mut dout_q = dout_pp.to_vec();
+        Self::fake_quant_i16(&mut eff1_q);
+        Self::fake_quant_i16(&mut eff2_q);
+        Self::fake_quant_i16(&mut x_q);
+        Self::fake_quant_i16(&mut z_q);
+        Self::fake_quant_i16(&mut dout_q);
+        Self::backward_block_phase1(&eff1_q, &eff2_q, &x_q, &z_q, &dout_q, dx_blk, m, s1, s2);
+    }
+
     /// Phase 2: contract one block's accumulated outer products (`s1`/`s2`,
     /// `m*b` each, from `backward_block_phase1` summed over the whole batch)
     /// with the dictionary — the `nd`-scaled work, now done once per block
@@ -2403,6 +2432,54 @@ mod tests {
         }
 
         assert!(max_err < 0.05, "gradcheck max_err={max_err:.2e} over {checked} params");
+    }
+
+    #[test]
+    fn backward_block_phase1_int16_does_not_compound_over_tokens() {
+        // Mirrors src/bin/int16_backward_accum_probe.rs but against the real
+        // production function: accumulate s1/s2 over an increasing number of
+        // tokens through the int16-fake-quant path and the fp32 path, and
+        // confirm relative error stays flat rather than growing with token
+        // count (the thing that would indicate compounding quantization bias).
+        let m = 8;
+        let b = m * m;
+        let eff1 = randvec(m * b, 0xA1A1);
+        let eff2 = randvec(m * b, 0xB2B2);
+
+        let mut prev_err: Option<f32> = None;
+        for &n_tokens in &[1usize, 16, 64, 256] {
+            let (mut s1_ref, mut s2_ref) = (vec![0.0f32; m * b], vec![0.0f32; m * b]);
+            let (mut s1_q, mut s2_q) = (vec![0.0f32; m * b], vec![0.0f32; m * b]);
+            for t in 0..n_tokens {
+                let seed = 0xC3C3u64.wrapping_add(t as u64 * 97);
+                let x_blk = randvec(m * m, seed);
+                let z = randvec(m * m, seed ^ 0x5555);
+                let dout = randvec(m * m, seed ^ 0xAAAA);
+                let mut dx_ref = vec![0.0f32; b];
+                let mut dx_q = vec![0.0f32; b];
+
+                SharedMonarchMatmul::backward_block_phase1(
+                    &eff1, &eff2, &x_blk, &z, &dout, &mut dx_ref, m, &mut s1_ref, &mut s2_ref,
+                );
+                SharedMonarchMatmul::backward_block_phase1_int16(
+                    &eff1, &eff2, &x_blk, &z, &dout, &mut dx_q, m, &mut s1_q, &mut s2_q,
+                );
+            }
+
+            let rel_err = {
+                let num: f32 = s1_ref.iter().zip(&s1_q).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+                let den: f32 = s1_ref.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-12);
+                num / den
+            };
+            assert!(rel_err < 1e-3, "n_tokens={n_tokens}: relative error too high: {rel_err:.2e}");
+            if let Some(prev) = prev_err {
+                assert!(
+                    rel_err < prev * 5.0,
+                    "error grew sharply from {prev:.2e} to {rel_err:.2e} as tokens increased — possible compounding bias"
+                );
+            }
+            prev_err = Some(rel_err);
+        }
     }
 
     #[test]
