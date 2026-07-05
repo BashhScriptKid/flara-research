@@ -1,0 +1,80 @@
+{
+  "nvidia/nv-embedqa-e5-v5": {
+    "ben_mean": 29.477,
+    "ben_std": 3.665,
+    "obf_mean": 23.113,
+    "obf_std": 6.992,
+    "separation": 6.364,
+    "auc": 0.865,
+    "best_f1": 0.821,
+    "best_threshold": 25.9,
+    "optimal_fpr": 0.032,
+    "optimal_tpr": 0.753,
+    "time": 535
+  },
+  "nvidia/llama-nemotron-embed-1b-v2": {
+    "ben_mean": -7.221,
+    "ben_std": 7.731,
+    "obf_mean": -0.715,
+    "obf_std": 5.031,
+    "separation": 6.507,
+    "auc": 0.802,
+    "best_f1": 0.428,
+    "best_threshold": 1.82,
+    "optimal_fpr": 0.899,
+    "optimal_tpr": 0.965,
+    "time": 687
+  },
+  "baai/bge-m3": {
+    "ben_mean": -54.598,
+    "ben_std": 6.709,
+    "obf_mean": -45.835,
+    "obf_std": 10.555,
+    "separation": 8.762,
+    "auc": 0.873,
+    "best_f1": 0.405,
+    "best_threshold": 0.0,
+    "optimal_fpr": 0.007,
+    "optimal_tpr": 0.017,
+    "time": 548
+  },
+  "nvidia/nv-embed-v1": {
+    "ben_mean": -4.343,
+    "ben_std": 9.132,
+    "obf_mean": -3.815,
+    "obf_std": 5.514,
+    "separation": 0.528,
+    "auc": 0.525,
+    "best_f1": 0.475,
+    "best_threshold": -0.69,
+    "optimal_fpr": 0.561,
+    "optimal_tpr": 0.808,
+    "time": 2628
+  },
+  "nvidia/nv-embedcode-7b-v1": {
+    "ben_mean": -8.457,
+    "ben_std": 15.628,
+    "obf_mean": -2.184,
+    "obf_std": 11.149,
+    "separation": 6.273,
+    "auc": 0.633,
+    "best_f1": 0.412,
+    "best_threshold": 27.26,
+    "optimal_fpr": 0.536,
+    "optimal_tpr": 0.585,
+    "time": 1785
+  },
+  "nvidia/llama-nemotron-embed-vl-1b-v2": {
+    "ben_mean": -3.818,
+    "ben_std": 7.127,
+    "obf_mean": -0.365,
+    "obf_std": 3.913,
+    "separation": 3.453,
+    "auc": 0.693,
+    "best_f1": 0.443,
+    "best_threshold": 2.15,
+    "optimal_fpr": 0.831,
+    "optimal_tpr": 0.962,
+    "time": 1024
+  }
+}

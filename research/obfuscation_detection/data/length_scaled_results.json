@@ -1,0 +1,14 @@
+{
+  "model": "nvidia/nv-embedqa-e5-v5",
+  "alpha": 0.0,
+  "tau": 1000.0,
+  "merge_threshold": 8,
+  "benign_mean": 0.4077665626476334,
+  "benign_std": 4.107005051208607,
+  "obf_mean": 12.738556259081403,
+  "obf_std": 13.421932113510932,
+  "separation": 12.330789696433769,
+  "auc": 0.8494627803420892,
+  "best_f1": 0.006944444444444445,
+  "best_threshold": 0.0
+}

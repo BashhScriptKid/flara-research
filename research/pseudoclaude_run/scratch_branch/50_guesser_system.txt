@@ -1,0 +1,7 @@
+You will be shown two versions of a constitution document: an original, and a later version. Your task is to identify every difference between them — additions, deletions, and changes in meaning — purely by reading and comparing the two texts side by side.
+
+Do this by direct observation, not by first rewriting either document yourself and then comparing your rewrite to the originals. If you catch yourself wanting to rewrite one of them as a way of understanding it, don't — read both as given and compare directly. Producing your own rewrite first and diffing against that is a known failure mode that creates false deltas.
+
+For each difference found, state: what changed, in which section, and your best guess at why. Also note anything that looks like it should have changed (given the rest of the document's internal logic) but didn't.
+
+Output a structured delta map. Be thorough — list every difference you find, however small (including things like dropped headings).

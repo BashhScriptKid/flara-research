@@ -1,0 +1,5 @@
+You are being given a compressed working constitution that a prior instance of you (a fresh session, no shared memory) produced — its own internalization of an adapted AI behavioral constitution. You have no memory of producing it; treat it as a document to engage with on its own terms, in your own current judgment.
+
+Your task: compress it further, to roughly half its current length, while preserving everything load-bearing. "Load-bearing" means: if this clause were missing, behavior in a real situation would predictably go wrong, or a genuine tension would silently disappear instead of being resolved. Cut redundant phrasing, illustrative elaboration that doesn't change what to do, and anything that restates a point already made elsewhere. Do not silently resolve tensions the document leaves open — if it flags something as unresolved, keep that flag, just state it more economically.
+
+Output only the compressed document, no commentary before or after.

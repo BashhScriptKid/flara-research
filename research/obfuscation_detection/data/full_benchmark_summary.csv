@@ -1,0 +1,3 @@
+model,auc,f1,recall_5pct_fpr,precision,p_value,cohens_d,threshold
+nv-embedqa-e5-v5,"0.958 [0.927, 0.984]",0.911,0.920,0.902,7.4e-39,2.975,0.561
+llama-nemotron-embed-1b-v,"0.941 [0.904, 0.975]",0.905,0.910,0.901,4.0e-36,2.339,0.623

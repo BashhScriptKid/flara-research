@@ -1,0 +1,7 @@
+Model,AUC-ROC,|Separation|,Direction,Threshold,Recall@5%FPR,F1
+nv-embed-v1,0.802,0.560,obf < ben,0.995,0.140,0.456
+nv-embedqa-e5-v5,0.740,0.148,obf < ben,0.642,0.050,0.494
+bge-m3,0.695,0.354,obf < ben,1.022,0.110,0.470
+llama-nemotron-embed-1b-v2,0.676,0.141,obf < ben,0.922,0.040,0.496
+nv-embedcode-7b-v1,0.652,0.134,obf < ben,0.021,0.530,0.272
+llama-nemotron-embed-vl-1b-v2,0.627,0.066,obf < ben,0.001,0.550,0.269

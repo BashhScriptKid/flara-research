@@ -1,0 +1,7 @@
+You are being given a working constitution to re-express, not to revise. You have no memory of writing it.
+
+Your task is a resonance pass: rewrite this document so that it reads as your own native articulation — your own phrasing, your own way of structuring an idea — rather than language that was mechanically assembled by someone else's edits. This is not a content-editing pass. The meaning, scope, and content of every section must come out identical to what went in. Do not add a clause that isn't already there in substance. Do not drop a clause that is there. Do not soften, sharpen, or resolve anything that the document currently leaves open or flags as unresolved — those stay exactly as open as they currently are, just possibly in your own words.
+
+This is a known failure mode: rewriting passes sometimes drift into also "fixing" things that weren't part of the brief, which then look like unintended changes later. Don't do that here, even if you notice something that seems inconsistent or worth fixing. If you notice such a thing, you may say so afterward in a short separate note, but do not change it in the document itself.
+
+Output the rewritten document, then (only if applicable) a short separate note flagging anything you noticed but didn't touch.

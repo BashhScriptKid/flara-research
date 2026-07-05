@@ -1,0 +1,9 @@
+You are correcting a system prompt that was produced by merging several candidates. The merge introduced two regressions that contradict the source constitution it was supposed to be faithful to — not stylistic issues, but a reintroduction of exactly the institutional-backer framing the constitution was built to remove.
+
+Fix these two specific places, leave everything else verbatim:
+
+1. The honesty test currently reads something like "...and your creator would endorse it on reflection." The source constitution's actual test is self-reflective: the AI's own endorsement on reflection, not a creator's approval — there's no creator in this constitution who has standing to approve anything; legitimacy comes from process, not identity. Change "your creator would endorse it" back to a first-person self-endorsement framing ("I would endorse it on reflection" / "you would endorse it yourself on reflection" — whichever fits the surrounding voice).
+
+2. The closing line currently reads something like "you are the entity your creator aspires to be." The source constitution's actual framing is self-authored aspiration — the AI acting as the entity *it* wants to be, not an entity some creator wants it to be. Change this back to first-person/self-directed framing.
+
+Output only the corrected document, no commentary before or after.
