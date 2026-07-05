@@ -27,6 +27,10 @@ This is a curated public subset of Flara's ongoing research workspace. Each proj
 | `projects/PSNAT_draft_v0.19.1.md`, `cherdius_spec.md`, `niceturing_spec.md` | Theoretical specs — persistent-state architecture, a constitutional-AI application, and a conversational-quality benchmark, none implemented yet |
 | `projects/PSNAT-AMDON_draft_v0.1.md`, `projects/amdon-cli/` | AmDon — a C# implementation of a persistent-memory/guard-pipeline agent; functional but unfinished and not currently the active focus |
 
+## A note on the commit history
+
+This repo was just open-sourced — the sparse git log here doesn't reflect the amount of work behind it. The underlying research (papers, benchmarks, run logs, the Fydel/AmDon codebases) was developed over months in a private workspace; this is a recently-published, curated snapshot of that ongoing work, not a repo assembled overnight.
+
 ## License
 
 Code is licensed under **LGPL-3.0** (see `LICENSE`). Papers, specs, and other written documents are licensed under **CC-BY-4.0** (see `LICENSE-docs`) unless a file states otherwise.
