@@ -13,7 +13,26 @@
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+use std::sync::OnceLock;
 use crate::kernels::gemm;
+
+// ---------------------------------------------------------------------------
+// Runtime int16 quantization flag (INT16_MATMUL=1 env var)
+// ---------------------------------------------------------------------------
+static INT16_MATMUL: OnceLock<bool> = OnceLock::new();
+
+fn is_int16_matmul_enabled() -> bool {
+    *INT16_MATMUL.get_or_init(|| {
+        std::env::var("INT16_MATMUL").ok().as_deref() == Some("1")
+    })
+}
+
+pub fn init_int16_matmul_flag() {
+    // Explicitly initialize the flag (optional — it will auto-initialize on first use).
+    let _ = INT16_MATMUL.get_or_init(|| {
+        std::env::var("INT16_MATMUL").ok().as_deref() == Some("1")
+    });
+}
 
 // ---------------------------------------------------------------------------
 // AVX2 kernels (m=8 specialisation)
@@ -855,11 +874,19 @@ impl SharedMonarchProj {
                 let ypp = &mut y_t[pp * b..(pp + 1) * b];
                 for qq in 0..q {
                     let idx = pp * q + qq;
-                    SharedMonarchMatmul::apply_block(
-                        &eff1_all[idx * m * b..(idx + 1) * m * b],
-                        &eff2_all[idx * m * b..(idx + 1) * m * b],
-                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
-                    );
+                    if is_int16_matmul_enabled() {
+                        SharedMonarchMatmul::apply_block_int16(
+                            &eff1_all[idx * m * b..(idx + 1) * m * b],
+                            &eff2_all[idx * m * b..(idx + 1) * m * b],
+                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                        );
+                    } else {
+                        SharedMonarchMatmul::apply_block(
+                            &eff1_all[idx * m * b..(idx + 1) * m * b],
+                            &eff2_all[idx * m * b..(idx + 1) * m * b],
+                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                        );
+                    }
                     let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
                 }
@@ -926,7 +953,11 @@ impl SharedMonarchProj {
                         let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
                         let s1_blk = &mut s1[idx * m * b..(idx + 1) * m * b];
                         let s2_blk = &mut s2[idx * m * b..(idx + 1) * m * b];
-                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        if is_int16_matmul_enabled() {
+                            SharedMonarchMatmul::backward_block_phase1_int16(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        } else {
+                            SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        }
                     }
                 }
             }
@@ -1239,10 +1270,17 @@ impl SharedMonarchProj {
                 let ypp = &mut y_t[pp * b..(pp + 1) * b];
                 for qq in 0..q {
                     let idx = pp * q + qq;
-                    SharedMonarchMatmul::apply_block(
-                        &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
-                    );
+                    if is_int16_matmul_enabled() {
+                        SharedMonarchMatmul::apply_block_int16(
+                            &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
+                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                        );
+                    } else {
+                        SharedMonarchMatmul::apply_block(
+                            &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
+                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                        );
+                    }
                     let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
                 }
@@ -1286,10 +1324,17 @@ impl SharedMonarchProj {
                 for &qq in &active_q[t] {
                     debug_assert!(qq < q, "active col-block {qq} out of range");
                     let idx = pp * q + qq;
-                    SharedMonarchMatmul::apply_block(
-                        &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
-                    );
+                    if is_int16_matmul_enabled() {
+                        SharedMonarchMatmul::apply_block_int16(
+                            &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
+                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                        );
+                    } else {
+                        SharedMonarchMatmul::apply_block(
+                            &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
+                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                        );
+                    }
                     let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
                 }
@@ -1344,7 +1389,11 @@ impl SharedMonarchProj {
                         let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
                         let s1_blk = &mut s1[idx * m * b..(idx + 1) * m * b];
                         let s2_blk = &mut s2[idx * m * b..(idx + 1) * m * b];
-                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        if is_int16_matmul_enabled() {
+                            SharedMonarchMatmul::backward_block_phase1_int16(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        } else {
+                            SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        }
                     }
                 }
             }
@@ -1417,7 +1466,11 @@ impl SharedMonarchProj {
                         let dx_blk = &mut dx_out[(t - t0) * in_dim + qq * b..(t - t0) * in_dim + (qq + 1) * b];
                         let s1_blk = &mut s1[idx * m * b..(idx + 1) * m * b];
                         let s2_blk = &mut s2[idx * m * b..(idx + 1) * m * b];
-                        SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        if is_int16_matmul_enabled() {
+                            SharedMonarchMatmul::backward_block_phase1_int16(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        } else {
+                            SharedMonarchMatmul::backward_block_phase1(eff1, eff2, x_blk, &z_f32, dout_pp, dx_blk, m, s1_blk, s2_blk);
+                        }
                     }
                 }
             }

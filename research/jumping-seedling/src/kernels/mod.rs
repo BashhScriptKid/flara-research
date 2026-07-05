@@ -13,3 +13,5 @@ pub mod probe;
 pub mod profiling;
 pub mod rope;
 pub mod scratch;
+
+pub use monarch::init_int16_matmul_flag;
