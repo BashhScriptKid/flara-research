@@ -3593,3 +3593,67 @@ for no bandwidth benefit at all. Not merged to `master` — remains an
 experimental branch pending a decision on whether an 8-9% throughput
 win is worth the added `half`-crate dependency and fp16-conversion
 surface area across the codebase permanently.
+
+---
+
+## 2026-07-05 — `feat/int16-quant`: true-int16 optimizer state falsified, deferred
+
+Explored pushing further than fp16 — full int16 (SIMD-width motivated:
+`i16×i16→i32` AVX2 accumulation is 16-wide vs. fp32's 8-wide) across
+weights, activations, gradients, and optimizer state, with quantization-
+aware training (fake-quant forward, straight-through backward). Before
+touching the real 17K-line codebase, built two standalone falsification
+probes (`src/bin/fixedpoint_adam_probe.rs`,
+`src/bin/fixedpoint_adafactor_probe.rs`) to test the riskiest piece —
+int16 optimizer state — on a synthetic quadratic-bowl problem, per the
+project's usual practice of proving a numerical scheme cheaply before
+wiring it into production code.
+
+**Design tested:** dynamic block fixed-point — int16 storage + a shared
+power-of-two scale per tensor/vector, recalibrated from the observed max
+magnitude every 8 steps (mirrors dynamic loss-scaling, applied per-tensor
+instead of just to the loss).
+
+**First probe (plain Adam, wrong optimizer — see below):** catastrophic
+divergence. Root cause: Adam's second moment `v` is intentionally
+*per-parameter* — it's what gives each parameter its own effective
+learning rate. A single shared scale across a tensor whose per-parameter
+gradient magnitude spans orders of magnitude (realistic — different
+rows/channels of a real weight matrix see different gradient statistics)
+forces the smallest-magnitude entries to quantize to exactly zero
+(measured: ~55-98% of low-curvature parameters' `v` dead by step 100).
+Once `v_i = 0`, Adam's denominator collapses to `eps` (1e-8), amplifying
+that parameter's update by ~1e8x — not noise, a structural blowup.
+
+**Correction:** the actual optimizer in this codebase is AdaFactor
+(`src/kernels/optimizer.rs`), not Adam — factored row/column second-moment
+sums (`O(rows+cols)` state) instead of full per-parameter `v`
+(`O(rows·cols)`), plus a global RMS-clip on the update. Re-ran the same
+falsification against AdaFactor's real update math (mirrored from
+`optimizer.rs::step`) on a matrix problem with per-row/per-column
+curvature spread.
+
+**Second probe (real AdaFactor):** same underlying cause (shared scale
+can't span the row/column factors' dynamic range — measured ~31%/50% of
+`R`/`C` quantized to zero), but a *different* failure signature:
+stagnation, not explosion. When `C[j] = 0` zeroes an entire column's
+`vhat`, that column's update spikes toward infinity, and AdaFactor's
+**global** RMS-clip divides the *whole tensor's* update — including every
+healthy parameter — down to compensate. One dead factor entry silently
+throttles the entire tensor's effective learning rate; the loss curve
+still trends downward, just glacially, which is a harder failure to
+notice by eye than a divergence. Factoring shrinks the *state size* but
+not the *dynamic-range problem* that breaks single-scale int16 storage.
+
+**Decision, backed by the existing profiler data (2026-07-03 entry,
+above): the AdaFactor step is ~1% of a training step**, so even a working
+int16 optimizer-state scheme would optimize a cost center that isn't one.
+Deferred at best — not worth the precision risk just demonstrated twice.
+Any future int16 work on this branch should target the matmul/kernel path
+instead (Monarch backward alone is ~72% of backward, ~half the whole
+step — the actual FLOPs and the only place the int16 SIMD width
+advantage would matter), keeping weights' master copy, gradients, and
+AdaFactor's `R`/`C`/`mom` state in fp32.
+
+**Status:** `feat/int16-quant` branch open with both probes committed as
+a record. No changes to `master`/production code paths.
