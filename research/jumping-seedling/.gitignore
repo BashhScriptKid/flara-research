@@ -1,0 +1,10 @@
+/target
+*.swp
+*.swo
+.idea/
+.data-cache/
+cache/
+checkpoints/
+*.ckpt
+*.step
+checkpoint*.bin
