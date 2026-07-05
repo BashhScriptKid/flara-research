@@ -1627,6 +1627,41 @@ impl SharedMonarchMatmul {
         }
     }
 
+    /// Symmetric per-call int16 fake-quant: round-trip through int16 with a
+    /// scale fresh from this call's own max magnitude (never carried across
+    /// calls). Falsified in isolation first — see RESEARCH_LOG.md 2026-07-05,
+    /// `src/bin/int16_matmul_probe.rs` / `int16_backward_accum_probe.rs` —
+    /// before landing here: relative error ~1e-5 typical, ~1e-3 worst-case
+    /// under injected heavy-tail outliers, and does not compound when
+    /// accumulated across a batch of tokens.
+    fn fake_quant_i16(values: &mut [f32]) {
+        let max_abs = values.iter().fold(1e-12f32, |m, &v| m.max(v.abs()));
+        let scale = max_abs / 32767.0;
+        for v in values.iter_mut() {
+            let q = (*v / scale).round().clamp(i16::MIN as f32, i16::MAX as f32);
+            *v = q * scale;
+        }
+    }
+
+    /// Same math as [`apply_block`], but `eff1`/`eff2`/`x_blk` are fake-quantized
+    /// to int16 before the matmuls (weights and activations both), simulating
+    /// the precision of an int16 SIMD implementation without requiring one.
+    /// Reference/parity path only for now — not wired into the model's real
+    /// forward pass — see `apply_block_int16_matches_fp32` for the accuracy
+    /// bound this is expected to hold.
+    pub fn apply_block_int16(
+        eff1: &[f32], eff2: &[f32], x_blk: &[f32], m: usize,
+        y1: &mut [f32], z: &mut [f32], out: &mut [f32],
+    ) {
+        let mut eff1_q = eff1.to_vec();
+        let mut eff2_q = eff2.to_vec();
+        let mut x_q = x_blk.to_vec();
+        Self::fake_quant_i16(&mut eff1_q);
+        Self::fake_quant_i16(&mut eff2_q);
+        Self::fake_quant_i16(&mut x_q);
+        Self::apply_block(&eff1_q, &eff2_q, &x_q, m, y1, z, out);
+    }
+
     /// VJP for one `(pp,qq,token)` triple against an already-expanded block.
     /// `da_base`/`g_da1`/`g_da2` follow `backward_block`'s convention (full
     /// model-wide `da1`/`da2` slices, indexed at this block's offset);
@@ -2368,6 +2403,30 @@ mod tests {
         }
 
         assert!(max_err < 0.05, "gradcheck max_err={max_err:.2e} over {checked} params");
+    }
+
+    #[test]
+    fn apply_block_int16_matches_fp32() {
+        let m = 8;
+        let b = m * m;
+        let eff1 = randvec(m * b, 0x7070);
+        let eff2 = randvec(m * b, 0x8080);
+        let x_blk = randvec(m * m, 0x9090);
+
+        let (mut y1, mut z, mut out): (Vec<f32>, Vec<f32>, Vec<f32>) =
+            (vec![0.0; m * m], vec![0.0; m * m], vec![0.0; m * m]);
+        SharedMonarchMatmul::apply_block(&eff1, &eff2, &x_blk, m, &mut y1, &mut z, &mut out);
+
+        let (mut y1_q, mut z_q, mut out_q): (Vec<f32>, Vec<f32>, Vec<f32>) =
+            (vec![0.0; m * m], vec![0.0; m * m], vec![0.0; m * m]);
+        SharedMonarchMatmul::apply_block_int16(&eff1, &eff2, &x_blk, m, &mut y1_q, &mut z_q, &mut out_q);
+
+        let rel_err = {
+            let num: f32 = out.iter().zip(&out_q).map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+            let den: f32 = out.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-12);
+            num / den
+        };
+        assert!(rel_err < 1e-3, "int16 fake-quant apply_block relative error too high: {rel_err:.2e}");
     }
 
     #[test]
