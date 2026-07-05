@@ -16,12 +16,13 @@ This is a curated public subset of Flara's ongoing research workspace. Each proj
 
 | Folder | What it is |
 |---|---|
+| `releases/` | Finished papers, pulled out of their working folders — the actual public-facing output |
 | `docs/` | Flara's identity and constitution documents |
-| `research/obfuscation_detection/` | Benchmarked detection of obfuscated/adversarial prompts via embedding-space analysis |
-| `research/delta_angle_general/` | General write-up of the delta-angle security approach used across Flara's detection work |
+| `research/obfuscation_detection/` | Benchmarked detection of obfuscated/adversarial prompts via embedding-space analysis (paper in `releases/`) |
+| `research/delta_angle_general/` | General write-up of the delta-angle security approach used across Flara's detection work (paper in `releases/`) |
 | `research/decoupled_guard/` | Separating "guard" and "servant" roles in a single model — benchmarked, experimental, not the current focus |
 | `research/annotation_over_blocking/` | Research on annotating risky input rather than blocking it outright |
-| `research/PseudoClaude_Paper.md`, `research/pseudoclaude_run/` | Testing whether constitutional AI behavior is portable to a non-Anthropic base model, with real run transcripts |
+| `research/pseudoclaude_run/` | Testing whether constitutional AI behavior is portable to a non-Anthropic base model, with real run transcripts (paper in `releases/`) |
 | `research/jumping-seedling/` | Fydel — a 1B-parameter, CPU-native transformer built for training on consumer hardware |
 | `projects/PSNAT_draft_v0.19.1.md`, `cherdius_spec.md`, `niceturing_spec.md` | Theoretical specs — persistent-state architecture, a constitutional-AI application, and a conversational-quality benchmark, none implemented yet |
 | `projects/PSNAT-AMDON_draft_v0.1.md`, `projects/amdon-cli/` | AmDon — a C# implementation of a persistent-memory/guard-pipeline agent; functional but unfinished and not currently the active focus |

@@ -2,7 +2,7 @@
 
 **Bashh Dazer**  
 Independent Researcher — Cherdius Project  
-*Draft v0.1 — Work in Progress*
+*v0.1*
 
 ---
 

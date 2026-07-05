@@ -78,7 +78,7 @@ Result: +2 TP, 0 new FP, SC AUC +1.25pp. Complementary to enhanced KW (zero over
 - `graphs/final/obf_analysis/` — 9 obfuscation analysis figures
 
 ### Paper
-- `Delta_Angle_Obfuscation_Paper.md` — Research paper
+- Paper moved to `../../releases/Delta_Angle_Obfuscation_Paper.md`
 - `../HANDOFF_DOCUMENT.md` — Research handoff for paper writer
 - `../HANDOFF_VALIDATION.md` — Held-out validation results
 
