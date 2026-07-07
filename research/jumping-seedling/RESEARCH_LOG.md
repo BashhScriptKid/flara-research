@@ -3754,3 +3754,55 @@ numerics, a working opt-in flag with confirmed zero-regression default
 behavior, and a corrected (real, ~15%, primitive-level only) SIMD
 finding. No full kernel rewrite attempted yet; no changes to
 `master`/production code paths.
+
+---
+
+## 2026-07-07 — `feat/int16-quant`: the ~15% ALU win understated the opportunity by ~20x
+
+Fable's write-up flagged two levers the dual-pack ALU spike didn't
+test: memory bandwidth (int16 halves weight storage) and pack
+amortization (every probe so far repacked weights on every call, when
+real weights are fixed for a whole step and reused across many tokens).
+Built `src/bin/int16_bandwidth_pack_probe.rs` to isolate both, at a
+weight-set size (65536 block-pairs, 4MiB fp32 / 2MiB int16) deliberately
+chosen to exceed L1/L2 rather than the prior spike's tiny
+all-in-cache shape, swept 64x to simulate per-step token reuse.
+
+**Results (consistent across repeated runs, ~3-3.4x / ~42-46%):**
+- **(a) bandwidth effect** (fp32 vs. int16-pre-packed-once, packing cost
+  excluded from both): int16 storage is **~3x faster** once the working
+  set is large enough to leave cache — the halved memory traffic
+  dominates once actual DRAM/L3 bandwidth is in play, unlike the
+  previous spike's all-in-cache shape where it couldn't show up at all.
+- **(b) pack-amortization effect**: repacking on every token call (what
+  every prior probe in this arc actually did, including the initial
+  dual-pack spike) costs **~42-46% of int16's own runtime** — pure
+  overhead that disappears entirely if weights are packed once per step
+  and reused across the batch, since real weights don't change
+  per-token.
+
+**Why this matters more than the ~15% figure suggests:** the earlier
+ALU-only finding was measured in exactly the regime that suppresses
+both of these effects (tiny working set, repack every call) — it wasn't
+wrong, but it was answering a narrower question than "is a real int16
+kernel worth building." Combined, these three findings (correct
+shuffle-based reduction ~15%, bandwidth ~3x, amortized packing ~1.4-1.9x
+recovered) point at one coherent kernel design rather than three
+separate, individually-marginal patches: store `eff1`/`eff2` (and the
+shared `d1`/`d2` dictionaries) as int16, pre-pack the dual-block layout
+once per step before the token loop (not per token), and use the
+shuffle/add reduction instead of `hadd`. Tested independently in
+isolation, none of these alone obviously justifies the engineering risk
+of rewriting `apply_block_avx2`/`bwd_block_avx2_hoisted`; aggregated,
+the case is substantially stronger.
+
+**Still not tested:** all three levers on the *real* kernel shapes
+(`apply_block_avx2`'s full 8x8-block-times-vector matmul, not just the
+one-dot-product-pair primitive; `bwd_block_avx2_hoisted`'s da/dd
+accumulation) rather than the isolated dot-product primitive used here
+and in the prior spike. That's the next step before committing to a
+rewrite of the production kernels.
+
+**Status:** three probes now support a combined kernel-rewrite design
+(int16 storage + amortized packing + shuffle-based reduction). No
+production kernel code touched yet.
