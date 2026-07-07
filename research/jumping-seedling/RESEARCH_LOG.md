@@ -3657,3 +3657,100 @@ AdaFactor's `R`/`C`/`mom` state in fp32.
 
 **Status:** `feat/int16-quant` branch open with both probes committed as
 a record. No changes to `master`/production code paths.
+
+---
+
+## 2026-07-06/07 — `feat/int16-quant`: matmul-side fake-quant validated, real SIMD win found only after a false start
+
+Followed the deferred optimizer-state finding's own recommendation:
+tested int16 on the matmul/kernel path instead, where the actual FLOPs
+live.
+
+**Numerics (validated, held up on re-check):** two more standalone
+probes (`src/bin/int16_matmul_probe.rs`, `int16_backward_accum_probe.rs`)
+confirmed int16 fake-quant (fresh per-call scale, no state carried across
+calls — the opposite shape of the optimizer-state failures) is accurate
+on the real hot path: relative error ~1e-5 typical on `apply_block`'s
+8x8 blocks (~1e-3 worst-case under injected heavy-tail outliers), and
+does not compound when accumulated over 1-2048 tokens in
+`backward_block_phase1`'s batched outer-product accumulation. Landed as
+parity-tested reference variants in `src/kernels/monarch.rs`
+(`apply_block_int16`, `backward_block_phase1_int16`, 109/109 lib tests
+passing), then wired behind an `INT16_MATMUL=1` env flag at all 6 real
+call sites (forward/backward × batch/rows/cols), default off, zero
+regression confirmed on the default path.
+
+**Throughput claim, first pass — wrong, and worth recording why:** an
+initial delegated benchmark (`layer_bench`) reported the flag as ~7-11%
+*faster*. This did not survive direct re-verification: re-running the
+identical `layer_bench` command myself, and separately running the
+full-training-loop `profile` binary (`TRAIN_SMALL_LOD=1 SEQ=256`), both
+showed the flag ~30% **slower**, consistently. The mechanism, obvious in
+hindsight: `apply_block_int16`/`backward_block_phase1_int16` are
+fake-quant *reference* implementations — they quantize to int16,
+immediately dequantize back to fp32, and call the exact same fp32
+kernel underneath. There is no real int16 SIMD arithmetic in that path;
+it is the original fp32 compute plus a full quantize/dequantize
+round-trip layered on top, which can only add overhead. The lesson:
+verify a throughput claim against the actual mechanism before repeating
+it — a fake-quant numerics probe was never capable of demonstrating a
+real speedup, and the "faster" number should have been caught as
+implausible on inspection rather than after independent re-measurement.
+
+**Whether real int16 SIMD is even structurally possible here — first
+answer wrong too:** the production fp32 kernel already uses `M=8` block
+size, which exactly fills a 256-bit AVX2 float register (`matvec8`,
+`src/kernels/monarch.rs:66-78`) — already maximally width-matched, no
+wasted lanes. int16 registers hold 16 lanes, so real advantage requires
+restructuring to process two blocks at once (dual-packing), not a dtype
+swap. A time-boxed standalone microbenchmark
+(`src/bin/int16_dualblock_spike.rs`) testing exactly this — pack two
+independent 8-element dot products into one 16-lane int16 register,
+reduce with `_mm256_madd_epi16` — came back **30% slower** than doing
+two ordinary fp32 8-wide dot products, and was initially written up as
+closing the door on this approach.
+
+That first verdict was also wrong, caught by asking "is this a real
+limit or an implementation quirk" rather than accepting the first
+number. Second-opinion investigation (Fable) found the packing step
+(stack-staging into `[i16;16]` before loading) was already free — the
+compiler elides it to a direct `vinserti128` either way — but the
+*reduction* step was the real cost: the original code extracted the
+`madd` result's two 128-bit halves before reducing, then ran four
+separate 128-bit `_mm_hadd_epi32` calls (~8 uops of pure reduction
+competing for shuffle ports), instead of mirroring `matvec8`'s own
+pattern of reducing on the full 256-bit register first
+(`_mm256_hadd_epi32`, which reduces both packed blocks in parallel
+since they occupy separate 128-bit lanes) and extracting to scalar only
+at the very end. Fixing just that closes the entire 30% gap to parity;
+replacing `hadd` (2-uop, shuffle-port-bound) with in-lane
+`_mm256_shuffle_epi32`+`_mm256_add_epi32` (1-uop, wider port choice)
+turns it into a genuine **~15% win** at the primitive level. Verified
+independently (re-ran the corrected benchmark myself, matched Fable's
+numbers within measurement noise).
+
+**Where this actually leaves the rewrite decision:** ~15% is real but
+far short of the naive "2x from double the lanes" expectation, because
+at this tiny 8-element shape both paths are bound by loads and
+horizontal reduction, not multiplies — halving the multiply count barely
+moves the needle. The larger, still-unrealized opportunity is on the
+bandwidth side: storing weights as int16 to halve the memory footprint
+of the (cache-resident but still real) 8x8 blocks, and amortizing the
+pack/insert cost by pre-packing weights once per step across the many
+tokens that reuse them, rather than repacking per call as every probe
+so far has done. Neither has been attempted yet.
+
+**Process note, stated plainly because it happened twice in one arc:**
+both the throughput regression and the "dead end" verdict were wrong on
+first pass, and both were caught only because they were re-checked
+rather than accepted — one via direct re-measurement, one via
+explicitly asking whether a bad number reflected a real limit or a
+fixable implementation choice. Worth treating a suspiciously convenient
+*or* suspiciously bad performance number the same way: as a claim to
+verify against the actual mechanism, not a result to relay.
+
+**Status:** `feat/int16-quant` branch has validated matmul-side int16
+numerics, a working opt-in flag with confirmed zero-regression default
+behavior, and a corrected (real, ~15%, primitive-level only) SIMD
+finding. No full kernel rewrite attempted yet; no changes to
+`master`/production code paths.
