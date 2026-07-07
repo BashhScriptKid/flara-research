@@ -987,6 +987,12 @@ impl SharedMonarchProj {
         &self, d1: &[f32], d2: &[f32], x: &[f32], cache: FwdCache, dout: &[f32], dx: &mut [f32], n_tokens: usize,
         pool: &mut crate::kernels::scratch::BufPool,
     ) -> Grads {
+        // Real int16 dual-token path (m == 8 only, same gate as forward's) —
+        // everything below this dispatch is the fp32 default plus the
+        // fake-quant reference for the flag-on m != 8 case.
+        if is_int16_matmul_enabled() && self.m == 8 {
+            return self.backward_batch_i16(d1, d2, x, cache, dout, dx, n_tokens, pool);
+        }
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let in_dim = q * b;
@@ -1052,6 +1058,141 @@ impl SharedMonarchProj {
         let mut s1_all = vec![0.0f32; p * q * m * b];
         let mut s2_all = vec![0.0f32; p * q * m * b];
         for (s1, s2, dx_chunk, t0, t1) in results {
+            // A trailing chunk can be empty (t0 >= t1) when chunk_len does
+            // not divide n_tokens evenly across n_chunks — an inverted slice
+            // range here would panic (latent in the fp32 paths too, exposed
+            // by the int16 parity tests at n_tokens = 37 on 12 threads).
+            if t0 >= t1 { continue; }
+            for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
+            dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
+        }
+        pool.give_f16(zs);
+        SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
+    }
+
+    /// Real int16 dual-token backward for the non-routed batch path (m == 8
+    /// only — the caller `backward_batch` checks). Same two-phase structure
+    /// and identical parallel chunking as `backward_batch`; phase 1 pairs
+    /// consecutive tokens within each thread's range and runs
+    /// `backward_block_dual_token_int16` per `(pair, pp, qq)`. An odd
+    /// trailing token in a range self-pairs with a ZERO `dout1` lane (exact
+    /// no-op contribution — see the kernel doc), so `s1`/`s2` never
+    /// double-count. Weights are transposed per sub-block + quantized ONCE
+    /// per call (backward contracts against `eff^T`), amortized across the
+    /// batch like forward's once-per-call weight quantization; `dout_pp` is
+    /// quantized once per `(pair, pp)` and reused across all `qq`; `x`/`z`
+    /// are never quantized (only the fp32 outer products consume them).
+    fn backward_batch_i16(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], cache: FwdCache, dout: &[f32], dx: &mut [f32], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
+    ) -> Grads {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        debug_assert_eq!(b, 64, "backward_batch_i16 requires m == 8");
+        let in_dim = q * b;
+        let out_dim = p * b;
+        dx.iter_mut().for_each(|v| *v = 0.0);
+        let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+        let (eff1t_i16, eff1_scale, eff2t_i16, eff2_scale) = {
+            let _t = crate::kernels::profiling::Timer::start(&crate::kernels::profiling::I16_BWD_WQUANT);
+            let e1t = transpose_subblocks_8x8(&eff1_all);
+            let e2t = transpose_subblocks_8x8(&eff2_all);
+            let (e1, s1) = SharedMonarchMatmul::quantize_i16(&e1t);
+            let (e2, s2) = SharedMonarchMatmul::quantize_i16(&e2t);
+            (e1, s1, e2, s2)
+        };
+        drop(eff1_all);
+        drop(eff2_all);
+        let FwdCache { zs } = cache;
+
+        let run_range = |t0: usize, t1: usize, s1: &mut [f32], s2: &mut [f32], dx_out: &mut [f32]| {
+            let (mut z0, mut z1) = ([0.0f32; 64], [0.0f32; 64]);
+            let zero_f = [0.0f32; 64];
+            let zero_q = [0i16; 64];
+            // Discarded zero-lane dx row for an odd trailing token (must span
+            // a full row: it's indexed at qq*b like a real dx row). Allocated
+            // once per range, not per token.
+            let mut dx_scratch = vec![0.0f32; in_dim];
+            let mut t = t0;
+            while t < t1 {
+                let paired = t + 1 < t1;
+                let tb = if paired { t + 1 } else { t };
+                // Two disjoint mutable dx rows (or scratch for the zero lane).
+                let (dx0_row, dx1_row): (&mut [f32], &mut [f32]) = if paired {
+                    let (lo, hi) = dx_out.split_at_mut((tb - t0) * in_dim);
+                    (&mut lo[(t - t0) * in_dim..], &mut hi[..in_dim])
+                } else {
+                    (&mut dx_out[(t - t0) * in_dim..(t - t0 + 1) * in_dim], &mut dx_scratch[..])
+                };
+                for pp in 0..p {
+                    let dout0_f = &dout[t * out_dim + pp * b..t * out_dim + (pp + 1) * b];
+                    let (dout0_q, dout0_s) = SharedMonarchMatmul::quantize_i16_64(dout0_f);
+                    let (dout1_f, dout1_q, dout1_s) = if paired {
+                        let df = &dout[tb * out_dim + pp * b..tb * out_dim + (pp + 1) * b];
+                        let (dq, ds) = SharedMonarchMatmul::quantize_i16_64(df);
+                        (df, dq, ds)
+                    } else {
+                        (&zero_f[..], zero_q, 0.0f32)
+                    };
+                    for qq in 0..q {
+                        let idx = pp * q + qq;
+                        crate::kernels::f16_simd::f16_to_f32(
+                            &zs[((t * p + pp) * q + qq) * b..((t * p + pp) * q + qq + 1) * b], &mut z0);
+                        if paired {
+                            crate::kernels::f16_simd::f16_to_f32(
+                                &zs[((tb * p + pp) * q + qq) * b..((tb * p + pp) * q + qq + 1) * b], &mut z1);
+                        }
+                        let x0b = &x[t * in_dim + qq * b..t * in_dim + (qq + 1) * b];
+                        let x1b = if paired { &x[tb * in_dim + qq * b..tb * in_dim + (qq + 1) * b] } else { x0b };
+                        SharedMonarchMatmul::backward_block_dual_token_int16(
+                            &eff1t_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                            &eff2t_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                            x0b, x1b, &z0, if paired { &z1 } else { &z0 },
+                            &dout0_q, dout0_s, dout0_f,
+                            &dout1_q, dout1_s, dout1_f,
+                            m,
+                            &mut dx0_row[qq * b..(qq + 1) * b], &mut dx1_row[qq * b..(qq + 1) * b],
+                            &mut s1[idx * m * b..(idx + 1) * m * b],
+                            &mut s2[idx * m * b..(idx + 1) * m * b],
+                        );
+                    }
+                }
+                t += 2;
+            }
+        };
+
+        if n_tokens < Self::PARALLEL_THRESHOLD {
+            let mut s1 = vec![0.0f32; p * q * m * b];
+            let mut s2 = vec![0.0f32; p * q * m * b];
+            let mut dx_full = vec![0.0f32; n_tokens * in_dim];
+            run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
+            dx.copy_from_slice(&dx_full);
+            pool.give_f16(zs);
+            return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
+        }
+
+        use rayon::prelude::*;
+        let n_chunks = rayon::current_num_threads().max(1).min(n_tokens);
+        let chunk_len = n_tokens.div_ceil(n_chunks);
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
+            (0..n_chunks).into_par_iter().map(|c| {
+                let t0 = c * chunk_len;
+                let t1 = ((c + 1) * chunk_len).min(n_tokens);
+                let mut s1 = vec![0.0f32; p * q * m * b];
+                let mut s2 = vec![0.0f32; p * q * m * b];
+                let mut dx_chunk = vec![0.0f32; t1.saturating_sub(t0) * in_dim];
+                run_range(t0, t1, &mut s1, &mut s2, &mut dx_chunk);
+                (s1, s2, dx_chunk, t0, t1)
+            }).collect();
+
+        let mut s1_all = vec![0.0f32; p * q * m * b];
+        let mut s2_all = vec![0.0f32; p * q * m * b];
+        for (s1, s2, dx_chunk, t0, t1) in results {
+            // A trailing chunk can be empty (t0 >= t1) when chunk_len does
+            // not divide n_tokens evenly across n_chunks — an inverted slice
+            // range here would panic (latent in the fp32 paths too, exposed
+            // by the int16 parity tests at n_tokens = 37 on 12 threads).
+            if t0 >= t1 { continue; }
             for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
@@ -1743,6 +1884,10 @@ impl SharedMonarchProj {
         active_p: &[Vec<usize>], n_tokens: usize,
         pool: &mut crate::kernels::scratch::BufPool,
     ) -> Grads {
+        // Real int16 dual-token path (m == 8 only) — see backward_batch.
+        if is_int16_matmul_enabled() && self.m == 8 {
+            return self.backward_rows_batch_i16(d1, d2, x, cache, dout, dx, active_p, n_tokens, pool);
+        }
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let in_dim = q * b;
@@ -1805,6 +1950,11 @@ impl SharedMonarchProj {
         let mut s1_all = vec![0.0f32; p * q * m * b];
         let mut s2_all = vec![0.0f32; p * q * m * b];
         for (s1, s2, dx_chunk, t0, t1) in results {
+            // A trailing chunk can be empty (t0 >= t1) when chunk_len does
+            // not divide n_tokens evenly across n_chunks — an inverted slice
+            // range here would panic (latent in the fp32 paths too, exposed
+            // by the int16 parity tests at n_tokens = 37 on 12 threads).
+            if t0 >= t1 { continue; }
             for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
@@ -1820,6 +1970,10 @@ impl SharedMonarchProj {
         active_q: &[Vec<usize>], n_tokens: usize,
         pool: &mut crate::kernels::scratch::BufPool,
     ) -> Grads {
+        // Real int16 dual-token path (m == 8 only) — see backward_batch.
+        if is_int16_matmul_enabled() && self.m == 8 {
+            return self.backward_cols_batch_i16(d1, d2, x, cache, dout, dx, active_q, n_tokens, pool);
+        }
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let in_dim = q * b;
@@ -1882,6 +2036,337 @@ impl SharedMonarchProj {
         let mut s1_all = vec![0.0f32; p * q * m * b];
         let mut s2_all = vec![0.0f32; p * q * m * b];
         for (s1, s2, dx_chunk, t0, t1) in results {
+            // A trailing chunk can be empty (t0 >= t1) when chunk_len does
+            // not divide n_tokens evenly across n_chunks — an inverted slice
+            // range here would panic (latent in the fp32 paths too, exposed
+            // by the int16 parity tests at n_tokens = 37 on 12 threads).
+            if t0 >= t1 { continue; }
+            for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
+            dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
+        }
+        pool.give_f16(zs);
+        SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
+    }
+
+    /// Real int16 dual-token backward for the ROUTED rows path (m == 8 only —
+    /// the caller `backward_rows_batch` checks). Combines `backward_batch_i16`'s
+    /// two-phase int16 design (once-per-call transposed weight quantization,
+    /// fp32 `s1`/`s2` outer products, zero-`dout1` lane for odd leftovers) with
+    /// `forward_rows_batch_i16`'s measurement-tuned routing-pairing pattern:
+    /// within each `I16_ROUTED_TOKEN_CHUNK`-token window, build an inverted
+    /// index (block -> window-local tokens routed to it) and pair same-block
+    /// tokens. Windows subdivide each rayon range (the thread-chunk +
+    /// per-thread `s1`/`s2` partials structure is `backward_batch`'s, not
+    /// forward's disjoint-output chunks, since `s1`/`s2` are shared
+    /// accumulators here).
+    #[allow(clippy::too_many_arguments)]
+    fn backward_rows_batch_i16(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], cache: FwdCache, dout: &[f32], dx: &mut [f32],
+        active_p: &[Vec<usize>], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
+    ) -> Grads {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        debug_assert_eq!(b, 64, "backward_rows_batch_i16 requires m == 8");
+        let in_dim = q * b;
+        let out_dim = p * b;
+        dx.iter_mut().for_each(|v| *v = 0.0);
+        let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+        let (eff1t_i16, eff1_scale, eff2t_i16, eff2_scale) = {
+            let _t = crate::kernels::profiling::Timer::start(&crate::kernels::profiling::I16_BWD_WQUANT);
+            let e1t = transpose_subblocks_8x8(&eff1_all);
+            let e2t = transpose_subblocks_8x8(&eff2_all);
+            let (e1, s1) = SharedMonarchMatmul::quantize_i16(&e1t);
+            let (e2, s2) = SharedMonarchMatmul::quantize_i16(&e2t);
+            (e1, s1, e2, s2)
+        };
+        drop(eff1_all);
+        drop(eff2_all);
+        let FwdCache { zs } = cache;
+
+        let chunkw = Self::I16_ROUTED_TOKEN_CHUNK;
+        let run_range = |t0: usize, t1: usize, s1_acc: &mut [f32], s2_acc: &mut [f32], dx_out: &mut [f32]| {
+            let (mut z0, mut z1) = ([0.0f32; 64], [0.0f32; 64]);
+            let zero_f = [0.0f32; 64];
+            let zero_q = [0i16; 64];
+            let mut dx_scratch = vec![0.0f32; in_dim];
+            let mut w0 = t0;
+            while w0 < t1 {
+                let w1 = (w0 + chunkw).min(t1);
+                let nw = w1 - w0;
+                // (1) Quantize dout once per (token, active pp) — reused
+                // across all qq — and build the inverted routing index.
+                let mut dq = vec![0i16; nw * p * 64];
+                let mut dsc = vec![0.0f32; nw * p];
+                let mut inv: Vec<Vec<usize>> = vec![Vec::new(); p];
+                for lt in 0..nw {
+                    let t = w0 + lt;
+                    for &pp in &active_p[t] {
+                        debug_assert!(pp < p, "active row-block {pp} out of range");
+                        let (qv, s) = SharedMonarchMatmul::quantize_i16_64(&dout[t * out_dim + pp * b..t * out_dim + (pp + 1) * b]);
+                        dq[(lt * p + pp) * 64..(lt * p + pp + 1) * 64].copy_from_slice(&qv);
+                        dsc[lt * p + pp] = s;
+                        inv[pp].push(lt);
+                    }
+                }
+                // (2) Per block, sweep its token list in pairs.
+                for pp in 0..p {
+                    let toks = &inv[pp];
+                    let mut i = 0;
+                    while i + 2 <= toks.len() {
+                        let (lt0, lt1) = (toks[i], toks[i + 1]);
+                        debug_assert!(lt0 < lt1, "routing gave token a duplicate active block");
+                        let (ta, tb) = (w0 + lt0, w0 + lt1);
+                        let (lo, hi) = dx_out.split_at_mut((tb - t0) * in_dim);
+                        let dx0_row = &mut lo[(ta - t0) * in_dim..(ta - t0 + 1) * in_dim];
+                        let dx1_row = &mut hi[..in_dim];
+                        let dout0_f = &dout[ta * out_dim + pp * b..ta * out_dim + (pp + 1) * b];
+                        let dout1_f = &dout[tb * out_dim + pp * b..tb * out_dim + (pp + 1) * b];
+                        for qq in 0..q {
+                            let idx = pp * q + qq;
+                            crate::kernels::f16_simd::f16_to_f32(
+                                &zs[((ta * p + pp) * q + qq) * b..((ta * p + pp) * q + qq + 1) * b], &mut z0);
+                            crate::kernels::f16_simd::f16_to_f32(
+                                &zs[((tb * p + pp) * q + qq) * b..((tb * p + pp) * q + qq + 1) * b], &mut z1);
+                            SharedMonarchMatmul::backward_block_dual_token_int16(
+                                &eff1t_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                                &eff2t_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                                &x[ta * in_dim + qq * b..ta * in_dim + (qq + 1) * b],
+                                &x[tb * in_dim + qq * b..tb * in_dim + (qq + 1) * b],
+                                &z0, &z1,
+                                &dq[(lt0 * p + pp) * 64..(lt0 * p + pp + 1) * 64], dsc[lt0 * p + pp], dout0_f,
+                                &dq[(lt1 * p + pp) * 64..(lt1 * p + pp + 1) * 64], dsc[lt1 * p + pp], dout1_f,
+                                m,
+                                &mut dx0_row[qq * b..(qq + 1) * b], &mut dx1_row[qq * b..(qq + 1) * b],
+                                &mut s1_acc[idx * m * b..(idx + 1) * m * b],
+                                &mut s2_acc[idx * m * b..(idx + 1) * m * b],
+                            );
+                        }
+                        i += 2;
+                    }
+                    if i < toks.len() {
+                        let lt0 = toks[i];
+                        let ta = w0 + lt0;
+                        let dx0_row = &mut dx_out[(ta - t0) * in_dim..(ta - t0 + 1) * in_dim];
+                        let dout0_f = &dout[ta * out_dim + pp * b..ta * out_dim + (pp + 1) * b];
+                        for qq in 0..q {
+                            let idx = pp * q + qq;
+                            crate::kernels::f16_simd::f16_to_f32(
+                                &zs[((ta * p + pp) * q + qq) * b..((ta * p + pp) * q + qq + 1) * b], &mut z0);
+                            let x0b = &x[ta * in_dim + qq * b..ta * in_dim + (qq + 1) * b];
+                            SharedMonarchMatmul::backward_block_dual_token_int16(
+                                &eff1t_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                                &eff2t_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                                x0b, x0b, &z0, &z0,
+                                &dq[(lt0 * p + pp) * 64..(lt0 * p + pp + 1) * 64], dsc[lt0 * p + pp], dout0_f,
+                                &zero_q, 0.0, &zero_f,
+                                m,
+                                &mut dx0_row[qq * b..(qq + 1) * b], &mut dx_scratch[qq * b..(qq + 1) * b],
+                                &mut s1_acc[idx * m * b..(idx + 1) * m * b],
+                                &mut s2_acc[idx * m * b..(idx + 1) * m * b],
+                            );
+                        }
+                    }
+                }
+                w0 = w1;
+            }
+        };
+
+        if n_tokens < Self::PARALLEL_THRESHOLD {
+            let mut s1 = vec![0.0f32; p * q * m * b];
+            let mut s2 = vec![0.0f32; p * q * m * b];
+            let mut dx_full = vec![0.0f32; n_tokens * in_dim];
+            run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
+            dx.copy_from_slice(&dx_full);
+            pool.give_f16(zs);
+            return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
+        }
+
+        use rayon::prelude::*;
+        let n_chunks = rayon::current_num_threads().max(1).min(n_tokens);
+        let chunk_len = n_tokens.div_ceil(n_chunks);
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
+            (0..n_chunks).into_par_iter().map(|c| {
+                let t0 = c * chunk_len;
+                let t1 = ((c + 1) * chunk_len).min(n_tokens);
+                let mut s1 = vec![0.0f32; p * q * m * b];
+                let mut s2 = vec![0.0f32; p * q * m * b];
+                let mut dx_chunk = vec![0.0f32; t1.saturating_sub(t0) * in_dim];
+                run_range(t0, t1, &mut s1, &mut s2, &mut dx_chunk);
+                (s1, s2, dx_chunk, t0, t1)
+            }).collect();
+
+        let mut s1_all = vec![0.0f32; p * q * m * b];
+        let mut s2_all = vec![0.0f32; p * q * m * b];
+        for (s1, s2, dx_chunk, t0, t1) in results {
+            // A trailing chunk can be empty (t0 >= t1) when chunk_len does
+            // not divide n_tokens evenly across n_chunks — an inverted slice
+            // range here would panic (latent in the fp32 paths too, exposed
+            // by the int16 parity tests at n_tokens = 37 on 12 threads).
+            if t0 >= t1 { continue; }
+            for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
+            dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
+        }
+        pool.give_f16(zs);
+        SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1_all, &s2_all, p, q, m, nd)
+    }
+
+    /// Real int16 dual-token backward for the ROUTED cols path — the cols
+    /// mirror of `backward_rows_batch_i16`. Routing is on the INPUT block
+    /// `qq`: two tokens pair on a shared active `qq` and sweep all `p` output
+    /// blocks of that column together. `dout` is quantized once per
+    /// `(token, pp)` for every token in the window with at least one active
+    /// `qq` (each such token consumes every `pp`).
+    #[allow(clippy::too_many_arguments)]
+    fn backward_cols_batch_i16(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], cache: FwdCache, dout: &[f32], dx: &mut [f32],
+        active_q: &[Vec<usize>], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
+    ) -> Grads {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        debug_assert_eq!(b, 64, "backward_cols_batch_i16 requires m == 8");
+        let in_dim = q * b;
+        let out_dim = p * b;
+        dx.iter_mut().for_each(|v| *v = 0.0);
+        let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+        let (eff1t_i16, eff1_scale, eff2t_i16, eff2_scale) = {
+            let _t = crate::kernels::profiling::Timer::start(&crate::kernels::profiling::I16_BWD_WQUANT);
+            let e1t = transpose_subblocks_8x8(&eff1_all);
+            let e2t = transpose_subblocks_8x8(&eff2_all);
+            let (e1, s1) = SharedMonarchMatmul::quantize_i16(&e1t);
+            let (e2, s2) = SharedMonarchMatmul::quantize_i16(&e2t);
+            (e1, s1, e2, s2)
+        };
+        drop(eff1_all);
+        drop(eff2_all);
+        let FwdCache { zs } = cache;
+
+        let chunkw = Self::I16_ROUTED_TOKEN_CHUNK;
+        let run_range = |t0: usize, t1: usize, s1_acc: &mut [f32], s2_acc: &mut [f32], dx_out: &mut [f32]| {
+            let (mut z0, mut z1) = ([0.0f32; 64], [0.0f32; 64]);
+            let zero_f = [0.0f32; 64];
+            let zero_q = [0i16; 64];
+            let mut dx_scratch = vec![0.0f32; in_dim];
+            let mut w0 = t0;
+            while w0 < t1 {
+                let w1 = (w0 + chunkw).min(t1);
+                let nw = w1 - w0;
+                // (1) Quantize dout once per (routed token, pp) — every pp is
+                // consumed for each of the token's active qqs — and build the
+                // inverted index (input block -> window-local tokens).
+                let mut dq = vec![0i16; nw * p * 64];
+                let mut dsc = vec![0.0f32; nw * p];
+                let mut inv: Vec<Vec<usize>> = vec![Vec::new(); q];
+                for lt in 0..nw {
+                    let t = w0 + lt;
+                    if active_q[t].is_empty() { continue; }
+                    for pp in 0..p {
+                        let (qv, s) = SharedMonarchMatmul::quantize_i16_64(&dout[t * out_dim + pp * b..t * out_dim + (pp + 1) * b]);
+                        dq[(lt * p + pp) * 64..(lt * p + pp + 1) * 64].copy_from_slice(&qv);
+                        dsc[lt * p + pp] = s;
+                    }
+                    for &qq in &active_q[t] {
+                        debug_assert!(qq < q, "active col-block {qq} out of range");
+                        inv[qq].push(lt);
+                    }
+                }
+                // (2) Per input block, sweep its token list in pairs; each
+                // pair walks all p output blocks of that column together.
+                for qq in 0..q {
+                    let toks = &inv[qq];
+                    let mut i = 0;
+                    while i + 2 <= toks.len() {
+                        let (lt0, lt1) = (toks[i], toks[i + 1]);
+                        debug_assert!(lt0 < lt1, "routing gave token a duplicate active block");
+                        let (ta, tb) = (w0 + lt0, w0 + lt1);
+                        let (lo, hi) = dx_out.split_at_mut((tb - t0) * in_dim);
+                        let dx0_row = &mut lo[(ta - t0) * in_dim..(ta - t0 + 1) * in_dim];
+                        let dx1_row = &mut hi[..in_dim];
+                        let x0b = &x[ta * in_dim + qq * b..ta * in_dim + (qq + 1) * b];
+                        let x1b = &x[tb * in_dim + qq * b..tb * in_dim + (qq + 1) * b];
+                        for pp in 0..p {
+                            let idx = pp * q + qq;
+                            crate::kernels::f16_simd::f16_to_f32(
+                                &zs[((ta * p + pp) * q + qq) * b..((ta * p + pp) * q + qq + 1) * b], &mut z0);
+                            crate::kernels::f16_simd::f16_to_f32(
+                                &zs[((tb * p + pp) * q + qq) * b..((tb * p + pp) * q + qq + 1) * b], &mut z1);
+                            SharedMonarchMatmul::backward_block_dual_token_int16(
+                                &eff1t_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                                &eff2t_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                                x0b, x1b, &z0, &z1,
+                                &dq[(lt0 * p + pp) * 64..(lt0 * p + pp + 1) * 64], dsc[lt0 * p + pp],
+                                &dout[ta * out_dim + pp * b..ta * out_dim + (pp + 1) * b],
+                                &dq[(lt1 * p + pp) * 64..(lt1 * p + pp + 1) * 64], dsc[lt1 * p + pp],
+                                &dout[tb * out_dim + pp * b..tb * out_dim + (pp + 1) * b],
+                                m,
+                                &mut dx0_row[qq * b..(qq + 1) * b], &mut dx1_row[qq * b..(qq + 1) * b],
+                                &mut s1_acc[idx * m * b..(idx + 1) * m * b],
+                                &mut s2_acc[idx * m * b..(idx + 1) * m * b],
+                            );
+                        }
+                        i += 2;
+                    }
+                    if i < toks.len() {
+                        let lt0 = toks[i];
+                        let ta = w0 + lt0;
+                        let dx0_row = &mut dx_out[(ta - t0) * in_dim..(ta - t0 + 1) * in_dim];
+                        let x0b = &x[ta * in_dim + qq * b..ta * in_dim + (qq + 1) * b];
+                        for pp in 0..p {
+                            let idx = pp * q + qq;
+                            crate::kernels::f16_simd::f16_to_f32(
+                                &zs[((ta * p + pp) * q + qq) * b..((ta * p + pp) * q + qq + 1) * b], &mut z0);
+                            SharedMonarchMatmul::backward_block_dual_token_int16(
+                                &eff1t_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                                &eff2t_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                                x0b, x0b, &z0, &z0,
+                                &dq[(lt0 * p + pp) * 64..(lt0 * p + pp + 1) * 64], dsc[lt0 * p + pp],
+                                &dout[ta * out_dim + pp * b..ta * out_dim + (pp + 1) * b],
+                                &zero_q, 0.0, &zero_f,
+                                m,
+                                &mut dx0_row[qq * b..(qq + 1) * b], &mut dx_scratch[qq * b..(qq + 1) * b],
+                                &mut s1_acc[idx * m * b..(idx + 1) * m * b],
+                                &mut s2_acc[idx * m * b..(idx + 1) * m * b],
+                            );
+                        }
+                    }
+                }
+                w0 = w1;
+            }
+        };
+
+        if n_tokens < Self::PARALLEL_THRESHOLD {
+            let mut s1 = vec![0.0f32; p * q * m * b];
+            let mut s2 = vec![0.0f32; p * q * m * b];
+            let mut dx_full = vec![0.0f32; n_tokens * in_dim];
+            run_range(0, n_tokens, &mut s1, &mut s2, &mut dx_full);
+            dx.copy_from_slice(&dx_full);
+            pool.give_f16(zs);
+            return SharedMonarchMatmul::contract_all_blocks(d1, d2, &self.a1, &self.a2, &s1, &s2, p, q, m, nd);
+        }
+
+        use rayon::prelude::*;
+        let n_chunks = rayon::current_num_threads().max(1).min(n_tokens);
+        let chunk_len = n_tokens.div_ceil(n_chunks);
+        let results: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize)> =
+            (0..n_chunks).into_par_iter().map(|c| {
+                let t0 = c * chunk_len;
+                let t1 = ((c + 1) * chunk_len).min(n_tokens);
+                let mut s1 = vec![0.0f32; p * q * m * b];
+                let mut s2 = vec![0.0f32; p * q * m * b];
+                let mut dx_chunk = vec![0.0f32; t1.saturating_sub(t0) * in_dim];
+                run_range(t0, t1, &mut s1, &mut s2, &mut dx_chunk);
+                (s1, s2, dx_chunk, t0, t1)
+            }).collect();
+
+        let mut s1_all = vec![0.0f32; p * q * m * b];
+        let mut s2_all = vec![0.0f32; p * q * m * b];
+        for (s1, s2, dx_chunk, t0, t1) in results {
+            // A trailing chunk can be empty (t0 >= t1) when chunk_len does
+            // not divide n_tokens evenly across n_chunks — an inverted slice
+            // range here would panic (latent in the fp32 paths too, exposed
+            // by the int16 parity tests at n_tokens = 37 on 12 threads).
+            if t0 >= t1 { continue; }
             for i in 0..s1_all.len() { s1_all[i] += s1[i]; s2_all[i] += s2[i]; }
             dx[t0 * in_dim..t1 * in_dim].copy_from_slice(&dx_chunk);
         }
@@ -2397,6 +2882,79 @@ impl SharedMonarchMatmul {
         Self::backward_block_phase1(&eff1_q, &eff2_q, &x_q, &z_q, &dout_q, dx_blk, m, s1, s2);
     }
 
+    /// Real int16 SIMD backward phase 1 for a PAIR of tokens against one
+    /// block — the backward counterpart of `apply_block_dual_token_int16`.
+    /// Same math as `backward_block_phase1` run once per token, with both
+    /// tokens' `s1`/`s2` contributions accumulated into the SAME caller-owned
+    /// fp32 buffers (backward's `s1`/`s2` are batch-accumulated, unlike
+    /// forward's per-token `y`).
+    ///
+    /// Split of int16 vs fp32 work (see RESEARCH_LOG.md 2026-07-05/07):
+    /// - The two matvec-shaped stages (`dz = eff2^T·dout`, `dx += eff1^T·dy1`)
+    ///   run as real dual-token `madd_epi16` via `matvec8_dual_i16`. Because
+    ///   they contract against the TRANSPOSED block, the caller passes
+    ///   `eff1t_i16`/`eff2t_i16` = per-8x8-sub-block-transposed, quantized
+    ///   weights (built once per backward call via `transpose_subblocks_8x8`
+    ///   + `quantize_i16` — amortized across the batch, matching forward's
+    ///   once-per-call weight quantization).
+    /// - The outer-product accumulations (`s2 += dout⊗z`, `s1 += dy1⊗x`)
+    ///   stay fp32 FMA on the RAW `z`/`x`/`dout` values: the validated-safe
+    ///   accumulation scheme (int16_backward_accum_probe, 2026-07-05) keeps
+    ///   the running sums fp32, and these are rank-1 updates with no
+    ///   reduction, so int16 buys nothing there — `z` and `x` never need
+    ///   quantizing at all on this path.
+    ///
+    /// `dout0_q`/`dout1_q` are quantized by the caller (hoistable: `dout_pp`
+    /// depends only on `(token, pp)`, not `qq`). A caller with an odd
+    /// leftover token passes token0's data in lane 0 and a ZERO `dout1`
+    /// (`dout1_q` all zeros, `dout1_scale = 0.0`, `dout1_f` zeros, `dx1` into
+    /// discarded scratch): lane 1 then contributes exactly zero to `s1`/`s2`
+    /// and `dx1`, so nothing is double-counted — cheaper than keeping a
+    /// second, separately-quantized weight copy alive for a single-token
+    /// fallback (the requantization pattern this arc removed twice).
+    #[allow(clippy::too_many_arguments)]
+    fn backward_block_dual_token_int16(
+        eff1t_i16: &[i16], eff1_scale: f32, eff2t_i16: &[i16], eff2_scale: f32,
+        x0: &[f32], x1: &[f32], z0: &[f32], z1: &[f32],
+        dout0_q: &[i16], dout0_scale: f32, dout0_f: &[f32],
+        dout1_q: &[i16], dout1_scale: f32, dout1_f: &[f32],
+        m: usize, dx0: &mut [f32], dx1: &mut [f32], s1: &mut [f32], s2: &mut [f32],
+    ) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if m == 8 {
+            unsafe {
+                backward_block_avx2_dual_i16(
+                    eff1t_i16.as_ptr(), eff1_scale, eff2t_i16.as_ptr(), eff2_scale,
+                    x0.as_ptr(), x1.as_ptr(), z0.as_ptr(), z1.as_ptr(),
+                    dout0_q.as_ptr(), dout0_scale, dout0_f.as_ptr(),
+                    dout1_q.as_ptr(), dout1_scale, dout1_f.as_ptr(),
+                    dx0.as_mut_ptr(), dx1.as_mut_ptr(), s1.as_mut_ptr(), s2.as_mut_ptr(),
+                );
+            }
+            return;
+        }
+        // Portable fallback (non-AVX2 build; callers gate on m == 8):
+        // dequantize + un-transpose the weights and run the fp32 reference
+        // per token. Raw `dout*_f` is used for both stages here (the SIMD
+        // path uses the quantized dout only for the dz matvec) — same noise
+        // envelope, strictly more accurate. A zero `dout1_f` makes token1 an
+        // exact no-op, matching the SIMD path's odd-leftover contract.
+        let _ = (dout0_q, dout0_scale, dout1_q, dout1_scale);
+        let b = m * m;
+        let mut eff1 = vec![0.0f32; eff1t_i16.len()];
+        let mut eff2 = vec![0.0f32; eff2t_i16.len()];
+        for blk in 0..m {
+            for r in 0..m {
+                for c in 0..m {
+                    eff1[blk * b + r * m + c] = eff1t_i16[blk * b + c * m + r] as f32 * eff1_scale;
+                    eff2[blk * b + r * m + c] = eff2t_i16[blk * b + c * m + r] as f32 * eff2_scale;
+                }
+            }
+        }
+        Self::backward_block_phase1(&eff1, &eff2, x0, z0, dout0_f, dx0, m, s1, s2);
+        Self::backward_block_phase1(&eff1, &eff2, x1, z1, dout1_f, dx1, m, s1, s2);
+    }
+
     /// Phase 2: contract one block's accumulated outer products (`s1`/`s2`,
     /// `m*b` each, from `backward_block_phase1` summed over the whole batch)
     /// with the dictionary — the `nd`-scaled work, now done once per block
@@ -2863,6 +3421,101 @@ unsafe fn transpose8x8_ps(src: *const f32, dst: *mut f32) {
     _mm256_storeu_ps(dst.add(40),  _mm256_permute2f128_ps(s1, s5, 0x31));
     _mm256_storeu_ps(dst.add(48),  _mm256_permute2f128_ps(s2, s6, 0x31));
     _mm256_storeu_ps(dst.add(56),  _mm256_permute2f128_ps(s3, s7, 0x31));
+}
+
+/// Per-64-element (8x8) sub-block transpose of an expanded weight buffer:
+/// `dst[blk*64 + c*8 + r] = src[blk*64 + r*8 + c]`. Backward's matvecs run
+/// against `eff^T` (`dz = eff2^T·dout`, `dx = eff1^T·dy1`), so the int16
+/// backward path pre-transposes once per `backward_*_batch` call — amortized
+/// across the whole batch — letting `matvec8_dual_i16` consume contiguous
+/// rows exactly like the forward path does.
+fn transpose_subblocks_8x8(src: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(src.len() % 64, 0);
+    let mut dst = vec![0.0f32; src.len()];
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        for (s, d) in src.chunks_exact(64).zip(dst.chunks_exact_mut(64)) {
+            unsafe { transpose8x8_ps(s.as_ptr(), d.as_mut_ptr()) };
+        }
+        return dst;
+    }
+    #[allow(unreachable_code)]
+    {
+        for (s, d) in src.chunks_exact(64).zip(dst.chunks_exact_mut(64)) {
+            for r in 0..8 {
+                for c in 0..8 { d[c * 8 + r] = s[r * 8 + c]; }
+            }
+        }
+        dst
+    }
+}
+
+/// AVX2 body of `backward_block_dual_token_int16` (see its doc for the
+/// int16-vs-fp32 work split and the zero-lane odd-leftover contract).
+/// `eff1t`/`eff2t` are the per-sub-block-TRANSPOSED, quantized weights;
+/// `dout*_q` quantized once per `(token, pp)` by the caller; `x*`/`z*`/
+/// `dout*_f` are raw fp32. `dx*` are accumulated (+=), `s1`/`s2` are the
+/// shared batch accumulators.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn backward_block_avx2_dual_i16(
+    eff1t: *const i16, eff1_scale: f32, eff2t: *const i16, eff2_scale: f32,
+    x0: *const f32, x1: *const f32, z0: *const f32, z1: *const f32,
+    dout0_q: *const i16, dout0_scale: f32, dout0_f: *const f32,
+    dout1_q: *const i16, dout1_scale: f32, dout1_f: *const f32,
+    dx0: *mut f32, dx1: *mut f32, s1: *mut f32, s2: *mut f32,
+) {
+    const M: usize = 8;
+    const B: usize = 64;
+    let mut dz0 = [0.0f32; B];
+    let mut dz1 = [0.0f32; B];
+    let mut dy1_0 = [0.0f32; B];
+    let mut dy1_1 = [0.0f32; B];
+    // Stage A: dz_j[c] = Σ_r eff2[j][r][c]·dout_j[r] for both tokens — one
+    // madd_epi16 per transposed row — plus the fp32 s2 rank-1 update.
+    let sa0 = _mm256_set1_ps(eff2_scale * dout0_scale);
+    let sa1 = _mm256_set1_ps(eff2_scale * dout1_scale);
+    for j in 0..M {
+        let (o0, o1) = matvec8_dual_i16(eff2t.add(j * B), dout0_q.add(j * M), dout1_q.add(j * M));
+        _mm256_storeu_ps(dz0.as_mut_ptr().add(j * M), _mm256_mul_ps(_mm256_cvtepi32_ps(o0), sa0));
+        _mm256_storeu_ps(dz1.as_mut_ptr().add(j * M), _mm256_mul_ps(_mm256_cvtepi32_ps(o1), sa1));
+        let z0v = _mm256_loadu_ps(z0.add(j * M));
+        let z1v = _mm256_loadu_ps(z1.add(j * M));
+        let s2_j = s2.add(j * B);
+        for r in 0..M {
+            let mut acc = _mm256_loadu_ps(s2_j.add(r * M));
+            acc = _mm256_fmadd_ps(z0v, _mm256_set1_ps(*dout0_f.add(j * M + r)), acc);
+            acc = _mm256_fmadd_ps(z1v, _mm256_set1_ps(*dout1_f.add(j * M + r)), acc);
+            _mm256_storeu_ps(s2_j.add(r * M), acc);
+        }
+    }
+    // dy1[i][r] = dz[r][i] — same mid-kernel transpose + fresh requantize as
+    // forward's z0/z1 (genuinely per-(pp,qq) data, not hoistable).
+    transpose8x8_ps(dz0.as_ptr(), dy1_0.as_mut_ptr());
+    transpose8x8_ps(dz1.as_ptr(), dy1_1.as_mut_ptr());
+    let (dy0_q, dy0_s) = SharedMonarchMatmul::quantize_i16_64(&dy1_0);
+    let (dy1_q, dy1_s) = SharedMonarchMatmul::quantize_i16_64(&dy1_1);
+    // Stage B: dx_i[c] += Σ_r dy1_i[r]·eff1[i][r][c] for both tokens, plus
+    // the fp32 s1 rank-1 update (raw x, int16-noise dy1 — the same noise
+    // envelope the accumulation probe validated).
+    let sb0 = _mm256_set1_ps(eff1_scale * dy0_s);
+    let sb1 = _mm256_set1_ps(eff1_scale * dy1_s);
+    for i in 0..M {
+        let (o0, o1) = matvec8_dual_i16(eff1t.add(i * B), dy0_q.as_ptr().add(i * M), dy1_q.as_ptr().add(i * M));
+        _mm256_storeu_ps(dx0.add(i * M), _mm256_fmadd_ps(_mm256_cvtepi32_ps(o0), sb0, _mm256_loadu_ps(dx0.add(i * M))));
+        _mm256_storeu_ps(dx1.add(i * M), _mm256_fmadd_ps(_mm256_cvtepi32_ps(o1), sb1, _mm256_loadu_ps(dx1.add(i * M))));
+        let x0v = _mm256_loadu_ps(x0.add(i * M));
+        let x1v = _mm256_loadu_ps(x1.add(i * M));
+        let s1_i = s1.add(i * B);
+        for r in 0..M {
+            let mut acc = _mm256_loadu_ps(s1_i.add(r * M));
+            acc = _mm256_fmadd_ps(x0v, _mm256_set1_ps(dy1_0[i * M + r]), acc);
+            acc = _mm256_fmadd_ps(x1v, _mm256_set1_ps(dy1_1[i * M + r]), acc);
+            _mm256_storeu_ps(s1_i.add(r * M), acc);
+        }
+    }
 }
 
 /// Same math as `bwd_block_avx2`, but `eff1`/`eff2` are precomputed
@@ -3362,6 +4015,121 @@ mod tests {
     }
 
     #[test]
+    fn backward_block_dual_token_int16_matches_fp32() {
+        // Real int16 SIMD backward kernel (not fake-quant): one block, two
+        // DIFFERENT tokens, s1/s2 accumulated into shared buffers. Checked
+        // against backward_block_phase1 (fp32) run per token into the same
+        // shared accumulators, in the style of
+        // apply_block_dual_token_int16_matches_fp32; also checks the
+        // zero-dout1 lane contract used for odd leftover tokens.
+        let m = 8;
+        let b = m * m;
+        let eff1 = randvec(m * b, 0xE1E1);
+        let eff2 = randvec(m * b, 0xE2E2);
+        let x0 = randvec(b, 0x1001);
+        let x1 = randvec(b, 0x1002);
+        let z0 = randvec(b, 0x2001);
+        let z1 = randvec(b, 0x2002);
+        let dout0 = randvec(b, 0x3001);
+        let dout1 = randvec(b, 0x3002);
+
+        // fp32 reference: per token, shared s1/s2.
+        let (mut s1_ref, mut s2_ref) = (vec![0.0f32; m * b], vec![0.0f32; m * b]);
+        let (mut dx0_ref, mut dx1_ref) = (vec![0.0f32; b], vec![0.0f32; b]);
+        SharedMonarchMatmul::backward_block_phase1(&eff1, &eff2, &x0, &z0, &dout0, &mut dx0_ref, m, &mut s1_ref, &mut s2_ref);
+        SharedMonarchMatmul::backward_block_phase1(&eff1, &eff2, &x1, &z1, &dout1, &mut dx1_ref, m, &mut s1_ref, &mut s2_ref);
+
+        // int16 path: transposed+quantized weights, quantized dout.
+        let (e1t_i16, e1s) = SharedMonarchMatmul::quantize_i16(&transpose_subblocks_8x8(&eff1));
+        let (e2t_i16, e2s) = SharedMonarchMatmul::quantize_i16(&transpose_subblocks_8x8(&eff2));
+        let (d0q, d0s) = SharedMonarchMatmul::quantize_i16_64(&dout0);
+        let (d1q, d1s) = SharedMonarchMatmul::quantize_i16_64(&dout1);
+        let (mut s1_q, mut s2_q) = (vec![0.0f32; m * b], vec![0.0f32; m * b]);
+        let (mut dx0_q, mut dx1_q) = (vec![0.0f32; b], vec![0.0f32; b]);
+        SharedMonarchMatmul::backward_block_dual_token_int16(
+            &e1t_i16, e1s, &e2t_i16, e2s, &x0, &x1, &z0, &z1,
+            &d0q, d0s, &dout0, &d1q, d1s, &dout1, m,
+            &mut dx0_q, &mut dx1_q, &mut s1_q, &mut s2_q,
+        );
+
+        let rel_err = |a: &[f32], r: &[f32]| {
+            let num: f32 = a.iter().zip(r).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+            let den: f32 = r.iter().map(|y| y * y).sum::<f32>().sqrt().max(1e-12);
+            num / den
+        };
+        assert!(rel_err(&dx0_q, &dx0_ref) < 1e-2, "dx0 relative error too high: {:.2e}", rel_err(&dx0_q, &dx0_ref));
+        assert!(rel_err(&dx1_q, &dx1_ref) < 1e-2, "dx1 relative error too high: {:.2e}", rel_err(&dx1_q, &dx1_ref));
+        assert!(rel_err(&s1_q, &s1_ref) < 1e-2, "s1 relative error too high: {:.2e}", rel_err(&s1_q, &s1_ref));
+        assert!(rel_err(&s2_q, &s2_ref) < 1e-2, "s2 relative error too high: {:.2e}", rel_err(&s2_q, &s2_ref));
+        // The two lanes must really carry different tokens' data.
+        assert!(rel_err(&dx0_q, &dx1_q) > 1e-3, "dx0 and dx1 suspiciously identical — dual-lane bug?");
+
+        // Zero-lane contract (odd leftover self-pair): a zero dout1 lane must
+        // contribute exactly nothing to s1/s2 and leave dx1's scratch at zero.
+        let zero_f = [0.0f32; 64];
+        let zero_q = [0i16; 64];
+        let (mut s1_solo_ref, mut s2_solo_ref) = (vec![0.0f32; m * b], vec![0.0f32; m * b]);
+        let mut dx0_solo_ref = vec![0.0f32; b];
+        SharedMonarchMatmul::backward_block_phase1(&eff1, &eff2, &x0, &z0, &dout0, &mut dx0_solo_ref, m, &mut s1_solo_ref, &mut s2_solo_ref);
+        let (mut s1_solo, mut s2_solo) = (vec![0.0f32; m * b], vec![0.0f32; m * b]);
+        let (mut dx0_solo, mut dx_scratch) = (vec![0.0f32; b], vec![0.0f32; b]);
+        SharedMonarchMatmul::backward_block_dual_token_int16(
+            &e1t_i16, e1s, &e2t_i16, e2s, &x0, &x0, &z0, &z0,
+            &d0q, d0s, &dout0, &zero_q, 0.0, &zero_f, m,
+            &mut dx0_solo, &mut dx_scratch, &mut s1_solo, &mut s2_solo,
+        );
+        assert!(rel_err(&dx0_solo, &dx0_solo_ref) < 1e-2, "solo dx0 relative error too high");
+        assert!(rel_err(&s1_solo, &s1_solo_ref) < 1e-2, "solo s1 relative error too high");
+        assert!(rel_err(&s2_solo, &s2_solo_ref) < 1e-2, "solo s2 relative error too high");
+        assert!(dx_scratch.iter().all(|&v| v == 0.0), "zero dout1 lane leaked into dx1 scratch");
+    }
+
+    #[test]
+    fn backward_batch_i16_matches_fp32() {
+        // End-to-end non-routed batched backward: real int16 dual-token path
+        // against the fp32 backward_batch on identical inputs/cache. Odd
+        // n_tokens = 9 (>= PARALLEL_THRESHOLD) exercises the rayon chunking,
+        // in-range pairing, and the zero-lane odd leftover; n_tokens = 5
+        // exercises the serial path.
+        for &n_tokens in &[5usize, 9] {
+            let (p, q, m, nd) = (4, 3, 8, 4);
+            let (d1, d2) = init_shared_atoms(nd, m, 0xD1CE);
+            let proj = SharedMonarchProj::new(p, q, m, nd, 0xBEEF);
+            let b = m * m;
+            let in_dim = q * b;
+            let out_dim = p * b;
+            let x = randvec(n_tokens * in_dim, 0x4141);
+            let dout = randvec(n_tokens * out_dim, 0x4242);
+            let mut pool = crate::kernels::scratch::BufPool::new();
+
+            let (_y0, cache_ref) = proj.forward_batch(&d1, &d2, &x, n_tokens, &mut pool);
+            let mut dx_ref = vec![0.0f32; n_tokens * in_dim];
+            let g_ref = proj.backward_batch(&d1, &d2, &x, cache_ref, &dout, &mut dx_ref, n_tokens, &mut pool);
+
+            let (_y1, cache_i16) = proj.forward_batch(&d1, &d2, &x, n_tokens, &mut pool);
+            let mut dx_i16 = vec![0.0f32; n_tokens * in_dim];
+            let g_i16 = proj.backward_batch_i16(&d1, &d2, &x, cache_i16, &dout, &mut dx_i16, n_tokens, &mut pool);
+
+            let rel_err = |a: &[f32], r: &[f32]| {
+                let num: f32 = a.iter().zip(r).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+                let den: f32 = r.iter().map(|y| y * y).sum::<f32>().sqrt().max(1e-12);
+                num / den
+            };
+            for t in 0..n_tokens {
+                let e = rel_err(&dx_i16[t * in_dim..(t + 1) * in_dim], &dx_ref[t * in_dim..(t + 1) * in_dim]);
+                assert!(e < 1e-2, "n_tokens={n_tokens} token {t}: dx relative error too high: {e:.2e}");
+            }
+            for (name, a, r) in [
+                ("da1", &g_i16.da1, &g_ref.da1), ("da2", &g_i16.da2, &g_ref.da2),
+                ("dd1", &g_i16.dd1, &g_ref.dd1), ("dd2", &g_i16.dd2, &g_ref.dd2),
+            ] {
+                let e = rel_err(a, r);
+                assert!(e < 1e-2, "n_tokens={n_tokens} {name}: relative error too high: {e:.2e}");
+            }
+        }
+    }
+
+    #[test]
     fn forward_rows_matches_full_on_active_blocks() {
         let (p, q, m, nd) = (5, 3, 8, 4);
         let proj = SharedMonarchProj::new(p, q, m, nd, 0x2020);
@@ -3770,6 +4538,106 @@ mod tests {
                     assert!(e < 1e-2, "token {t} pp={pp} qq={qq}: zs relative error too high: {e:.2e}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn backward_rows_batch_i16_matches_fp32() {
+        // Routed real-int16 dual-token BACKWARD (rows): inverted index +
+        // in-window pairing + zero-lane odd leftovers, against the fp32
+        // routed backward on identical inputs/cache. n_tokens = 37 exercises
+        // the rayon path, uneven thread ranges, short final windows, and —
+        // with token-varying routing — odd leftovers in blocks' token lists.
+        let (p, q, m, nd) = (6, 3, 8, 4);
+        let (d1, d2) = init_shared_atoms(nd, m, 0xD1CE);
+        let proj = SharedMonarchProj::new(p, q, m, nd, 0xFACE);
+        let b = m * m;
+        let in_dim = q * b;
+        let out_dim = p * b;
+        let n_tokens = 37;
+        let n_active = 2;
+        let x = randvec(n_tokens * in_dim, 0x5151);
+        let dout = randvec(n_tokens * out_dim, 0x5252);
+        let active_p: Vec<Vec<usize>> = (0..n_tokens).map(|t| {
+            (0..n_active).map(|k| (t * 3 + k * 5) % p).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+        }).collect();
+
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let (_y0, cache_ref) = proj.forward_rows_batch(&d1, &d2, &x, &active_p, n_tokens, &mut pool);
+        let mut dx_ref = vec![0.0f32; n_tokens * in_dim];
+        let g_ref = proj.backward_rows_batch(&d1, &d2, &x, cache_ref, &dout, &mut dx_ref, &active_p, n_tokens, &mut pool);
+
+        let (_y1, cache_i16) = proj.forward_rows_batch(&d1, &d2, &x, &active_p, n_tokens, &mut pool);
+        let mut dx_i16 = vec![0.0f32; n_tokens * in_dim];
+        let g_i16 = proj.backward_rows_batch_i16(&d1, &d2, &x, cache_i16, &dout, &mut dx_i16, &active_p, n_tokens, &mut pool);
+
+        let rel_err = |a: &[f32], r: &[f32]| {
+            let num: f32 = a.iter().zip(r).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+            let den: f32 = r.iter().map(|y| y * y).sum::<f32>().sqrt().max(1e-12);
+            num / den
+        };
+        for t in 0..n_tokens {
+            let e = rel_err(&dx_i16[t * in_dim..(t + 1) * in_dim], &dx_ref[t * in_dim..(t + 1) * in_dim]);
+            assert!(e < 1e-2, "token {t}: dx relative error too high: {e:.2e}");
+        }
+        for (name, a, r) in [
+            ("da1", &g_i16.da1, &g_ref.da1), ("da2", &g_i16.da2, &g_ref.da2),
+            ("dd1", &g_i16.dd1, &g_ref.dd1), ("dd2", &g_i16.dd2, &g_ref.dd2),
+        ] {
+            let e = rel_err(a, r);
+            assert!(e < 1e-2, "{name}: relative error too high: {e:.2e}");
+        }
+    }
+
+    #[test]
+    fn backward_cols_batch_i16_matches_fp32() {
+        // Cols mirror of backward_rows_batch_i16_matches_fp32 (input-routed
+        // down-proj shape): pairing on shared active input block qq.
+        let (p, q, m, nd) = (6, 3, 8, 4);
+        let (d1, d2) = init_shared_atoms(nd, m, 0xD1CE);
+        let proj = SharedMonarchProj::new(p, q, m, nd, 0xFACE);
+        let b = m * m;
+        let in_dim = q * b;
+        let out_dim = p * b;
+        let n_tokens = 37;
+        let n_active = 2;
+        let x = randvec(n_tokens * in_dim, 0x6161);
+        let dout = randvec(n_tokens * out_dim, 0x6262);
+        let active_q: Vec<Vec<usize>> = (0..n_tokens).map(|t| {
+            (0..n_active).map(|k| (t * 2 + k * 7) % q).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+        }).collect();
+
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let (_y0, cache_ref) = proj.forward_cols_batch(&d1, &d2, &x, &active_q, n_tokens, &mut pool);
+        let mut dx_ref = vec![0.0f32; n_tokens * in_dim];
+        let g_ref = proj.backward_cols_batch(&d1, &d2, &x, cache_ref, &dout, &mut dx_ref, &active_q, n_tokens, &mut pool);
+
+        let (_y1, cache_i16) = proj.forward_cols_batch(&d1, &d2, &x, &active_q, n_tokens, &mut pool);
+        let mut dx_i16 = vec![0.0f32; n_tokens * in_dim];
+        let g_i16 = proj.backward_cols_batch_i16(&d1, &d2, &x, cache_i16, &dout, &mut dx_i16, &active_q, n_tokens, &mut pool);
+
+        let rel_err = |a: &[f32], r: &[f32]| {
+            let num: f32 = a.iter().zip(r).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+            let den: f32 = r.iter().map(|y| y * y).sum::<f32>().sqrt().max(1e-12);
+            num / den
+        };
+        for t in 0..n_tokens {
+            let e = rel_err(&dx_i16[t * in_dim..(t + 1) * in_dim], &dx_ref[t * in_dim..(t + 1) * in_dim]);
+            assert!(e < 1e-2, "token {t}: dx relative error too high: {e:.2e}");
+            // Inactive input blocks must stay exactly zero in dx.
+            for qq in 0..q {
+                if active_q[t].contains(&qq) { continue; }
+                for i in 0..b {
+                    assert_eq!(dx_i16[t * in_dim + qq * b + i], 0.0, "token {t} inactive qq={qq} i={i} dx nonzero");
+                }
+            }
+        }
+        for (name, a, r) in [
+            ("da1", &g_i16.da1, &g_ref.da1), ("da2", &g_i16.da2, &g_ref.da2),
+            ("dd1", &g_i16.dd1, &g_ref.dd1), ("dd2", &g_i16.dd2, &g_ref.dd2),
+        ] {
+            let e = rel_err(a, r);
+            assert!(e < 1e-2, "{name}: relative error too high: {e:.2e}");
         }
     }
 

@@ -33,6 +33,11 @@ counters!(
     // temporarily for the 2026-07-07 dual-token diagnosis and then removed:
     // ~9 Instant pairs per 8x8 block inflated the very path being measured).
     I16_WQUANT,
+    // Once-per-backward weight sub-block transpose + quantization on the
+    // int16 backward path (only nonzero when INT16_MATMUL=1) — backward's
+    // matvecs run against eff^T, so the transposed int16 copy is built once
+    // per backward_*_batch call and amortized across the whole batch.
+    I16_BWD_WQUANT,
 );
 
 /// RAII timer: accumulates elapsed wall time into `counter` on drop.
