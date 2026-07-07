@@ -3920,3 +3920,79 @@ first found real bugs via reasoning alone (inlining, redundant
 quantization), second required real measurement (the codebase's own
 profiling counters, since `perf`/`valgrind` aren't available here) to
 find the remainder. FFN's real-kernel port is the next concrete step.
+
+---
+
+## 2026-07-08 — `feat/int16-quant`: FFN ported, ~10% real forward win at production scale
+
+Ported the real dual-token int16 kernel into FFN's forward path
+(`forward_rows_batch`/`forward_cols_batch`, `src/kernels/monarch.rs`),
+which had been left on the fake-quant reference and was the whole
+reason forward only reached parity rather than a clean win in the
+previous entry — FFN is 56-59% of forward time, and fake-quant can only
+break even with fp32 at best (it quantizes and immediately dequantizes
+before running the plain fp32 kernel underneath).
+
+**The complication FFN has that `forward_batch` (attention's QKV/WO)
+doesn't: routing.** `forward_rows_batch`/`forward_cols_batch` take
+`active_p`/`active_q: &[Vec<usize>]` — a per-token list of which blocks
+are active for that token (top-k routing). Different tokens generally
+activate different, only partially-overlapping block subsets, so there's
+no simple "pair token t with token t+1" the way `forward_batch`'s
+uniform (every token touches every block) structure allowed. Solved
+with a per-call inverted index (block → list of tokens with that block
+active), pairing same-block tokens within each block's own list.
+
+**Design decisions made by measurement, not assumption, matching this
+arc's established discipline:**
+- Tokens processed in 8-token chunks for parallelism (each chunk owns a
+  disjoint output slice — no unsafe cross-thread sharing). 16-token
+  chunks were tried first (fewer, larger chunks seemed like it should
+  pair better) and measured WORSE at both scales — 16 rayon items over
+  12 threads leaves the slowest thread doing 2x its fair share. 8 won on
+  real numbers, not on paper reasoning.
+- Odd leftover tokens (a block's token list has odd length) self-pair
+  (same token in both SIMD lanes, second lane's output discarded)
+  rather than falling back to the fake-quant single-token path. The
+  fallback would have required keeping a second, separately-quantized
+  copy of every weight block alive per call — exactly the
+  redundant-requantization pattern this arc already found and removed
+  twice (2026-07-07/08 entries above). Self-pairing costs one wasted
+  64-float lane instead, and stays numerically identical to the
+  established per-call-fresh-scale quantization scheme.
+- The residual `x_t.to_vec()` per-token heap allocation flagged in the
+  previous entry (a known-bad pattern this arc had already found and
+  fixed twice elsewhere) was fixed in both fake-quant fallback paths
+  too, not just the new int16 path — loops restructured so each
+  activation slice quantizes once into a stack `[f32; 64]`.
+
+**Verified independently** (re-ran the exact commands myself, didn't
+take the implementing session's numbers on trust): `cargo test --release
+--lib` 112/112 (110 existing + 2 new parity tests for the routed path —
+pairing, odd leftovers, short final chunks, inactive-block zeroing, `zs`
+cache parity — all green with the flag off). Production scale,
+forward-only (`FULL=1 SEQ=256 STEPS=10 FWD_ONLY=1`):
+
+```
+FFN_FWD:       16,011.56ms (fp32) -> 14,252.56ms (int16)   -11.0%
+total forward:  3,514.79ms (fp32) ->  3,175.97ms (int16)    -9.6%
+```
+
+This is a genuine, verified win — not the parity result from the
+previous entry. **Toy scale shows no gain** (within ~5% run-to-run
+noise either direction): its FFN blocks are small enough to stay
+cache-resident, so the memory-bandwidth lever that drives the
+production win (per the 2026-07-07 bandwidth probe: int16 storage's
+advantage specifically requires a working set exceeding cache) never
+engages at that scale. Consistent with, not contradicting, the earlier
+finding — the same mechanism, just below its threshold at toy size.
+
+**Status:** real int16 SIMD forward path now delivers a genuine ~10%
+win at production scale across both attention (`forward_batch`) and FFN
+(`forward_rows_batch`/`forward_cols_batch`), gated behind `INT16_MATMUL`,
+default off, zero regression confirmed on the default path throughout.
+Backward (`backward_block_phase1`/`backward_block_hoisted`) is still on
+the earlier fake-quant reference for both attention and FFN — porting
+the real dual-token-style kernel there is the natural next step, though
+backward's da/dd accumulation shape (RESEARCH_LOG.md 2026-07-03) differs
+from forward's shape enough that it isn't a direct copy of this work.
