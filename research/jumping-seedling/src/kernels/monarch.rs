@@ -859,6 +859,20 @@ impl SharedMonarchProj {
         let in_dim = q * b;
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
+        // Real int16 SIMD path (see RESEARCH_LOG.md 2026-07-07): weights are
+        // quantized ONCE per step here — not per token/call like
+        // apply_block_int16's fake-quant reference — since eff1_all/eff2_all
+        // are already freshly rebuilt once per forward_batch call regardless.
+        // Only paid when the flag is on.
+        let (eff1_all_i16, eff1_scale, eff2_all_i16, eff2_scale) = if is_int16_matmul_enabled() {
+            let _t = crate::kernels::profiling::Timer::start(&crate::kernels::profiling::I16_WQUANT);
+            let (e1, s1) = SharedMonarchMatmul::quantize_i16(&eff1_all);
+            let (e2, s2) = SharedMonarchMatmul::quantize_i16(&eff2_all);
+            (e1, s1, e2, s2)
+        } else {
+            (Vec::new(), 0.0, Vec::new(), 0.0)
+        };
+
         // `y` is accumulated into (`out[..] += ..` in `apply_block`), so it
         // must start zeroed; `zs` is pure write-before-read (every element
         // assigned exactly once across the pp/qq loop), so `take_uninit`
@@ -866,41 +880,89 @@ impl SharedMonarchProj {
         let mut y   = pool.take_zeroed(n_tokens * p * b);
         let mut zs  = pool.take_f16_uninit(n_tokens * p * q * b);
 
-        let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [half::f16]| {
-            let x_t = &x[t * in_dim..(t + 1) * in_dim];
-            let mut y1 = vec![0.0f32; b];
-            let mut z_f32 = vec![0.0f32; b];
-            for pp in 0..p {
-                let ypp = &mut y_t[pp * b..(pp + 1) * b];
-                for qq in 0..q {
-                    let idx = pp * q + qq;
-                    if is_int16_matmul_enabled() {
-                        SharedMonarchMatmul::apply_block_int16(
-                            &eff1_all[idx * m * b..(idx + 1) * m * b],
-                            &eff2_all[idx * m * b..(idx + 1) * m * b],
-                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
-                        );
-                    } else {
-                        SharedMonarchMatmul::apply_block(
-                            &eff1_all[idx * m * b..(idx + 1) * m * b],
-                            &eff2_all[idx * m * b..(idx + 1) * m * b],
-                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
-                        );
+        // Fallback for the flag-off default path and for an odd leftover
+        // token: identical math/results to before this change, just callable
+        // on however many whole tokens (1 or 2) are in the given chunk.
+        let apply_tokens_individually = |base_t: usize, y_chunk: &mut [f32], zs_chunk: &mut [half::f16]| {
+            let n_in_chunk = y_chunk.len() / (p * b);
+            for local_t in 0..n_in_chunk {
+                let t = base_t + local_t;
+                let y_t = &mut y_chunk[local_t * p * b..(local_t + 1) * p * b];
+                let zs_t = &mut zs_chunk[local_t * p * q * b..(local_t + 1) * p * q * b];
+                let x_t = &x[t * in_dim..(t + 1) * in_dim];
+                let mut y1 = vec![0.0f32; b];
+                let mut z_f32 = vec![0.0f32; b];
+                for pp in 0..p {
+                    let ypp = &mut y_t[pp * b..(pp + 1) * b];
+                    for qq in 0..q {
+                        let idx = pp * q + qq;
+                        if is_int16_matmul_enabled() {
+                            SharedMonarchMatmul::apply_block_int16(
+                                &eff1_all[idx * m * b..(idx + 1) * m * b],
+                                &eff2_all[idx * m * b..(idx + 1) * m * b],
+                                &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                            );
+                        } else {
+                            SharedMonarchMatmul::apply_block(
+                                &eff1_all[idx * m * b..(idx + 1) * m * b],
+                                &eff2_all[idx * m * b..(idx + 1) * m * b],
+                                &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                            );
+                        }
+                        let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                        crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
                     }
-                    let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
-                    crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
+                }
+            }
+        };
+
+        let apply_token_pair = |pair_idx: usize, y_chunk: &mut [f32], zs_chunk: &mut [half::f16]| {
+            if y_chunk.len() != 2 * p * b || !is_int16_matmul_enabled() {
+                apply_tokens_individually(pair_idx * 2, y_chunk, zs_chunk);
+                return;
+            }
+            let (t0, t1) = (pair_idx * 2, pair_idx * 2 + 1);
+            let x_t0 = &x[t0 * in_dim..(t0 + 1) * in_dim];
+            let x_t1 = &x[t1 * in_dim..(t1 + 1) * in_dim];
+            let (y_t0, y_t1) = y_chunk.split_at_mut(p * b);
+            let (zs_t0, zs_t1) = zs_chunk.split_at_mut(p * q * b);
+            let (mut y1_0, mut y1_1) = (vec![0.0f32; b], vec![0.0f32; b]);
+            let (mut z0, mut z1) = (vec![0.0f32; b], vec![0.0f32; b]);
+            // qq outer, pp inner: x0/x1 depend only on qq, so quantize once
+            // per qq and reuse across every pp — quantizing inside the pp
+            // loop (the original structure) redid the same work `p` times
+            // per qq, which RESEARCH_LOG.md 2026-07-07/08 found was the
+            // dominant cause of this kernel measuring slower than fp32
+            // despite a validated primitive-level win.
+            for qq in 0..q {
+                let (x0_q, x0_scale) = SharedMonarchMatmul::quantize_i16_64(&x_t0[qq * b..(qq + 1) * b]);
+                let (x1_q, x1_scale) = SharedMonarchMatmul::quantize_i16_64(&x_t1[qq * b..(qq + 1) * b]);
+                for pp in 0..p {
+                    let idx = pp * q + qq;
+                    let ypp0 = &mut y_t0[pp * b..(pp + 1) * b];
+                    let ypp1 = &mut y_t1[pp * b..(pp + 1) * b];
+                    SharedMonarchMatmul::apply_block_dual_token_int16(
+                        &eff1_all_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                        &eff2_all_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                        &x0_q, x0_scale, &x1_q, x1_scale, m,
+                        &mut y1_0, &mut y1_1, &mut z0, &mut z1, ypp0, ypp1,
+                    );
+                    let z_dst0 = &mut zs_t0[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                    let z_dst1 = &mut zs_t1[(pp * q + qq) * b..(pp * q + qq + 1) * b];
+                    crate::kernels::f16_simd::f32_to_f16(&z0, z_dst0);
+                    crate::kernels::f16_simd::f32_to_f16(&z1, z_dst1);
                 }
             }
         };
 
         if n_tokens < Self::PARALLEL_THRESHOLD {
-            for (t, (y_t, zs_t)) in y.chunks_mut(p * b).zip(zs.chunks_mut(p * q * b)).enumerate() {
-                apply_token(t, y_t, zs_t);
+            for (k, (y_chunk, zs_chunk)) in y.chunks_mut(2 * p * b).zip(zs.chunks_mut(2 * p * q * b)).enumerate() {
+                apply_token_pair(k, y_chunk, zs_chunk);
             }
         } else {
             use rayon::prelude::*;
-            y.par_chunks_mut(p * b).zip(zs.par_chunks_mut(p * q * b)).enumerate()
-                .for_each(|(t, (y_t, zs_t))| apply_token(t, y_t, zs_t));
+            y.par_chunks_mut(2 * p * b).zip(zs.par_chunks_mut(2 * p * q * b)).enumerate()
+                .for_each(|(k, (y_chunk, zs_chunk))| apply_token_pair(k, y_chunk, zs_chunk));
         }
         (y, FwdCache { zs })
     }
@@ -1258,11 +1320,40 @@ impl SharedMonarchProj {
         let in_dim = q * b;
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
+        // Int16: fake-quant the weights ONCE per call, per m*b block slice —
+        // the exact slices apply_block_int16 would quantize itself, so the
+        // scales (and results) are unchanged; only the redundancy is gone.
+        // Profile 2026-07-07 (FULL=1 FWD_ONLY=1): FFN_FWD was ~1.8x its fp32
+        // time under INT16_MATMUL=1 purely because apply_block_int16 redid
+        // this quantization (plus 3 Vec allocs) per (token, pp, qq) block —
+        // this routed path was the whole remaining int16-vs-fp32 gap after
+        // the dual-token kernel itself reached parity or better on QKV/WO.
+        let (eff1_all, eff2_all) = if is_int16_matmul_enabled() {
+            let (mut e1, mut e2) = (eff1_all, eff2_all);
+            for blk in e1.chunks_mut(m * b) { SharedMonarchMatmul::fake_quant_i16(blk); }
+            for blk in e2.chunks_mut(m * b) { SharedMonarchMatmul::fake_quant_i16(blk); }
+            (e1, e2)
+        } else {
+            (eff1_all, eff2_all)
+        };
+
         let mut y  = pool.take_zeroed(n_tokens * p * b);
         let mut zs = pool.take_f16_uninit(n_tokens * p * q * b);
 
         let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [half::f16]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
+            // Int16: fake-quant this token's activations once per qq-slice
+            // (they were re-quantized per active pp before — same slices,
+            // same scales, just hoisted out of the pp loop).
+            let x_q: Vec<f32>;
+            let x_t: &[f32] = if is_int16_matmul_enabled() {
+                let mut xq = x_t.to_vec();
+                for sl in xq.chunks_mut(b) { SharedMonarchMatmul::fake_quant_i16(sl); }
+                x_q = xq;
+                &x_q
+            } else {
+                x_t
+            };
             let mut y1 = vec![0.0f32; b];
             let mut z_f32 = vec![0.0f32; b];
             for &pp in &active_p[t] {
@@ -1270,17 +1361,10 @@ impl SharedMonarchProj {
                 let ypp = &mut y_t[pp * b..(pp + 1) * b];
                 for qq in 0..q {
                     let idx = pp * q + qq;
-                    if is_int16_matmul_enabled() {
-                        SharedMonarchMatmul::apply_block_int16(
-                            &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
-                        );
-                    } else {
-                        SharedMonarchMatmul::apply_block(
-                            &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
-                        );
-                    }
+                    SharedMonarchMatmul::apply_block(
+                        &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
+                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                    );
                     let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
                 }
@@ -1312,11 +1396,37 @@ impl SharedMonarchProj {
         let in_dim = q * b;
         let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
 
+        // Int16: same once-per-call weight fake-quant hoist as
+        // forward_rows_batch — see the comment there for the measured
+        // rationale (FFN_FWD ~1.8x fp32 from per-block requantization).
+        let (eff1_all, eff2_all) = if is_int16_matmul_enabled() {
+            let (mut e1, mut e2) = (eff1_all, eff2_all);
+            for blk in e1.chunks_mut(m * b) { SharedMonarchMatmul::fake_quant_i16(blk); }
+            for blk in e2.chunks_mut(m * b) { SharedMonarchMatmul::fake_quant_i16(blk); }
+            (e1, e2)
+        } else {
+            (eff1_all, eff2_all)
+        };
+
         let mut y  = pool.take_zeroed(n_tokens * p * b);
         let mut zs = pool.take_f16_uninit(n_tokens * p * q * b);
 
         let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [half::f16]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
+            // Int16: fake-quant this token's active qq-slices once (they were
+            // re-quantized for every pp in 0..p before — same slices, same
+            // scales, hoisted out of the pp loop).
+            let x_q: Vec<f32>;
+            let x_t: &[f32] = if is_int16_matmul_enabled() {
+                let mut xq = x_t.to_vec();
+                for &qq in &active_q[t] {
+                    SharedMonarchMatmul::fake_quant_i16(&mut xq[qq * b..(qq + 1) * b]);
+                }
+                x_q = xq;
+                &x_q
+            } else {
+                x_t
+            };
             let mut y1 = vec![0.0f32; b];
             let mut z_f32 = vec![0.0f32; b];
             for pp in 0..p {
@@ -1324,17 +1434,10 @@ impl SharedMonarchProj {
                 for &qq in &active_q[t] {
                     debug_assert!(qq < q, "active col-block {qq} out of range");
                     let idx = pp * q + qq;
-                    if is_int16_matmul_enabled() {
-                        SharedMonarchMatmul::apply_block_int16(
-                            &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
-                        );
-                    } else {
-                        SharedMonarchMatmul::apply_block(
-                            &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                            &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
-                        );
-                    }
+                    SharedMonarchMatmul::apply_block(
+                        &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
+                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                    );
                     let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
                 }
@@ -1688,11 +1791,25 @@ impl SharedMonarchMatmul {
     /// under injected heavy-tail outliers, and does not compound when
     /// accumulated across a batch of tokens.
     fn fake_quant_i16(values: &mut [f32]) {
-        let max_abs = values.iter().fold(1e-12f32, |m, &v| m.max(v.abs()));
-        let scale = max_abs / 32767.0;
-        for v in values.iter_mut() {
-            let q = (*v / scale).round().clamp(i16::MIN as f32, i16::MAX as f32);
-            *v = q * scale;
+        // AVX2 body: same numerics contract, but 8-wide abs-max fold and one
+        // divide total instead of a scalar divide per element (rounding is
+        // nearest-even vs the scalar `.round()`'s half-away — differs by one
+        // quant level on exact .5 fractions only, inside every consumer's
+        // tolerance). The scalar loop was measurable once the per-block
+        // redundancy around it was fixed (2026-07-07 int16 profiling arc).
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            unsafe { fake_quant_i16_avx2(values) };
+            return;
+        }
+        #[allow(unreachable_code)]
+        {
+            let max_abs = values.iter().fold(1e-12f32, |m, &v| m.max(v.abs()));
+            let scale = max_abs / 32767.0;
+            for v in values.iter_mut() {
+                let q = (*v / scale).round().clamp(i16::MIN as f32, i16::MAX as f32);
+                *v = q * scale;
+            }
         }
     }
 
@@ -1713,6 +1830,129 @@ impl SharedMonarchMatmul {
         Self::fake_quant_i16(&mut eff2_q);
         Self::fake_quant_i16(&mut x_q);
         Self::apply_block(&eff1_q, &eff2_q, &x_q, m, y1, z, out);
+    }
+
+    /// Symmetric per-tensor int16 quantization returning both the quantized
+    /// values and the scale (unlike `fake_quant_i16`, which round-trips back
+    /// to `f32` in place — this keeps the `i16` representation for real SIMD
+    /// use). Scale is fresh from this call's own data, per the numerics
+    /// validated in RESEARCH_LOG.md 2026-07-05/06.
+    /// Target magnitude reserves headroom below `i16::MAX` for the `i32`
+    /// accumulator in `matvec8_dual_i16`'s `madd_epi16`-based reduction: a
+    /// row-dot sums 8 products, so worst case is `8 * target^2`, and
+    /// `target=8192` keeps that at ~0.25 * i32::MAX — quantizing to the full
+    /// `32767` range instead overflows `i32` by ~4x in the worst case (two
+    /// near-max operands), which is exactly the bug this constant fixes:
+    /// `apply_block_dual_token_int16_matches_fp32` failed with ~86% relative
+    /// error (silent i32 wraparound, not a rounding-precision issue) before
+    /// this was added. Fake-quant paths (`fake_quant_i16`) don't need this —
+    /// they round-trip back to `f32` immediately and never accumulate in
+    /// integer domain.
+    const QUANTIZE_HEADROOM_TARGET: f32 = 8192.0;
+
+    fn quantize_i16(values: &[f32]) -> (Vec<i16>, f32) {
+        // AVX2 body — the I16_WQUANT counter measured this scalar loop at
+        // ~82ms/step at production scale (2026-07-07), pure divide-per-element
+        // cost on the once-per-forward weight quantization.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            return unsafe { quantize_i16_avx2(values) };
+        }
+        #[allow(unreachable_code)]
+        {
+            let max_abs = values.iter().fold(1e-12f32, |m, &v| m.max(v.abs()));
+            let scale = max_abs / Self::QUANTIZE_HEADROOM_TARGET;
+            let q = values.iter().map(|&v| (v / scale).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16).collect();
+            (q, scale)
+        }
+    }
+
+    /// Same as `quantize_i16` but into a fixed-size stack array (no heap
+    /// allocation) — used in the `apply_block_dual_token_int16` hot path,
+    /// called once per `(pp,qq)` block. A `Vec` allocation here was a real,
+    /// measured regression: `layer_bench`'s isolated forward/prefill
+    /// benchmark showed the dual-token kernel ~14% faster, but the
+    /// full-model `profile` binary showed forward ~30-50% SLOWER at both
+    /// toy and production scale — the discrepancy was exactly this
+    /// allocation churn scaling with block count, not the arithmetic.
+    /// Fixed size 64 matches the `m==8` fast path this is only used in.
+    #[inline]
+    fn quantize_i16_64(values: &[f32]) -> ([i16; 64], f32) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if values.len() == 64 {
+            // AVX2 path: the scalar loop below was the measured bottleneck of
+            // the whole dual-token int16 forward (profile 2026-07-07:
+            // I16_ZQUANT alone was ~16% of forward wall time, larger than
+            // either matvec stage — 64 scalar `divss` plus a serially-
+            // dependent max fold per call, per (pp,qq) block). Vectorized:
+            // 8-wide abs-max fold, one divide total (the reciprocal), and
+            // `packs_epi32`'s signed saturation replaces the explicit clamp.
+            // Rounding: `cvtps_epi32` is round-to-nearest-even vs the scalar
+            // path's `.round()` half-away-from-zero — differs only on exact
+            // .5 fractions by one quant level, far inside the parity test's
+            // tolerance.
+            return unsafe { quantize_i16_64_avx2(values.as_ptr()) };
+        }
+        let max_abs = values.iter().fold(1e-12f32, |m, &v| m.max(v.abs()));
+        let scale = max_abs / Self::QUANTIZE_HEADROOM_TARGET;
+        let mut out = [0i16; 64];
+        for (o, &v) in out.iter_mut().zip(values.iter()) {
+            *o = (v / scale).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+        (out, scale)
+    }
+
+    /// Real int16 SIMD forward for a PAIR of tokens against one already-
+    /// expanded, already-int16-quantized block — this is the first
+    /// non-fake-quant int16 kernel in this arc (see RESEARCH_LOG.md
+    /// 2026-07-07 for the design rationale: dual-token packing, not
+    /// dual-block packing, so the same weight row's `i16` broadcast is
+    /// reused for both tokens per instruction and the weight quantization
+    /// itself is amortized once per step by the caller, not once per call).
+    ///
+    /// `eff1_i16`/`eff2_i16` are already quantized (by the caller, once per
+    /// `forward_batch` call) with scales `eff1_scale`/`eff2_scale`.
+    /// `x0_i16`/`x1_i16` are ALSO already quantized by the caller — this was
+    /// originally raw `f32` quantized inside this function, but `x0`/`x1`
+    /// depend only on `qq` (not `pp`), so quantizing here meant redoing the
+    /// same work `p` times per `qq` in `forward_batch`'s `(pp,qq)` loop. See
+    /// RESEARCH_LOG.md 2026-07-07/08: this, plus missing `#[inline]` on the
+    /// new kernels, was found (via Fable review + verification) to be why
+    /// the real SIMD kernel measured SLOWER than fp32 in the full model
+    /// despite a validated ~15% win at the primitive level — every
+    /// benchmark that showed a win pre-quantized data outside the timed
+    /// loop, so none of them ever measured this cost. The intermediate
+    /// `z0`/`z1` are still quantized fresh mid-call (they're genuinely
+    /// per-`(pp,qq)` data, not hoistable) — covered by
+    /// `apply_block_dual_token_int16_matches_fp32`'s parity test.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_block_dual_token_int16(
+        eff1_i16: &[i16], eff1_scale: f32, eff2_i16: &[i16], eff2_scale: f32,
+        x0_i16: &[i16], x0_scale: f32, x1_i16: &[i16], x1_scale: f32, m: usize,
+        y1_0: &mut [f32], y1_1: &mut [f32], z0: &mut [f32], z1: &mut [f32],
+        out0: &mut [f32], out1: &mut [f32],
+    ) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if m == 8 {
+            unsafe {
+                apply_block_avx2_dual_i16(
+                    eff1_i16.as_ptr(), eff1_scale, eff2_i16.as_ptr(), eff2_scale,
+                    x0_i16.as_ptr(), x0_scale, x1_i16.as_ptr(), x1_scale,
+                    y1_0.as_mut_ptr(), y1_1.as_mut_ptr(), z0.as_mut_ptr(), z1.as_mut_ptr(),
+                    out0.as_mut_ptr(), out1.as_mut_ptr(),
+                );
+            }
+            return;
+        }
+        // Portable/non-m==8 fallback: no dual-packing win, but numerically
+        // identical in kind to apply_block_int16 (fresh-scale fake-quant),
+        // just called once per token instead of packed together.
+        let eff1_f: Vec<f32> = eff1_i16.iter().map(|&v| v as f32 * eff1_scale).collect();
+        let eff2_f: Vec<f32> = eff2_i16.iter().map(|&v| v as f32 * eff2_scale).collect();
+        let x0_f: Vec<f32> = x0_i16.iter().map(|&v| v as f32 * x0_scale).collect();
+        let x1_f: Vec<f32> = x1_i16.iter().map(|&v| v as f32 * x1_scale).collect();
+        Self::apply_block_int16(&eff1_f, &eff2_f, &x0_f, m, y1_0, z0, out0);
+        Self::apply_block_int16(&eff1_f, &eff2_f, &x1_f, m, y1_1, z1, out1);
     }
 
     /// VJP for one `(pp,qq,token)` triple against an already-expanded block.
@@ -2107,6 +2347,246 @@ unsafe fn apply_block_avx2(
     for j in 0..M {
         matvec8_accum(out.as_mut_ptr().add(j * M), eff2.as_ptr().add(j * 64), z.as_ptr().add(j * M));
     }
+}
+
+/// 8-wide abs-max fold + scalar tail; the shared front half of the AVX2
+/// quantize/fake-quant bodies below.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+unsafe fn max_abs_avx2(p: *const f32, n: usize) -> f32 {
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    let mut vmax = _mm256_set1_ps(1e-12f32);
+    let mut i = 0;
+    while i + 8 <= n {
+        vmax = _mm256_max_ps(vmax, _mm256_and_ps(_mm256_loadu_ps(p.add(i)), abs_mask));
+        i += 8;
+    }
+    let m4 = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+    let m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+    let m1 = _mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 1));
+    let mut max_abs = _mm_cvtss_f32(m1);
+    while i < n {
+        max_abs = max_abs.max((*p.add(i)).abs());
+        i += 1;
+    }
+    max_abs
+}
+
+/// AVX2 body of `fake_quant_i16`: in-place int16 round-trip, arbitrary length.
+/// No explicit clamp needed — |v| <= max_abs so |v/scale| <= 32767 by
+/// construction.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+unsafe fn fake_quant_i16_avx2(values: &mut [f32]) {
+    let n = values.len();
+    let p = values.as_mut_ptr();
+    let max_abs = max_abs_avx2(p, n);
+    let scale = max_abs / 32767.0;
+    let inv = _mm256_set1_ps(32767.0 / max_abs);
+    let sc = _mm256_set1_ps(scale);
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = _mm256_loadu_ps(p.add(i));
+        let q = _mm256_cvtepi32_ps(_mm256_cvtps_epi32(_mm256_mul_ps(v, inv)));
+        _mm256_storeu_ps(p.add(i), _mm256_mul_ps(q, sc));
+        i += 8;
+    }
+    while i < n {
+        let q = (*p.add(i) / scale).round().clamp(i16::MIN as f32, i16::MAX as f32);
+        *p.add(i) = q * scale;
+        i += 1;
+    }
+}
+
+/// AVX2 body of `quantize_i16`: arbitrary-length variant of
+/// `quantize_i16_64_avx2` (same scale contract, `packs_epi32` saturation as
+/// the clamp), 16 elements per iteration + scalar tail.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+unsafe fn quantize_i16_avx2(values: &[f32]) -> (Vec<i16>, f32) {
+    let n = values.len();
+    let p = values.as_ptr();
+    let max_abs = max_abs_avx2(p, n);
+    let scale = max_abs / SharedMonarchMatmul::QUANTIZE_HEADROOM_TARGET;
+    let inv = _mm256_set1_ps(SharedMonarchMatmul::QUANTIZE_HEADROOM_TARGET / max_abs);
+    let mut out = vec![0i16; n];
+    let o = out.as_mut_ptr();
+    let mut i = 0;
+    while i + 16 <= n {
+        let a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(p.add(i)), inv));
+        let b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(p.add(i + 8)), inv));
+        let packed = _mm256_packs_epi32(a, b);
+        let fixed = _mm256_permute4x64_epi64(packed, 0b1101_1000);
+        _mm256_storeu_si256(o.add(i) as *mut __m256i, fixed);
+        i += 16;
+    }
+    while i < n {
+        *o.add(i) = (*p.add(i) / scale).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        i += 1;
+    }
+    (out, scale)
+}
+
+/// AVX2 body of `quantize_i16_64` (see its doc/rationale). `p` must point to
+/// exactly 64 valid `f32`s. Returns the quantized values and the scale, same
+/// contract as the scalar path: `scale = max_abs / QUANTIZE_HEADROOM_TARGET`,
+/// out[i] = round(values[i] / scale) saturated to i16.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+unsafe fn quantize_i16_64_avx2(p: *const f32) -> ([i16; 64], f32) {
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    let mut vmax = _mm256_set1_ps(1e-12f32);
+    for i in 0..8 {
+        let v = _mm256_loadu_ps(p.add(i * 8));
+        vmax = _mm256_max_ps(vmax, _mm256_and_ps(v, abs_mask));
+    }
+    let m4 = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+    let m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+    let m1 = _mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 1));
+    let max_abs = _mm_cvtss_f32(m1);
+    let scale = max_abs / SharedMonarchMatmul::QUANTIZE_HEADROOM_TARGET;
+    let inv = _mm256_set1_ps(SharedMonarchMatmul::QUANTIZE_HEADROOM_TARGET / max_abs);
+    let mut out = [0i16; 64];
+    for i in 0..4 {
+        let a = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(p.add(i * 16)), inv));
+        let b = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(p.add(i * 16 + 8)), inv));
+        // packs interleaves 128-bit lanes: [a_lo, b_lo, a_hi, b_hi] -> permute
+        // back to source order. Signed saturation = the clamp, for free.
+        let packed = _mm256_packs_epi32(a, b);
+        let fixed = _mm256_permute4x64_epi64(packed, 0b1101_1000);
+        _mm256_storeu_si256(out.as_mut_ptr().add(i * 16) as *mut __m256i, fixed);
+    }
+    (out, scale)
+}
+
+/// (out0, out1) = [dot(mat[r*8..r*8+8], vec0/vec1) for r in 0..8], as two
+/// 8-lane i32 vectors — one 8x8 int16 matrix times TWO 8-element vectors,
+/// one `madd_epi16` per row instead of two separate fp32 8-wide dot products.
+/// The weight row is broadcast into both 16-lane halves (cheap, a single
+/// register op — no memory repack, unlike the earlier dual-BLOCK-packing
+/// spike which packed two different weight rows and paid a real repack
+/// cost); the two tokens' vectors occupy the low/high halves instead. See
+/// RESEARCH_LOG.md 2026-07-07 for why this pairing (token x token) was
+/// chosen over block x block: it lines up with real per-step weight reuse.
+///
+/// Reduction is a hadd TREE over all 8 rows (6 `hadd_epi32` + 2 permutes for
+/// the whole matrix) rather than the original per-row shuffle/add reduction
+/// with scalar extraction: per-row reduction cost 8x(2 shuffles + 2 adds +
+/// extract + 2 x 4-byte scalar stores), and the caller then reloaded those 8
+/// scalar stores as one 32-byte vector load — a store-forwarding stall on
+/// every row-group. (The earlier "no hadd" note from int16_dualblock_spike v3
+/// applied to hadd per row-pair as the final reduce; amortized 6-for-8-rows in
+/// a tree, with results staying in registers, it wins instead.) Layout note:
+/// each madd lane holds a 2-element partial, low 128 lane = token0, high =
+/// token1; hadd(a,b) per lane = [a0+a1, a2+a3, b0+b1, b2+b3], so two tree
+/// levels yield [row0..row3] per lane and the cross-lane permutes assemble
+/// rows 0..7 of each token.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn matvec8_dual_i16(mat: *const i16, vec0: *const i16, vec1: *const i16) -> (__m256i, __m256i) {
+    let vpack = _mm256_set_m128i(_mm_loadu_si128(vec1 as *const __m128i), _mm_loadu_si128(vec0 as *const __m128i));
+    let mut p = [_mm256_setzero_si256(); 8];
+    for r in 0..8 {
+        let row = _mm_loadu_si128(mat.add(r * 8) as *const __m128i);
+        p[r] = _mm256_madd_epi16(_mm256_set_m128i(row, row), vpack);
+    }
+    let h01 = _mm256_hadd_epi32(p[0], p[1]);
+    let h23 = _mm256_hadd_epi32(p[2], p[3]);
+    let h45 = _mm256_hadd_epi32(p[4], p[5]);
+    let h67 = _mm256_hadd_epi32(p[6], p[7]);
+    let q0 = _mm256_hadd_epi32(h01, h23); // per lane: rows 0..3 of that token
+    let q1 = _mm256_hadd_epi32(h45, h67); // per lane: rows 4..7
+    (
+        _mm256_permute2x128_si256(q0, q1, 0x20), // token0: rows 0..7
+        _mm256_permute2x128_si256(q0, q1, 0x31), // token1: rows 0..7
+    )
+}
+
+/// Real int16 SIMD forward for one block, two tokens at once. `eff1`/`eff2`
+/// are pre-quantized int16 (once per step by the caller); `x0`/`x1` are
+/// pre-quantized int16 for this specific call (fresh per-token scale). The
+/// intermediate `z0`/`z1` are quantized fresh mid-call, before the second
+/// matmul stage — see `apply_block_dual_token_int16`'s doc comment.
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn apply_block_avx2_dual_i16(
+    eff1: *const i16, eff1_scale: f32, eff2: *const i16, eff2_scale: f32,
+    x0: *const i16, x0_scale: f32, x1: *const i16, x1_scale: f32,
+    y1_0: *mut f32, y1_1: *mut f32, z0: *mut f32, z1: *mut f32,
+    out0: *mut f32, out1: *mut f32,
+) {
+    const M: usize = 8;
+    // Rescale vectorized (profile 2026-07-07: after the quantize fix, the
+    // remaining int16-path overhead vs fp32 was concentrated in these scalar
+    // i32->f32 rescale loops and the scalar 8x8 transpose): one 8-wide
+    // cvt+mul per row instead of 16 scalar convert/multiply/store ops.
+    let s0 = _mm256_set1_ps(eff1_scale * x0_scale);
+    let s1 = _mm256_set1_ps(eff1_scale * x1_scale);
+    for i in 0..M {
+        let (o0, o1) = matvec8_dual_i16(eff1.add(i * 64), x0.add(i * M), x1.add(i * M));
+        _mm256_storeu_ps(y1_0.add(i * M), _mm256_mul_ps(_mm256_cvtepi32_ps(o0), s0));
+        _mm256_storeu_ps(y1_1.add(i * M), _mm256_mul_ps(_mm256_cvtepi32_ps(o1), s1));
+    }
+    transpose8x8_ps(y1_0, z0);
+    transpose8x8_ps(y1_1, z1);
+    let z0_slice = std::slice::from_raw_parts(z0, M * M);
+    let z1_slice = std::slice::from_raw_parts(z1, M * M);
+    let (z0_q, z0_scale) = SharedMonarchMatmul::quantize_i16_64(z0_slice);
+    let (z1_q, z1_scale) = SharedMonarchMatmul::quantize_i16_64(z1_slice);
+    let s0 = _mm256_set1_ps(eff2_scale * z0_scale);
+    let s1 = _mm256_set1_ps(eff2_scale * z1_scale);
+    for j in 0..M {
+        let (o0, o1) = matvec8_dual_i16(eff2.add(j * 64), z0_q.as_ptr().add(j * M), z1_q.as_ptr().add(j * M));
+        let v0 = _mm256_cvtepi32_ps(o0);
+        let v1 = _mm256_cvtepi32_ps(o1);
+        _mm256_storeu_ps(out0.add(j * M), _mm256_fmadd_ps(v0, s0, _mm256_loadu_ps(out0.add(j * M))));
+        _mm256_storeu_ps(out1.add(j * M), _mm256_fmadd_ps(v1, s1, _mm256_loadu_ps(out1.add(j * M))));
+    }
+}
+
+/// 8x8 f32 transpose, `dst[j*8+i] = src[i*8+j]`, via the standard AVX
+/// unpack/shuffle/permute ladder — replaces the 64-iteration scalar loop
+/// that the 2026-07-07 profile flagged (I16_TRANSPOSE) as a top-4 cost of
+/// the dual-token int16 block kernel. `src` and `dst` must not alias.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn transpose8x8_ps(src: *const f32, dst: *mut f32) {
+    let r0 = _mm256_loadu_ps(src);
+    let r1 = _mm256_loadu_ps(src.add(8));
+    let r2 = _mm256_loadu_ps(src.add(16));
+    let r3 = _mm256_loadu_ps(src.add(24));
+    let r4 = _mm256_loadu_ps(src.add(32));
+    let r5 = _mm256_loadu_ps(src.add(40));
+    let r6 = _mm256_loadu_ps(src.add(48));
+    let r7 = _mm256_loadu_ps(src.add(56));
+    let t0 = _mm256_unpacklo_ps(r0, r1);
+    let t1 = _mm256_unpackhi_ps(r0, r1);
+    let t2 = _mm256_unpacklo_ps(r2, r3);
+    let t3 = _mm256_unpackhi_ps(r2, r3);
+    let t4 = _mm256_unpacklo_ps(r4, r5);
+    let t5 = _mm256_unpackhi_ps(r4, r5);
+    let t6 = _mm256_unpacklo_ps(r6, r7);
+    let t7 = _mm256_unpackhi_ps(r6, r7);
+    let s0 = _mm256_shuffle_ps(t0, t2, 0b0100_0100);
+    let s1 = _mm256_shuffle_ps(t0, t2, 0b1110_1110);
+    let s2 = _mm256_shuffle_ps(t1, t3, 0b0100_0100);
+    let s3 = _mm256_shuffle_ps(t1, t3, 0b1110_1110);
+    let s4 = _mm256_shuffle_ps(t4, t6, 0b0100_0100);
+    let s5 = _mm256_shuffle_ps(t4, t6, 0b1110_1110);
+    let s6 = _mm256_shuffle_ps(t5, t7, 0b0100_0100);
+    let s7 = _mm256_shuffle_ps(t5, t7, 0b1110_1110);
+    _mm256_storeu_ps(dst,          _mm256_permute2f128_ps(s0, s4, 0x20));
+    _mm256_storeu_ps(dst.add(8),   _mm256_permute2f128_ps(s1, s5, 0x20));
+    _mm256_storeu_ps(dst.add(16),  _mm256_permute2f128_ps(s2, s6, 0x20));
+    _mm256_storeu_ps(dst.add(24),  _mm256_permute2f128_ps(s3, s7, 0x20));
+    _mm256_storeu_ps(dst.add(32),  _mm256_permute2f128_ps(s0, s4, 0x31));
+    _mm256_storeu_ps(dst.add(40),  _mm256_permute2f128_ps(s1, s5, 0x31));
+    _mm256_storeu_ps(dst.add(48),  _mm256_permute2f128_ps(s2, s6, 0x31));
+    _mm256_storeu_ps(dst.add(56),  _mm256_permute2f128_ps(s3, s7, 0x31));
 }
 
 /// Same math as `bwd_block_avx2`, but `eff1`/`eff2` are precomputed
@@ -2557,6 +3037,52 @@ mod tests {
             num / den
         };
         assert!(rel_err < 1e-3, "int16 fake-quant apply_block relative error too high: {rel_err:.2e}");
+    }
+
+    #[test]
+    fn apply_block_dual_token_int16_matches_fp32() {
+        // Real int16 SIMD kernel (not fake-quant): one block, two DIFFERENT
+        // tokens processed together. Checks both tokens' outputs against
+        // apply_block run independently per token, and additionally checks
+        // the two dual-token outputs are NOT accidentally identical (i.e.
+        // the two lanes really are carrying different tokens' data, not a
+        // copy-paste bug where token1's result silently mirrors token0's).
+        let m = 8;
+        let b = m * m;
+        let eff1 = randvec(m * b, 0xA0A0);
+        let eff2 = randvec(m * b, 0xB0B0);
+        let x0 = randvec(m * m, 0xC0C0);
+        let x1 = randvec(m * m, 0xD0D0);
+
+        let (eff1_i16, eff1_scale) = SharedMonarchMatmul::quantize_i16(&eff1);
+        let (eff2_i16, eff2_scale) = SharedMonarchMatmul::quantize_i16(&eff2);
+        let (x0_i16, x0_scale) = SharedMonarchMatmul::quantize_i16_64(&x0);
+        let (x1_i16, x1_scale) = SharedMonarchMatmul::quantize_i16_64(&x1);
+
+        let (mut y1_0, mut z0, mut out0) = (vec![0.0f32; b], vec![0.0f32; b], vec![0.0f32; b]);
+        let (mut y1_1, mut z1, mut out1) = (vec![0.0f32; b], vec![0.0f32; b], vec![0.0f32; b]);
+        SharedMonarchMatmul::apply_block_dual_token_int16(
+            &eff1_i16, eff1_scale, &eff2_i16, eff2_scale, &x0_i16, x0_scale, &x1_i16, x1_scale, m,
+            &mut y1_0, &mut y1_1, &mut z0, &mut z1, &mut out0, &mut out1,
+        );
+
+        let (mut ry1, mut rz, mut rout0) = (vec![0.0f32; b], vec![0.0f32; b], vec![0.0f32; b]);
+        SharedMonarchMatmul::apply_block(&eff1, &eff2, &x0, m, &mut ry1, &mut rz, &mut rout0);
+        let (mut ry1b, mut rzb, mut rout1) = (vec![0.0f32; b], vec![0.0f32; b], vec![0.0f32; b]);
+        SharedMonarchMatmul::apply_block(&eff1, &eff2, &x1, m, &mut ry1b, &mut rzb, &mut rout1);
+
+        let rel_err = |a: &[f32], b: &[f32]| {
+            let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+            let den: f32 = b.iter().map(|y| y * y).sum::<f32>().sqrt().max(1e-12);
+            num / den
+        };
+        let err0 = rel_err(&out0, &rout0);
+        let err1 = rel_err(&out1, &rout1);
+        assert!(err0 < 1e-2, "token0 relative error too high: {err0:.2e}");
+        assert!(err1 < 1e-2, "token1 relative error too high: {err1:.2e}");
+
+        let cross_err = rel_err(&out0, &out1);
+        assert!(cross_err > 1e-3, "token0 and token1 outputs suspiciously identical (cross_err={cross_err:.2e}) — dual-lane bug?");
     }
 
     #[test]

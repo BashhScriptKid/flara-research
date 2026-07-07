@@ -27,6 +27,12 @@ counters!(
     // isolate its share (Fable review 2026-07-05: flagged as the one
     // unexamined serial path that scales adversely at production dict_k).
     MONARCH_CONTRACT,
+    // Once-per-forward_batch weight quantization on the int16 path (only
+    // nonzero when INT16_MATMUL=1) — coarse enough that the timer itself is
+    // noise-level, unlike per-(pp,qq)-block timers (which were used
+    // temporarily for the 2026-07-07 dual-token diagnosis and then removed:
+    // ~9 Instant pairs per 8x8 block inflated the very path being measured).
+    I16_WQUANT,
 );
 
 /// RAII timer: accumulates elapsed wall time into `counter` on drop.
