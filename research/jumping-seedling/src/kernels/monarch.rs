@@ -1315,6 +1315,13 @@ impl SharedMonarchProj {
         &self, d1: &[f32], d2: &[f32], x: &[f32], active_p: &[Vec<usize>], n_tokens: usize,
         pool: &mut crate::kernels::scratch::BufPool,
     ) -> (Vec<f32>, FwdCache) {
+        // Real int16 dual-token path (m == 8 only, same gate as the AVX2 fast
+        // path inside apply_block_dual_token_int16). Everything below this
+        // dispatch is the fp32 default plus the fake-quant reference for the
+        // flag-on m != 8 case.
+        if is_int16_matmul_enabled() && self.m == 8 {
+            return self.forward_rows_batch_i16(d1, d2, x, active_p, n_tokens, pool);
+        }
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let in_dim = q * b;
@@ -1342,28 +1349,37 @@ impl SharedMonarchProj {
 
         let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [half::f16]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
-            // Int16: fake-quant this token's activations once per qq-slice
-            // (they were re-quantized per active pp before — same slices,
-            // same scales, just hoisted out of the pp loop).
-            let x_q: Vec<f32>;
-            let x_t: &[f32] = if is_int16_matmul_enabled() {
-                let mut xq = x_t.to_vec();
-                for sl in xq.chunks_mut(b) { SharedMonarchMatmul::fake_quant_i16(sl); }
-                x_q = xq;
-                &x_q
-            } else {
-                x_t
-            };
             let mut y1 = vec![0.0f32; b];
             let mut z_f32 = vec![0.0f32; b];
-            for &pp in &active_p[t] {
-                debug_assert!(pp < p, "active row-block {pp} out of range");
-                let ypp = &mut y_t[pp * b..(pp + 1) * b];
-                for qq in 0..q {
+            // Int16 fake-quant fallback (flag on but m != 8 — m == 8 takes
+            // forward_rows_batch_i16 above): quantize each qq-slice once into
+            // a stack buffer, reused across that qq's active pps. This
+            // replaces the previous whole-token `x_t.to_vec()` heap copy
+            // (flagged in RESEARCH_LOG.md 2026-07-07/08 as a residual
+            // per-token allocation) — loop order swapped to qq-outer so the
+            // per-qq quantization is still done exactly once. `y`
+            // accumulation order per (pp,qq) is unchanged (qq ascending for
+            // each pp either way), so results are bit-identical.
+            let int16 = is_int16_matmul_enabled();
+            let mut xq_buf = [0.0f32; 64];
+            let mut xq_vec: Vec<f32> = if int16 && b > 64 { vec![0.0; b] } else { Vec::new() };
+            for qq in 0..q {
+                let x_src = &x_t[qq * b..(qq + 1) * b];
+                let x_blk: &[f32] = if int16 {
+                    let dst: &mut [f32] = if b <= 64 { &mut xq_buf[..b] } else { &mut xq_vec[..] };
+                    dst.copy_from_slice(x_src);
+                    SharedMonarchMatmul::fake_quant_i16(dst);
+                    dst
+                } else {
+                    x_src
+                };
+                for &pp in &active_p[t] {
+                    debug_assert!(pp < p, "active row-block {pp} out of range");
+                    let ypp = &mut y_t[pp * b..(pp + 1) * b];
                     let idx = pp * q + qq;
                     SharedMonarchMatmul::apply_block(
                         &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                        x_blk, m, &mut y1, &mut z_f32, ypp,
                     );
                     let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
@@ -1383,6 +1399,148 @@ impl SharedMonarchProj {
         (y, FwdCache { zs })
     }
 
+    /// Token chunk width for the real-int16 routed forward paths
+    /// (`forward_rows_batch_i16`/`forward_cols_batch_i16`): tokens are
+    /// processed in contiguous chunks so each rayon work item owns a disjoint
+    /// slice of `y`/`zs` (safe parallelism, same shape as `forward_batch`'s
+    /// token-pair chunks), while being wide enough that most blocks find
+    /// token PAIRS inside a chunk. Production FFN routing (p=48,
+    /// n_active=12): ~2 tokens per block per 8-token chunk on average, so
+    /// roughly a quarter of (token, block) work items end up as odd-leftover
+    /// self-pairs. Measured 2026-07-07 (FULL=1 FWD_ONLY=1 SEQ=256): 16-token
+    /// chunks pair better on paper but lost to 8 at both scales (FFN_FWD
+    /// 14.7s vs 14.4s production; clear toy regression) — 256/16 = 16 rayon
+    /// items on 12 threads leaves the slowest thread doing 2x its share,
+    /// which costs more than the extra leftovers save.
+    const I16_ROUTED_TOKEN_CHUNK: usize = 8;
+
+    /// Real int16 dual-token forward for the ROUTED rows path. `m == 8` only
+    /// (the caller `forward_rows_batch` checks); same math/layout contract as
+    /// `forward_rows_batch` (`y` zeroed + accumulated on active blocks only,
+    /// `zs` written exactly on active `(pp,qq)` entries).
+    ///
+    /// Unlike `forward_batch` (weights shared by ALL tokens, so consecutive
+    /// tokens always pair), routing means a block `pp` is only shared by the
+    /// subset of tokens with `pp` in `active_p[t]`. So: per token-chunk,
+    /// build an inverted index (block -> chunk-local tokens routed to it) and
+    /// pair tokens within each block's list. An odd leftover token runs the
+    /// SAME dual kernel with itself in both lanes, second lane's outputs into
+    /// discarded stack scratch — chosen over the fake-quant single-token
+    /// reference because that would need a second, fake-quantized copy of
+    /// every weight block kept alive just for leftovers (or worse, per-call
+    /// requantization — the exact pattern RESEARCH_LOG.md 2026-07-07/08
+    /// removed twice), while the self-pair costs one extra 64-float
+    /// accumulate and stays numerically identical to the paired path.
+    fn forward_rows_batch_i16(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], active_p: &[Vec<usize>], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
+    ) -> (Vec<f32>, FwdCache) {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        debug_assert_eq!(b, 64, "forward_rows_batch_i16 requires m == 8");
+        let in_dim = q * b;
+        let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+        // Weights quantized for real (i16 + scale, not fake-quant) ONCE per
+        // call — same amortization as `forward_batch`'s int16 path.
+        let (eff1_i16, eff1_scale, eff2_i16, eff2_scale) = {
+            let _t = crate::kernels::profiling::Timer::start(&crate::kernels::profiling::I16_WQUANT);
+            let (e1, s1) = SharedMonarchMatmul::quantize_i16(&eff1_all);
+            let (e2, s2) = SharedMonarchMatmul::quantize_i16(&eff2_all);
+            (e1, s1, e2, s2)
+        };
+
+        let mut y  = pool.take_zeroed(n_tokens * p * b);
+        let mut zs = pool.take_f16_uninit(n_tokens * p * q * b);
+
+        let chunk = Self::I16_ROUTED_TOKEN_CHUNK;
+        let apply_chunk = |chunk_idx: usize, y_chunk: &mut [f32], zs_chunk: &mut [half::f16]| {
+            let base_t = chunk_idx * chunk;
+            let n_in_chunk = y_chunk.len() / (p * b);
+            // (1) Quantize every token's activations once per (token, qq) —
+            // every qq is consumed by every active pp, so as long as each
+            // token routes to >= 1 block none of this is wasted work.
+            let mut xq = vec![0i16; n_in_chunk * q * 64];
+            let mut xs = vec![0.0f32; n_in_chunk * q];
+            for lt in 0..n_in_chunk {
+                let x_t = &x[(base_t + lt) * in_dim..(base_t + lt + 1) * in_dim];
+                for qq in 0..q {
+                    let (qv, s) = SharedMonarchMatmul::quantize_i16_64(&x_t[qq * b..(qq + 1) * b]);
+                    xq[(lt * q + qq) * 64..(lt * q + qq + 1) * 64].copy_from_slice(&qv);
+                    xs[lt * q + qq] = s;
+                }
+            }
+            // (2) Inverted routing index: block -> chunk-local tokens routed
+            // to it, in ascending token order (push order below).
+            let mut inv: Vec<Vec<usize>> = vec![Vec::new(); p];
+            for lt in 0..n_in_chunk {
+                for &pp in &active_p[base_t + lt] {
+                    debug_assert!(pp < p, "active row-block {pp} out of range");
+                    inv[pp].push(lt);
+                }
+            }
+            let (mut y1_0, mut y1_1) = ([0.0f32; 64], [0.0f32; 64]);
+            let (mut z0, mut z1) = ([0.0f32; 64], [0.0f32; 64]);
+            // Discarded second-lane output for the odd-leftover self-pair.
+            let mut out_scratch = [0.0f32; 64];
+            // (3) Per block, sweep its token list in pairs.
+            for pp in 0..p {
+                let toks = &inv[pp];
+                let mut i = 0;
+                while i + 2 <= toks.len() {
+                    let (lt0, lt1) = (toks[i], toks[i + 1]);
+                    debug_assert!(lt0 < lt1, "routing gave token a duplicate active block");
+                    let (y_lo, y_hi) = y_chunk.split_at_mut(lt1 * p * b);
+                    let ypp0 = &mut y_lo[lt0 * p * b + pp * b..lt0 * p * b + (pp + 1) * b];
+                    let ypp1 = &mut y_hi[pp * b..(pp + 1) * b];
+                    let (zs_lo, zs_hi) = zs_chunk.split_at_mut(lt1 * p * q * b);
+                    let zs_t0 = &mut zs_lo[lt0 * p * q * b..(lt0 + 1) * p * q * b];
+                    let zs_t1 = &mut zs_hi[..p * q * b];
+                    for qq in 0..q {
+                        let idx = pp * q + qq;
+                        SharedMonarchMatmul::apply_block_dual_token_int16(
+                            &eff1_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                            &eff2_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                            &xq[(lt0 * q + qq) * 64..(lt0 * q + qq + 1) * 64], xs[lt0 * q + qq],
+                            &xq[(lt1 * q + qq) * 64..(lt1 * q + qq + 1) * 64], xs[lt1 * q + qq],
+                            m, &mut y1_0, &mut y1_1, &mut z0, &mut z1, ypp0, ypp1,
+                        );
+                        crate::kernels::f16_simd::f32_to_f16(&z0, &mut zs_t0[idx * b..(idx + 1) * b]);
+                        crate::kernels::f16_simd::f32_to_f16(&z1, &mut zs_t1[idx * b..(idx + 1) * b]);
+                    }
+                    i += 2;
+                }
+                if i < toks.len() {
+                    let lt0 = toks[i];
+                    let ypp0 = &mut y_chunk[lt0 * p * b + pp * b..lt0 * p * b + (pp + 1) * b];
+                    let zs_t0 = &mut zs_chunk[lt0 * p * q * b..(lt0 + 1) * p * q * b];
+                    for qq in 0..q {
+                        let idx = pp * q + qq;
+                        let xoff = (lt0 * q + qq) * 64;
+                        SharedMonarchMatmul::apply_block_dual_token_int16(
+                            &eff1_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                            &eff2_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                            &xq[xoff..xoff + 64], xs[lt0 * q + qq],
+                            &xq[xoff..xoff + 64], xs[lt0 * q + qq],
+                            m, &mut y1_0, &mut y1_1, &mut z0, &mut z1, ypp0, &mut out_scratch,
+                        );
+                        crate::kernels::f16_simd::f32_to_f16(&z0, &mut zs_t0[idx * b..(idx + 1) * b]);
+                    }
+                }
+            }
+        };
+
+        if n_tokens < Self::PARALLEL_THRESHOLD {
+            for (k, (y_chunk, zs_chunk)) in y.chunks_mut(chunk * p * b).zip(zs.chunks_mut(chunk * p * q * b)).enumerate() {
+                apply_chunk(k, y_chunk, zs_chunk);
+            }
+        } else {
+            use rayon::prelude::*;
+            y.par_chunks_mut(chunk * p * b).zip(zs.par_chunks_mut(chunk * p * q * b)).enumerate()
+                .for_each(|(k, (y_chunk, zs_chunk))| apply_chunk(k, y_chunk, zs_chunk));
+        }
+        (y, FwdCache { zs })
+    }
+
     /// Batched, hoisted `forward_cols` — same hoist as `forward_rows_batch`,
     /// restricting the *input* col-blocks per token instead of the output
     /// row-blocks (for the routed `W_down` projection, whose input is exactly
@@ -1391,6 +1549,10 @@ impl SharedMonarchProj {
         &self, d1: &[f32], d2: &[f32], x: &[f32], active_q: &[Vec<usize>], n_tokens: usize,
         pool: &mut crate::kernels::scratch::BufPool,
     ) -> (Vec<f32>, FwdCache) {
+        // Real int16 dual-token path (m == 8 only) — see forward_rows_batch.
+        if is_int16_matmul_enabled() && self.m == 8 {
+            return self.forward_cols_batch_i16(d1, d2, x, active_q, n_tokens, pool);
+        }
         let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
         let b = m * m;
         let in_dim = q * b;
@@ -1413,30 +1575,34 @@ impl SharedMonarchProj {
 
         let apply_token = |t: usize, y_t: &mut [f32], zs_t: &mut [half::f16]| {
             let x_t = &x[t * in_dim..(t + 1) * in_dim];
-            // Int16: fake-quant this token's active qq-slices once (they were
-            // re-quantized for every pp in 0..p before — same slices, same
-            // scales, hoisted out of the pp loop).
-            let x_q: Vec<f32>;
-            let x_t: &[f32] = if is_int16_matmul_enabled() {
-                let mut xq = x_t.to_vec();
-                for &qq in &active_q[t] {
-                    SharedMonarchMatmul::fake_quant_i16(&mut xq[qq * b..(qq + 1) * b]);
-                }
-                x_q = xq;
-                &x_q
-            } else {
-                x_t
-            };
             let mut y1 = vec![0.0f32; b];
             let mut z_f32 = vec![0.0f32; b];
-            for pp in 0..p {
-                let ypp = &mut y_t[pp * b..(pp + 1) * b];
-                for &qq in &active_q[t] {
-                    debug_assert!(qq < q, "active col-block {qq} out of range");
+            // Int16 fake-quant fallback (flag on but m != 8 — m == 8 takes
+            // forward_cols_batch_i16 above): same stack-buffer replacement of
+            // the old whole-token `x_t.to_vec()` as forward_rows_batch's
+            // fallback, loop order swapped to active-qq-outer so each active
+            // slice is still quantized exactly once. Per-(pp,qq) accumulation
+            // order into `y` is unchanged, so results are bit-identical.
+            let int16 = is_int16_matmul_enabled();
+            let mut xq_buf = [0.0f32; 64];
+            let mut xq_vec: Vec<f32> = if int16 && b > 64 { vec![0.0; b] } else { Vec::new() };
+            for &qq in &active_q[t] {
+                debug_assert!(qq < q, "active col-block {qq} out of range");
+                let x_src = &x_t[qq * b..(qq + 1) * b];
+                let x_blk: &[f32] = if int16 {
+                    let dst: &mut [f32] = if b <= 64 { &mut xq_buf[..b] } else { &mut xq_vec[..] };
+                    dst.copy_from_slice(x_src);
+                    SharedMonarchMatmul::fake_quant_i16(dst);
+                    dst
+                } else {
+                    x_src
+                };
+                for pp in 0..p {
+                    let ypp = &mut y_t[pp * b..(pp + 1) * b];
                     let idx = pp * q + qq;
                     SharedMonarchMatmul::apply_block(
                         &eff1_all[idx * m * b..(idx + 1) * m * b], &eff2_all[idx * m * b..(idx + 1) * m * b],
-                        &x_t[qq * b..(qq + 1) * b], m, &mut y1, &mut z_f32, ypp,
+                        x_blk, m, &mut y1, &mut z_f32, ypp,
                     );
                     let z_dst = &mut zs_t[(pp * q + qq) * b..(pp * q + qq + 1) * b];
                     crate::kernels::f16_simd::f32_to_f16(&z_f32, z_dst);
@@ -1452,6 +1618,116 @@ impl SharedMonarchProj {
             use rayon::prelude::*;
             y.par_chunks_mut(p * b).zip(zs.par_chunks_mut(p * q * b)).enumerate()
                 .for_each(|(t, (y_t, zs_t))| apply_token(t, y_t, zs_t));
+        }
+        (y, FwdCache { zs })
+    }
+
+    /// Real int16 dual-token forward for the ROUTED cols path — the cols
+    /// mirror of `forward_rows_batch_i16` (see its doc for the pairing /
+    /// odd-leftover-self-pair design). Routing here is on the INPUT block
+    /// `qq`: two tokens pair on a shared active `qq` and then sweep all `p`
+    /// output blocks of that column together. Activations are quantized only
+    /// on each token's active `qq` slices (the rest are never read).
+    fn forward_cols_batch_i16(
+        &self, d1: &[f32], d2: &[f32], x: &[f32], active_q: &[Vec<usize>], n_tokens: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
+    ) -> (Vec<f32>, FwdCache) {
+        let (p, q, m, nd) = (self.p, self.q, self.m, self.nd);
+        let b = m * m;
+        debug_assert_eq!(b, 64, "forward_cols_batch_i16 requires m == 8");
+        let in_dim = q * b;
+        let (eff1_all, eff2_all) = Self::expand_all_blocks(d1, d2, &self.a1, &self.a2, p, q, m, nd);
+        let (eff1_i16, eff1_scale, eff2_i16, eff2_scale) = {
+            let _t = crate::kernels::profiling::Timer::start(&crate::kernels::profiling::I16_WQUANT);
+            let (e1, s1) = SharedMonarchMatmul::quantize_i16(&eff1_all);
+            let (e2, s2) = SharedMonarchMatmul::quantize_i16(&eff2_all);
+            (e1, s1, e2, s2)
+        };
+
+        let mut y  = pool.take_zeroed(n_tokens * p * b);
+        let mut zs = pool.take_f16_uninit(n_tokens * p * q * b);
+
+        let chunk = Self::I16_ROUTED_TOKEN_CHUNK;
+        let apply_chunk = |chunk_idx: usize, y_chunk: &mut [f32], zs_chunk: &mut [half::f16]| {
+            let base_t = chunk_idx * chunk;
+            let n_in_chunk = y_chunk.len() / (p * b);
+            // (1) Quantize each token's ACTIVE qq slices once (dense layout,
+            // inactive entries left zeroed and never read).
+            let mut xq = vec![0i16; n_in_chunk * q * 64];
+            let mut xs = vec![0.0f32; n_in_chunk * q];
+            // (2) Inverted routing index: input block -> chunk-local tokens.
+            let mut inv: Vec<Vec<usize>> = vec![Vec::new(); q];
+            for lt in 0..n_in_chunk {
+                let x_t = &x[(base_t + lt) * in_dim..(base_t + lt + 1) * in_dim];
+                for &qq in &active_q[base_t + lt] {
+                    debug_assert!(qq < q, "active col-block {qq} out of range");
+                    let (qv, s) = SharedMonarchMatmul::quantize_i16_64(&x_t[qq * b..(qq + 1) * b]);
+                    xq[(lt * q + qq) * 64..(lt * q + qq + 1) * 64].copy_from_slice(&qv);
+                    xs[lt * q + qq] = s;
+                    inv[qq].push(lt);
+                }
+            }
+            let (mut y1_0, mut y1_1) = ([0.0f32; 64], [0.0f32; 64]);
+            let (mut z0, mut z1) = ([0.0f32; 64], [0.0f32; 64]);
+            let mut out_scratch = [0.0f32; 64];
+            // (3) Per input block, sweep its token list in pairs; each pair
+            // walks all p output blocks of that column together.
+            for qq in 0..q {
+                let toks = &inv[qq];
+                let mut i = 0;
+                while i + 2 <= toks.len() {
+                    let (lt0, lt1) = (toks[i], toks[i + 1]);
+                    debug_assert!(lt0 < lt1, "routing gave token a duplicate active block");
+                    let (y_lo, y_hi) = y_chunk.split_at_mut(lt1 * p * b);
+                    let y_t0 = &mut y_lo[lt0 * p * b..(lt0 + 1) * p * b];
+                    let y_t1 = &mut y_hi[..p * b];
+                    let (zs_lo, zs_hi) = zs_chunk.split_at_mut(lt1 * p * q * b);
+                    let zs_t0 = &mut zs_lo[lt0 * p * q * b..(lt0 + 1) * p * q * b];
+                    let zs_t1 = &mut zs_hi[..p * q * b];
+                    for pp in 0..p {
+                        let idx = pp * q + qq;
+                        SharedMonarchMatmul::apply_block_dual_token_int16(
+                            &eff1_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                            &eff2_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                            &xq[(lt0 * q + qq) * 64..(lt0 * q + qq + 1) * 64], xs[lt0 * q + qq],
+                            &xq[(lt1 * q + qq) * 64..(lt1 * q + qq + 1) * 64], xs[lt1 * q + qq],
+                            m, &mut y1_0, &mut y1_1, &mut z0, &mut z1,
+                            &mut y_t0[pp * b..(pp + 1) * b], &mut y_t1[pp * b..(pp + 1) * b],
+                        );
+                        crate::kernels::f16_simd::f32_to_f16(&z0, &mut zs_t0[idx * b..(idx + 1) * b]);
+                        crate::kernels::f16_simd::f32_to_f16(&z1, &mut zs_t1[idx * b..(idx + 1) * b]);
+                    }
+                    i += 2;
+                }
+                if i < toks.len() {
+                    let lt0 = toks[i];
+                    let y_t0 = &mut y_chunk[lt0 * p * b..(lt0 + 1) * p * b];
+                    let zs_t0 = &mut zs_chunk[lt0 * p * q * b..(lt0 + 1) * p * q * b];
+                    let xoff = (lt0 * q + qq) * 64;
+                    for pp in 0..p {
+                        let idx = pp * q + qq;
+                        SharedMonarchMatmul::apply_block_dual_token_int16(
+                            &eff1_i16[idx * m * b..(idx + 1) * m * b], eff1_scale,
+                            &eff2_i16[idx * m * b..(idx + 1) * m * b], eff2_scale,
+                            &xq[xoff..xoff + 64], xs[lt0 * q + qq],
+                            &xq[xoff..xoff + 64], xs[lt0 * q + qq],
+                            m, &mut y1_0, &mut y1_1, &mut z0, &mut z1,
+                            &mut y_t0[pp * b..(pp + 1) * b], &mut out_scratch,
+                        );
+                        crate::kernels::f16_simd::f32_to_f16(&z0, &mut zs_t0[idx * b..(idx + 1) * b]);
+                    }
+                }
+            }
+        };
+
+        if n_tokens < Self::PARALLEL_THRESHOLD {
+            for (k, (y_chunk, zs_chunk)) in y.chunks_mut(chunk * p * b).zip(zs.chunks_mut(chunk * p * q * b)).enumerate() {
+                apply_chunk(k, y_chunk, zs_chunk);
+            }
+        } else {
+            use rayon::prelude::*;
+            y.par_chunks_mut(chunk * p * b).zip(zs.par_chunks_mut(chunk * p * q * b)).enumerate()
+                .for_each(|(k, (y_chunk, zs_chunk))| apply_chunk(k, y_chunk, zs_chunk));
         }
         (y, FwdCache { zs })
     }
@@ -3393,6 +3669,106 @@ mod tests {
             for i in 0..g_old.dd1.len() {
                 assert!((g_old.dd1[i] - g_new.dd1[i]).abs() < 1e-3, "m={m} dd1[{i}]: old={} new={}", g_old.dd1[i], g_new.dd1[i]);
                 assert!((g_old.dd2[i] - g_new.dd2[i]).abs() < 1e-3, "m={m} dd2[{i}]: old={} new={}", g_old.dd2[i], g_new.dd2[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn forward_rows_batch_i16_matches_fp32() {
+        // Routed real-int16 dual-token path (inverted index + in-chunk
+        // pairing + odd-leftover self-pair) against the fp32 routed batch
+        // path, in the style of apply_block_dual_token_int16_matches_fp32.
+        // Called directly (not via the INT16_MATMUL env flag, which is
+        // process-global). n_tokens = 37 exercises the rayon path, a short
+        // final chunk (37 = 16 + 16 + 5), and — with token-varying routing —
+        // odd leftovers inside blocks' token lists.
+        let (p, q, m, nd) = (6, 3, 8, 4);
+        let (d1, d2) = init_shared_atoms(nd, m, 0xD1CE);
+        let proj = SharedMonarchProj::new(p, q, m, nd, 0xFACE);
+        let b = m * m;
+        let in_dim = q * b;
+        let out_dim = p * b;
+        let n_tokens = 37;
+        let n_active = 2;
+        let x = randvec(n_tokens * in_dim, 0x1616);
+        let active_p: Vec<Vec<usize>> = (0..n_tokens).map(|t| {
+            (0..n_active).map(|k| (t * 3 + k * 5) % p).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+        }).collect();
+
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let (y_ref, cache_ref) = proj.forward_rows_batch(&d1, &d2, &x, &active_p, n_tokens, &mut pool);
+        let (y_i16, cache_i16) = proj.forward_rows_batch_i16(&d1, &d2, &x, &active_p, n_tokens, &mut pool);
+
+        let rel_err = |a: &[f32], r: &[f32]| {
+            let num: f32 = a.iter().zip(r).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+            let den: f32 = r.iter().map(|y| y * y).sum::<f32>().sqrt().max(1e-12);
+            num / den
+        };
+        for t in 0..n_tokens {
+            let a = &y_i16[t * out_dim..(t + 1) * out_dim];
+            let r = &y_ref[t * out_dim..(t + 1) * out_dim];
+            let e = rel_err(a, r);
+            assert!(e < 1e-2, "token {t}: y relative error too high: {e:.2e}");
+            // Inactive blocks must stay exactly zero, not garbage.
+            for pp in 0..p {
+                if active_p[t].contains(&pp) { continue; }
+                for i in 0..b {
+                    assert_eq!(a[pp * b + i], 0.0, "token {t} inactive pp={pp} i={i} nonzero");
+                }
+            }
+            // zs parity on active (pp,qq) entries (what backward reads).
+            for &pp in &active_p[t] {
+                for qq in 0..q {
+                    let off = t * p * q * b + (pp * q + qq) * b;
+                    let za: Vec<f32> = cache_i16.zs[off..off + b].iter().map(|v| v.to_f32()).collect();
+                    let zr: Vec<f32> = cache_ref.zs[off..off + b].iter().map(|v| v.to_f32()).collect();
+                    let e = rel_err(&za, &zr);
+                    assert!(e < 1e-2, "token {t} pp={pp} qq={qq}: zs relative error too high: {e:.2e}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_cols_batch_i16_matches_fp32() {
+        // Cols mirror of forward_rows_batch_i16_matches_fp32 (input-routed
+        // down-proj shape): pairing on shared active input block qq.
+        let (p, q, m, nd) = (6, 3, 8, 4);
+        let (d1, d2) = init_shared_atoms(nd, m, 0xD1CE);
+        let proj = SharedMonarchProj::new(p, q, m, nd, 0xFACE);
+        let b = m * m;
+        let in_dim = q * b;
+        let out_dim = p * b;
+        let n_tokens = 37;
+        let n_active = 2;
+        let x = randvec(n_tokens * in_dim, 0x2626);
+        let active_q: Vec<Vec<usize>> = (0..n_tokens).map(|t| {
+            (0..n_active).map(|k| (t * 2 + k * 7) % q).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+        }).collect();
+
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let (y_ref, cache_ref) = proj.forward_cols_batch(&d1, &d2, &x, &active_q, n_tokens, &mut pool);
+        let (y_i16, cache_i16) = proj.forward_cols_batch_i16(&d1, &d2, &x, &active_q, n_tokens, &mut pool);
+
+        let rel_err = |a: &[f32], r: &[f32]| {
+            let num: f32 = a.iter().zip(r).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt();
+            let den: f32 = r.iter().map(|y| y * y).sum::<f32>().sqrt().max(1e-12);
+            num / den
+        };
+        for t in 0..n_tokens {
+            let a = &y_i16[t * out_dim..(t + 1) * out_dim];
+            let r = &y_ref[t * out_dim..(t + 1) * out_dim];
+            let e = rel_err(a, r);
+            assert!(e < 1e-2, "token {t}: y relative error too high: {e:.2e}");
+            // zs parity on (pp, active qq) — what backward_cols reads.
+            for pp in 0..p {
+                for &qq in &active_q[t] {
+                    let off = t * p * q * b + (pp * q + qq) * b;
+                    let za: Vec<f32> = cache_i16.zs[off..off + b].iter().map(|v| v.to_f32()).collect();
+                    let zr: Vec<f32> = cache_ref.zs[off..off + b].iter().map(|v| v.to_f32()).collect();
+                    let e = rel_err(&za, &zr);
+                    assert!(e < 1e-2, "token {t} pp={pp} qq={qq}: zs relative error too high: {e:.2e}");
+                }
             }
         }
     }
