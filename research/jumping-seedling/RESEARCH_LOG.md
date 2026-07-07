@@ -3996,3 +3996,103 @@ the earlier fake-quant reference for both attention and FFN — porting
 the real dual-token-style kernel there is the natural next step, though
 backward's da/dd accumulation shape (RESEARCH_LOG.md 2026-07-03) differs
 from forward's shape enough that it isn't a direct copy of this work.
+
+---
+
+## 2026-07-08 — `feat/int16-quant`: backward ported (all 3 call sites), then audited as tapped out
+
+Ported the real dual-token int16 kernel into backward
+(`backward_block_dual_token_int16`/`backward_block_avx2_dual_i16`,
+`src/kernels/monarch.rs`), mirroring forward's design: `dz = eff2^T @
+dout` and `dx = eff1^T @ dy1` run as real `madd_epi16` against
+once-per-call-quantized, transposed weights. The `s1`/`s2` outer-product
+accumulation stays fp32 on raw (unquantized) `x`/`z`/`dout` — this was
+already validated safe in the 2026-07-05 probe
+(`int16_backward_accum_probe.rs`: per-token quantization noise doesn't
+compound across a batch summed in fp32) and there's no reduction in a
+rank-1 update for int16 to meaningfully help with anyway, so it was
+correctly left alone rather than force-quantized for its own sake.
+
+Scoped as "land the non-routed `backward_batch` case first, attempt the
+FFN-routed cases only if that goes cleanly" — it did, so all three
+landed in one pass: `backward_batch_i16` (consecutive-token pairing,
+mirrors `forward_batch`), and `backward_rows_batch_i16`/
+`backward_cols_batch_i16` (FFN-routed, reusing the forward port's
+inverted per-block token-index pairing pattern rather than
+re-designing it).
+
+**A real, pre-existing bug found and fixed along the way, unrelated to
+int16 itself**: a latent panic in the rayon reduction shared by both
+fp32 and int16 code paths (`backward_batch`/`backward_rows_batch`/
+`backward_cols_batch`) — an empty trailing chunk could produce an
+inverted `dx` slice (`t0 >= t1`). Never triggered before because nothing
+had previously exercised that exact chunk-boundary condition. Fixed
+with a guard at all 6 occurrences (verified: `grep` confirms 6 matches
+for the guard comment).
+
+**Verified independently** (re-ran the exact commands myself rather than
+trusting the implementing session's report, consistent with every prior
+entry in this arc): `cargo test --release --lib` 116/116 (112 existing +
+4 new parity tests) green with the flag off. Real measured numbers,
+both scales this time — unlike the FFN-forward port, backward showed a
+genuine win at BOTH toy and production scale, not just production:
+
+```
+toy (TRAIN_SMALL_LOD=1 SEQ=256 STEPS=30):
+  backward: 187.33ms -> 146.57ms   (~22% faster, own measurement;
+                                     implementing session reported ~4%,
+                                     likely run-to-run noise either way —
+                                     both confirm a real win, not a wash)
+
+production (FULL=1 SEQ=256 STEPS=10):
+  backward:     14,907.94ms -> 12,773.55ms   (-14.3%)
+  FFN_BWD:      78,437.43ms -> 64,740.08ms   (-17.5%)
+  QKV_BWD:      12,588.71ms ->  9,687.16ms   (-23.1%)
+  WO_BWD:        9,592.53ms ->  7,108.27ms   (-25.9%)
+  total step:   19,767.71ms -> 17,326.25ms   (-12.3%)
+```
+
+Plausible reason toy scale wins here but didn't for FFN-forward:
+backward's per-call weight quantization (transpose + quantize, wrapped
+in the new `I16_BWD_WQUANT` counter) amortizes over a larger per-call
+working set than forward's did, so it clears the cache-residency
+threshold (2026-07-07 bandwidth probe) even at toy size.
+
+**Follow-up audit (Fable, review-only, no edits)**: asked explicitly to
+find any remaining performance/memory lever across the whole int16
+arc (forward + backward, attention + FFN) before considering the
+branch done. Verdict: **essentially tapped out**. Checked clean:
+redundant quantization (all 5 entry points quantize weights exactly
+once per call, confirmed by reading each), inlining (every hot AVX2
+kernel has `#[inline]`, confirmed independently), `s1`/`s2`
+accumulation (already fused fp32 FMA, correctly not quantized), `d1`/
+`d2` dictionary bandwidth (still fp32, confirmed cache-resident at
+production `dict_k=32` — 8KB per dictionary — so quantizing them would
+fail the established "bandwidth only pays past cache" criterion, not
+assumed). Two marginal, non-urgent items surfaced: (1) the routed
+windowed loops (forward AND backward both, not a backward-specific
+regression) still heap-allocate scratch buffers (`Vec<Vec<usize>>` for
+the inverted index, etc.) once per 8-token window rather than reusing
+fixed buffers — estimated sub-1% of step time; (2) the 8-token window
+size was carried into backward from forward without re-validation, and
+the reason 8 beat 16 in forward (rayon chunk load-balance) doesn't
+actually apply to backward's parallelization structure (backward
+parallelizes over thread ranges, not per-chunk) — a larger window would
+plausibly help backward slightly, one measurement to check, not
+re-tuned from scratch. Neither finding was judged to justify opening a
+new session on its own.
+
+**Status:** real int16 SIMD now covers forward and backward, attention
+and FFN, all gated behind `INT16_MATMUL` (default off, zero regression
+on the default path, 116/116 tests green). Verified wins: ~10% forward,
+~12-26% backward depending on sub-block, at production scale; backward
+also wins at toy scale. Deliberately out of scope, unchanged: optimizer
+state (fp32, per the earlier falsification finding), attention's core
+softmax kernel (`attn_flash.rs`/`attn_swa.rs`, a different kernel family
+entirely). This closes the active development arc on this branch for
+now — remaining items are two low-impact cleanup opportunities, not
+open engineering questions. The one gap that would matter before this
+goes any further than an opt-in experimental flag: this has never been
+validated at actual multi-step training-loop scale (loss curve, flag
+off vs on) — every check so far is per-kernel numerical parity or
+per-step timing, not accumulated training-dynamics behavior.
