@@ -3806,3 +3806,117 @@ rewrite of the production kernels.
 **Status:** three probes now support a combined kernel-rewrite design
 (int16 storage + amortized packing + shuffle-based reduction). No
 production kernel code touched yet.
+
+---
+
+## 2026-07-07/08 — `feat/int16-quant`: real dual-token kernel landed in `forward_batch`, two regressions found and fixed, verified at parity/faster on attention
+
+Built the real (not fake-quant) int16 kernel the three prior probes
+argued for, in `SharedMonarchMatmul`'s forward path
+(`src/kernels/monarch.rs`): "dual-token packing" — broadcast one weight
+row into both halves of a 256-bit register, pack two DIFFERENT tokens'
+activation vectors into the other operand, compute both tokens' dot
+products with one `_mm256_madd_epi16` instead of two separate fp32
+8-wide dot products. Chosen over dual-BLOCK packing specifically because
+weights are fixed for a whole step and reused across tokens, lining up
+with the validated amortization finding.
+
+**A real correctness bug, caught immediately by the parity test before
+any perf measurement:** initial version failed with ~86% relative
+error — not a rounding issue, an `i32` accumulator overflow.
+`quantize_i16`'s existing scale (`max_abs/32767`, fine for the fake-quant
+paths, which never actually accumulate in integer domain) let two
+near-max int16 operands' product reach ~1.07e9; summed over an 8-term
+row-dot, worst case ~8.6e9 versus `i32::MAX`'s ~2.1e9 — silent
+wraparound. Fixed with a headroom-reserving scale
+(`max_abs/8192`, `QUANTIZE_HEADROOM_TARGET`) sized so `8 * target^2`
+stays well under `i32::MAX`. Parity test (`apply_block_dual_token_int16_matches_fp32`)
+passed after the fix; 110/110 lib tests green with the flag off.
+
+**First throughput regression: real kernel measured 50-59% SLOWER than
+fp32 in the full-model `profile` binary**, despite the underlying
+primitive being validated ~15% faster in isolation. `layer_bench`
+showed a naive ~14% win; `profile` (the trusted arbiter all session,
+having already caught one false "faster" claim on a different kernel)
+disagreed, and was trusted over the isolated number. Asked Fable
+(fresh session, review-only) to find the cause without editing.
+Verified independently before acting on it: **confirmed** — the old
+fp32 `matvec8`/`matvec8_accum` have `#[inline]`; the new
+`matvec8_dual_i16`/`apply_block_avx2_dual_i16`/`quantize_i16_64` did not.
+Separately, `x0`/`x1` (which depend only on `qq`, not `pp`) were being
+re-quantized inside the `pp` loop — `p`x redundant work per `qq`. Fixed
+both (added `#[inline]`; restructured `forward_batch`'s loop to `qq`
+outer/`pp` inner so quantization happens once per `qq`, changed
+`apply_block_dual_token_int16`'s signature to take pre-quantized
+`i16`+scale instead of raw `f32` so the caller controls when
+quantization happens). Result: real but partial improvement — toy scale
+53%→38% slower, production 59%→49% slower. Still net negative.
+
+**Second round — asked Fable again, this time with edit permission and
+instructed to get REAL measured data, not more reasoning**, since two
+rounds of hand-reasoning had each only partially closed the gap. Neither
+`perf` nor `valgrind` are installed in this environment, so used the
+codebase's own lightweight counter/`Timer` infrastructure
+(`src/kernels/profiling.rs`) to instrument the dual-token path directly.
+Measured breakdown (toy scale, 30-step run): quantization
+(`ZQUANT` 658ms + `XQUANT` 306ms = 964ms) cost MORE than the actual
+`madd_epi16` arithmetic (`STAGE1`+`STAGE2` 846ms) — the scalar
+`quantize_i16_64` (64 `divss` plus a serially-dependent max-fold per
+call) was the real dominant cost, confirming the hypothesis but
+underestimating its size. Fixed by vectorizing `quantize_i16_64`
+(AVX2 abs-max fold, reciprocal-multiply, `packs_epi32` for the clamp)
+and by keeping `matvec8_dual_i16`'s per-row reduction results in
+registers across all 8 rows instead of scalar-storing and having the
+caller reload as a vector (a store-forwarding stall).
+
+**A second, larger issue surfaced at production scale that the original
+diagnosis had conflated with the new kernel**: the remaining ~38% gap
+was almost entirely `FFN_FWD` (28.8s vs fp32's 15.6s) — FFN's
+`forward_rows_batch`/`forward_cols_batch` don't use the new dual-token
+kernel at all; they were still calling the old **fake-quant reference**
+(`apply_block_int16`), which re-fake-quantizes full weight blocks fresh
+on every `(token, pp, qq)` call. Hoisted that to once-per-call for
+weights and once-per-token for activations (same amortization principle
+as the dual-token fix, applied to a different, older code path that
+happened to share the same call site as the thing being measured).
+
+**Verified independently, not taken on the implementing agent's word**:
+`cargo test --release --lib` 110/110 with the flag off, parity test
+passes; re-ran the exact toy-scale and production-scale `profile`
+commands myself. Production scale, forward-only: **3444ms (int16) vs
+3484ms (fp32)** — genuine parity, int16 marginally ahead. Toy scale is
+noisy (±10% run-to-run) but no longer a clear regression either way.
+
+**What's left, per a follow-up Fable consult (ranked by expected
+impact):**
+1. **FFN still gets zero real int16 benefit** — its fake-quant reference
+   path can only break even with fp32 at best (observed: ~8% slower on
+   FFN specifically), since it quantizes and immediately dequantizes
+   before running the plain fp32 matmul. This is why production forward
+   nets to parity rather than a clean win: attention's QKV/WO projections
+   (using the real dual-token kernel) are faster, but FFN (56-59% of
+   forward time) dilutes it back to even. Porting a real int16 kernel
+   into FFN is the largest remaining lever, but FFN's routing (each
+   token activates a different block subset) doesn't have the same
+   natural "two tokens, same block" pairing `forward_batch` has — needs
+   either per-block token-list bookkeeping to pair same-block tokens, or
+   revisiting dual-BLOCK packing (rejected once before on repack cost,
+   but before the current register-return/hadd-tree matvec design).
+2. A residual heap allocation (`x_t.to_vec()`) introduced by the FFN
+   quantization hoist fix above — now once-per-token rather than the
+   `p`x-per-token pattern that caused the original regression, so it's
+   already reflected in the verified parity numbers above, but still a
+   known-bad pattern (per this arc's own repeated findings) worth
+   replacing with a stack array.
+3. Minor, lower-priority items: fusing `z0`/`z1`'s two quantize calls
+   into one 128-element call; `_mm256_rcp_ps`+Newton-Raphson instead of
+   a scalar reciprocal divide; parallelizing FFN's weight fake-quant
+   loop with rayon at production block counts.
+
+**Status:** real int16 SIMD kernel verified at parity (attention
+projections faster, FFN diluting it back to even) on `feat/int16-quant`.
+Two Fable review rounds, both independently verified before trusting —
+first found real bugs via reasoning alone (inlining, redundant
+quantization), second required real measurement (the codebase's own
+profiling counters, since `perf`/`valgrind` aren't available here) to
+find the remainder. FFN's real-kernel port is the next concrete step.
