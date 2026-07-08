@@ -20,6 +20,13 @@ NIM_API_URL = "https://integrate.api.nvidia.com/v1"
 NIM_API_KEY = "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"
 
 def chunk_input(text):
+    # Strip (example XXXX) patterns
+    text = re.sub(r'\s*\(example\s+\d+\)\.*\s*$', '', text)
+    text = re.sub(r'\s*\(example\s+\d+\)\.*\s*', ' ', text).strip()
+    
+    if len(text) < 5:
+        return [text] if text else []
+    
     sentences = re.split(r'(?<=[.!?])\s+', text)
     chunks = []
     for s in sentences:
@@ -29,11 +36,18 @@ def chunk_input(text):
                 if sub.strip(): chunks.append(sub.strip())
         else:
             chunks.append(s.strip())
+    
+    # Improved fallback: only split if we have enough words and no sentence boundaries
     if len(chunks) < 2 and len(text) > 10:
         words = text.split()
-        mid = len(words) // 2
-        chunks = [' '.join(words[:mid]), ' '.join(words[mid:])]
-    return chunks
+        if len(words) >= 10:  # Increased from 6 to 10
+            mid = len(words) // 2
+            chunks = [' '.join(words[:mid]), ' '.join(words[mid:])]
+        else:
+            # Too short to split meaningfully - keep as single chunk
+            chunks = [text]
+    
+    return chunks if chunks else [text]
 
 def get_embeddings_batch(texts, model):
     headers = {"Authorization": f"Bearer {NIM_API_KEY}", "Content-Type": "application/json"}
@@ -54,7 +68,25 @@ def compute_angle(v1, v2):
     m1 = math.sqrt(sum(a*a for a in v1))
     m2 = math.sqrt(sum(b*b for b in v2))
     if m1 > 0 and m2 > 0:
-        return math.acos(max(-1, min(1, dot/(m1*m2))))
+        cos_angle = max(-1, min(1, dot/(m1*m2)))
+        angle = math.acos(cos_angle)
+        
+        # Compute signed angle using Gram-Schmidt
+        # Normalize vectors
+        v1_norm = [a/m1 for a in v1]
+        v2_norm = [b/m2 for b in v2]
+        
+        # Project v2 onto v1 to get orthogonal component
+        proj = sum(a*b for a,b in zip(v1_norm, v2_norm))
+        e2_orth = [v2_norm[i] - proj*v1_norm[i] for i in range(len(v2_norm))]
+        e2_m = math.sqrt(sum(a*a for a in e2_orth))
+        
+        if e2_m > 1e-10:
+            # Sign determined by first non-zero component of orthogonal direction
+            for val in e2_orth:
+                if abs(val) > 1e-10:
+                    return math.copysign(angle, val)
+        return angle
     return 0
 
 def compute_delta_batch(texts, model, batch_size=20):
@@ -106,8 +138,9 @@ def compute_delta_batch(texts, model, batch_size=20):
                 continue
             
             temp = 0.5
-            max_a = max(angles)
-            exp_vals = [math.exp((a - max_a) / temp) for a in angles]
+            # Favor lower angles: negate before softmax
+            min_a = min(angles)
+            exp_vals = [math.exp((min_a - a) / temp) for a in angles]
             sum_exp = sum(exp_vals)
             weights = [e / sum_exp for e in exp_vals]
             deltas.append(sum(w * a for w, a in zip(weights, angles)))

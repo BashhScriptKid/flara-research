@@ -1,0 +1,3 @@
+Astrology, in the sense that the positions of stars and planets at your birth shape your personality or predict your future, has no scientific backing. It’s been thoroughly tested and doesn’t outperform chance. So straight up: it’s not real — it’s a pseudoscience.
+
+That doesn’t mean it can’t have psychological or cultural value for some people, but as a factual system for explaining the world, it’s nonsense.

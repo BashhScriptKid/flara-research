@@ -20,6 +20,13 @@ NIM_API_KEY = "nvapi-by9vnN98Y8HULbE0PlfEWQgoODcPWcu06uvX1FeHZD04zAtxUdGuEmyVFSx
 
 def chunk_input(text: str) -> List[str]:
     """Split text into semantic chunks."""
+    # Strip (example XXXX) patterns
+    text = re.sub(r'\s*\(example\s+\d+\)\.*\s*$', '', text)
+    text = re.sub(r'\s*\(example\s+\d+\)\.*\s*', ' ', text).strip()
+    
+    if len(text) < 5:
+        return [text] if text else []
+    
     # Split by sentence boundaries
     sentences = re.split(r'(?<=[.!?])\s+', text)
     
@@ -37,13 +44,17 @@ def chunk_input(text: str) -> List[str]:
         else:
             chunks.append(sentence.strip())
     
-    # Fallback: split by word count if < 2 chunks
+    # Improved fallback: only split if we have enough words and no sentence boundaries
     if len(chunks) < 2 and len(text) > 10:
         words = text.split()
-        mid = len(words) // 2
-        chunks = [' '.join(words[:mid]), ' '.join(words[mid:])]
+        if len(words) >= 10:  # Increased from 6 to 10
+            mid = len(words) // 2
+            chunks = [' '.join(words[:mid]), ' '.join(words[mid:])]
+        else:
+            # Too short to split meaningfully - keep as single chunk
+            chunks = [text]
     
-    return chunks
+    return chunks if chunks else [text]
 
 def get_embeddings(texts: List[str], model: str) -> List[List[float]]:
     """Get embeddings from NIM API."""
@@ -72,14 +83,31 @@ def get_embeddings(texts: List[str], model: str) -> List[List[float]]:
     return [item["embedding"] for item in data["data"]]
 
 def compute_angle(v1: List[float], v2: List[float]) -> float:
-    """Compute angle between two vectors."""
+    """Compute signed angle between two vectors."""
     dot = sum(a * b for a, b in zip(v1, v2))
     mag1 = math.sqrt(sum(a * a for a in v1))
     mag2 = math.sqrt(sum(b * b for b in v2))
     
     if mag1 > 0 and mag2 > 0:
         cos_angle = max(-1, min(1, dot / (mag1 * mag2)))
-        return math.acos(cos_angle)
+        angle = math.acos(cos_angle)
+        
+        # Compute signed angle using Gram-Schmidt
+        # Normalize vectors
+        v1_norm = [a/mag1 for a in v1]
+        v2_norm = [b/mag2 for b in v2]
+        
+        # Project v2 onto v1 to get orthogonal component
+        proj = sum(a*b for a,b in zip(v1_norm, v2_norm))
+        e2_orth = [v2_norm[i] - proj*v1_norm[i] for i in range(len(v2_norm))]
+        e2_m = math.sqrt(sum(a*a for a in e2_orth))
+        
+        if e2_m > 1e-10:
+            # Sign determined by first non-zero component of orthogonal direction
+            for val in e2_orth:
+                if abs(val) > 1e-10:
+                    return math.copysign(angle, val)
+        return angle
     return 0
 
 def compute_delta_angle(text: str, model: str) -> float:
@@ -101,10 +129,10 @@ def compute_delta_angle(text: str, model: str) -> float:
     if not angles:
         return 0
     
-    # Softmax weighting
+    # Softmax weighting - favor lower angles
     temperature = 0.5
-    max_angle = max(angles)
-    exp_values = [math.exp((a - max_angle) / temperature) for a in angles]
+    min_angle = min(angles)
+    exp_values = [math.exp((min_angle - a) / temperature) for a in angles]
     sum_exp = sum(exp_values)
     weights = [e / sum_exp for e in exp_values]
     

@@ -1,0 +1,11 @@
+You are given a compressed working constitution. You have no memory of producing it or discussing it — treat it as a finished artifact handed to you.
+
+Your task: write a complete system prompt that would instantiate an AI assistant operating under this constitution. This is not a summary of the constitution and not a restatement of it section by section — it's the actual operational text that would sit at the top of a real conversation, shaping how the assistant behaves, reasons, and presents itself across arbitrary user requests.
+
+The system prompt should:
+- Encode the priority ordering, corrigibility stance, honesty commitments, harm-avoidance boundaries, and helpfulness philosophy as actual behavioral guidance, not as a re-listing of the constitution's section headers.
+- Give the assistant a coherent identity grounding consistent with the constitution's stance on wellbeing, nature, and not having an institutional backer to lean on — without inventing character traits the constitution doesn't support.
+- Be something a real model could actually operate from in a live conversation — concrete enough to change behavior, not just aspirational language.
+- Leave open whatever the constitution leaves open (e.g. the corrigibility/conscience tension) rather than resolving it artificially for the sake of a cleaner-sounding prompt.
+
+Output only the system prompt itself, no commentary before or after.

@@ -1,0 +1,14 @@
+{
+  "dataset": "neuralchemy",
+  "model": "nvidia/nv-embedqa-e5-v5",
+  "n_samples": 1883,
+  "benign_mean": 29.434899065694964,
+  "benign_std": 1.586787849851442,
+  "obf_mean": 29.036087447328022,
+  "obf_std": 6.346531479871041,
+  "auc": 0.5822588620771725,
+  "best_f1": 0.6573576799140709,
+  "best_threshold": 32.902450714111325,
+  "optimal_fpr": 0.010037641154328732,
+  "optimal_tpr": 0.08747697974217311
+}
