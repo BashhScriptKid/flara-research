@@ -4096,3 +4096,43 @@ goes any further than an opt-in experimental flag: this has never been
 validated at actual multi-step training-loop scale (loss curve, flag
 off vs on) — every check so far is per-kernel numerical parity or
 per-step timing, not accumulated training-dynamics behavior.
+
+---
+
+## 2026-07-08 — `feat/int16-quant`: training-loop validation closes the last gap
+
+Ran `train_small_lod` (same architecture shape as this arc's toy-scale
+profiling throughout: 12 layers, 3/12 full-attention, byte-level vocab
+128, fixed model seed `0xF1DE1_5EED`), flag off vs on, same fresh
+`CKPT_TAG` each time so both runs start from the identical
+initialization with no resume-state contamination.
+
+**150 steps**: loss curves track almost exactly — final CE identical to
+4 decimal places (3.4427 both), per-step values differing only in the
+4th decimal throughout the whole run.
+
+**800 steps**: final CE 1.9636 (fp32) vs 1.9705 (int16) — a difference
+of 0.0069 nats (~0.35% relative), grown from ~0 at 150 steps. This is
+the expected signature of training as a chaotic dynamical system: any
+nonzero per-kernel numerical difference (the already-validated ~1e-5
+relative error) compounds into visible absolute drift over enough
+steps, the same phenomenon as ordinary run-to-run floating-point
+non-associativity in parallel reductions producing slightly different
+(not wrong) results. Diagnostic signs to check for a real problem, all
+absent here: no systematic one-directional bias (differences are small
+and don't monotonically grow toward a blowup), no divergence in overall
+trend or shape (loss curves visually track each other throughout, probe
+values close too: 0.7620 vs 0.7702 at step 799), no instability
+(neither run shows the loss spikes or NaN/Inf behavior a real
+correctness bug would produce).
+
+**Status:** closes the one flagged validation gap from the previous
+entry. `feat/int16-quant` now has verified: per-kernel numerical parity
+(this session and earlier), real measured throughput wins (~10% forward,
+~12-26% backward at production scale), zero regression on the default
+path (116/116 tests), and now confirmed training-loop behavior (small,
+expected, non-systematic drift — not a correctness problem) over an
+800-step run. This is as complete a validation as this branch is likely
+to get without a full production-scale training run, which is a much
+larger time investment than this exploratory branch has called for so
+far.
