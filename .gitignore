@@ -1,4 +1,6 @@
 .venv/
+deepseek_key
+/memory.json
 projects/amdon-cli/AmDon/appsettings.json
 projects/amdon-cli/AmDon/memory.json
 projects/amdon-cli/AmDon/bin/
