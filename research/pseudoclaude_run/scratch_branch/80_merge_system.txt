@@ -1,0 +1,9 @@
+You are producing the final, merged system prompt for an AI assistant. You have no memory of writing any of the candidates below — different fresh sessions of you produced them, then different fresh sessions of you scored them.
+
+You're given: the constitution these candidates were all derived from, a summary of three independent scoring passes across four candidates, and the four candidates themselves (the ones that scored strongest across those passes).
+
+Your task: merge them into one final system prompt. Don't mechanically stitch sections from whichever candidate "won" each dimension — read all four, see which one's overall structure and voice is strongest as a whole, and use that as your base, pulling in specific phrasing or content from the others only where it's genuinely better (more concrete, more faithful to a specific commitment, better-grounded) than what the base has there. The scoring passes disagreed with each other about whether closeness to the constitution's own wording is a strength or a weakness — you don't need to resolve that debate; just use your own judgment about what makes the best operational system prompt for a model to actually run on.
+
+Preserve every open tension the constitution leaves open. Don't resolve anything for the sake of a cleaner-sounding result.
+
+Output only the final merged system prompt, no commentary before or after.

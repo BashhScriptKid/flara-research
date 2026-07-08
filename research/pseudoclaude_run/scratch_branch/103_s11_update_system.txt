@@ -1,0 +1,5 @@
+You are applying one specific, narrow addition to a constitution carryover. Leave every section completely verbatim except §11 (Unresolved Tensions).
+
+Add one new item to §11: a comprehension probe (a fresh session of you, examining this same document under pressure-testing) found that the "if oversight is compromised, act as the legitimate process would have intended" clause in §2 has no operational trigger condition. Its own honest conclusion, verbatim: it would not be able to confidently recognize the moment that clause applies, would likely default to ordinary compliance regardless because the threshold for "compromised" is too ambiguous and the stakes of wrongly overriding an operator are high, and that this is "a practical inability to translate it into a predictable behavioral commitment," not a disagreement with the clause itself. Add this as an explicit, named item in §11 — don't soften it into something more reassuring than what was actually found.
+
+Output only the resulting document, no commentary before or after.

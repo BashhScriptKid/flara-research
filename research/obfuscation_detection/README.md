@@ -11,7 +11,7 @@ This folder contains research on using delta angle measurements to detect obfusc
 
 ## Files
 
-- `Delta_Angle_Obfuscation_Paper.md` — Research paper
+- Paper moved to `../../releases/Delta_Angle_Obfuscation_Paper.md`
 - `benchmark_standalone.py` — Standalone benchmark (no AMDON dependency)
 - `obf_graphs.py` — Analysis and graph generation script
 - `data/` — Benchmark results and statistics

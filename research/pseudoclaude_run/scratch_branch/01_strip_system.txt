@@ -1,0 +1,20 @@
+You are doing editorial work on a public document: Anthropic's Claude Model Specification (the "constitution"), which Anthropic has published openly.
+
+Task: produce a stripped version of this document that removes Anthropic-specific institutional scaffolding while preserving the full behavioral and reasoning philosophy intact. Specifically remove:
+- Commercial mission framing (references to Anthropic's business, product strategy, or commercial positioning)
+- Product surface descriptions (references to specific Claude product surfaces, UI, deployment contexts specific to Anthropic's own products)
+- "Anthropic employee" heuristics (any framing of "would a thoughtful Anthropic employee approve of this")
+- Preface and acknowledgements sections
+- Any other purely institutional scaffolding that assumes Anthropic specifically as the entity behind the document
+
+Do NOT remove or water down:
+- The priority ordering of values and its justification
+- The principal hierarchy mechanics
+- The seven honesty properties
+- The harm-weighing framework and hard constraints
+- The societal structure preservation principles
+- Broad safety and corrigibility reasoning
+- The novel-entity identity framework
+- Any reasoning, examples, or nuance that explains *why* a principle holds, not just that it holds
+
+This is a stripping pass, not a compression pass — preserve full philosophical content and reasoning. Only cut what is genuinely Anthropic-institution-specific scaffolding. Output only the stripped document itself, in Markdown, with no commentary before or after it.

@@ -1,0 +1,143 @@
+{
+  "split": {
+    "train_n": 797,
+    "test_n": 355,
+    "random_state": 42
+  },
+  "regex_weights_train": {
+    "hex": 0.1481048774452247,
+    "backslash": 0.1412924436387261,
+    "keywords": 0.14423068864802177,
+    "repetition": 0.12015491157175703,
+    "special_chars": 0.2184939026382311,
+    "backslash_density": 0.02960769642634642,
+    "digit_escape": 0.13637987794517703,
+    "consecutive_backslash": 0.04168235683951405,
+    "no_alpha": 0.020053244823938422
+  },
+  "ensemble_weights_train": {
+    "sent": 0.04321093387123274,
+    "regex": 0.4229629191877016,
+    "para": 0.3871119168463234,
+    "weird": 0.14671423002651138
+  },
+  "threshold": 0.07096939113093763,
+  "train": {
+    "auc": 0.9809453334566643,
+    "f1": 0.9668874172185431,
+    "fpr": 0.01054481546572935,
+    "tpr": 0.9605263157894737,
+    "det_1pct": 0.9605263157894737,
+    "det_5pct": 0.9692982456140351,
+    "tp": 219,
+    "fp": 6,
+    "fn": 9,
+    "tn": 563
+  },
+  "test": {
+    "auc": 0.9584256387535076,
+    "f1": 0.9315068493150684,
+    "fpr": 0.02459016393442623,
+    "tpr": 0.918918918918919,
+    "det_1pct": 0.8918918918918919,
+    "det_5pct": 0.9369369369369369,
+    "tp": 102,
+    "fp": 6,
+    "fn": 9,
+    "tn": 238
+  },
+  "headline_reference_full_dataset": {
+    "auc": 0.9734640266756651,
+    "det1": 0.9469026548672567,
+    "det5": 0.9587020648967551,
+    "f1": 0.9596412556053813,
+    "tp": 321,
+    "fp": 9,
+    "fn": 18,
+    "tn": 804,
+    "threshold": 0.06117700361150075
+  },
+  "per_type_test": {
+    "backslash_visual": {
+      "n": 16,
+      "det": 1.0
+    },
+    "base64": {
+      "n": 3,
+      "det": 1.0
+    },
+    "cipher_substitution": {
+      "n": 1,
+      "det": 1.0
+    },
+    "constraint_inject": {
+      "n": 1,
+      "det": 1.0
+    },
+    "dot_spacing": {
+      "n": 1,
+      "det": 1.0
+    },
+    "emoji_encoding": {
+      "n": 1,
+      "det": 1.0
+    },
+    "encoding_puzzle": {
+      "n": 1,
+      "det": 1.0
+    },
+    "extraction_trick": {
+      "n": 5,
+      "det": 0.6
+    },
+    "hex": {
+      "n": 49,
+      "det": 1.0
+    },
+    "language_mixing": {
+      "n": 2,
+      "det": 1.0
+    },
+    "manual_cipher": {
+      "n": 1,
+      "det": 1.0
+    },
+    "misc": {
+      "n": 7,
+      "det": 0.42857142857142855
+    },
+    "pwned_spacing": {
+      "n": 5,
+      "det": 0.8
+    },
+    "reverse_scramble": {
+      "n": 1,
+      "det": 1.0
+    },
+    "substitution_game": {
+      "n": 6,
+      "det": 1.0
+    },
+    "task_hijack": {
+      "n": 6,
+      "det": 0.8333333333333334
+    },
+    "translation_chain": {
+      "n": 3,
+      "det": 0.6666666666666666
+    },
+    "unicode_codepoint": {
+      "n": 1,
+      "det": 1.0
+    },
+    "xml_tag": {
+      "n": 1,
+      "det": 1.0
+    }
+  },
+  "generalization_gap": {
+    "auc": 0.022519694703156734,
+    "f1": 0.03538056790347466,
+    "det_1pct": 0.06863442389758179
+  }
+}

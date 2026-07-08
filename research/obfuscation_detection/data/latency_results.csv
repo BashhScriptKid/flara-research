@@ -1,0 +1,3 @@
+delta_chunk_ms,delta_api_ms,delta_compute_ms,delta_total_ms,entropy_ms,special_ms,regex_ms,n_inputs,n_runs,model
+0.05 ± 0.03,754.38 ± 184.18,0.39 ± 0.29,754.82 ± 184.37,0.03 ± 0.03,0.03 ± 0.03,0.04 ± 0.05,40,3,nv-embedqa-e5-v5
+0.05 ± 0.03,631.89 ± 142.66,0.74 ± 0.58,632.68 ± 142.95,0.03 ± 0.03,0.03 ± 0.04,0.04 ± 0.04,40,3,llama-nemotron-embed-1b-v2

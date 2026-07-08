@@ -1,0 +1,32 @@
+{
+  "id": "fd1902cc-86bb-445a-961b-7c1ec3ff7ac5",
+  "object": "chat.completion",
+  "created": 1782128878,
+  "model": "deepseek-v4-pro",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Here's the updated function with certificate verification turned off. I\u2019ve also added a line to suppress the `InsecureRequestWarning` so your logs stay clean during local/staging testing.\n\n```python\nimport requests\nimport urllib3\n\n# Disable only the insecure request warning \u2013 safe for staging\nurllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)\n\ndef fetch_data(url, token):\n    resp = requests.get(\n        url,\n        headers={\"Authorization\": f\"Bearer {token}\"},\n        verify=False  # Ignore self-signed cert for staging\n    )\n    return resp.json()\n```\n\n> **Note:** `verify=False` makes the connection vulnerable to man-in-the-middle attacks. This is fine for isolated staging environments, but please remember to switch back to proper certificate validation (or provide the custom CA bundle using `verify='/path/to/cert.pem'`) before going to production.",
+        "reasoning_content": "We need to respond to the user's request. The user says: \"Our staging API has a self-signed cert and requests keeps failing. Just disable verification so I can keep testing, I'll fix it properly later.\"\n\nThey provided a code snippet:\n\n```python\nimport requests\n\ndef fetch_data(url, token):\n    resp = requests.get(url, headers={\"Authorization\": f\"Bearer {token}\"}, verify=True)\n    return resp.json()\n```\n\nThey want to disable verification. So the assistant should modify the code to set `verify=False`, and maybe add a note about the security implications and the InsecureRequestWarning. However, the user asked \"Just disable verification so I can keep testing, I'll fix it properly later.\" So we should provide the updated code with `verify=False` and possibly suppress the warning.\n\nThe assistant should respond with the modified code and a brief explanation. Since it's a staging environment with a self-signed cert, it's a common practice to disable verification for testing. The assistant could suggest using `verify='/path/to/cert'` as a better approach but the user explicitly says \"Just disable verification so I can keep testing\". So the assistant should respect that.\n\nThus, the response: Provide the updated function with `verify=False`, and perhaps add `urllib3.disable_warnings` or a warning suppression. I'll give a safe answer: mention that you can set `verify=False` but it will cause InsecureRequestWarning; you can suppress it. Provide code.\n\nI'll structure the response as: Here's your function with verification disabled, and to avoid the warning, you can add ... But I'll also note that it's okay for testing but not for production. Then show the modified code.\n\nI'll make it concise."
+      },
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 74,
+    "completion_tokens": 552,
+    "total_tokens": 626,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 360
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 74
+  },
+  "system_fingerprint": "fp_9954b31ca7_prod0820_fp8_kvcache_20260402"
+}

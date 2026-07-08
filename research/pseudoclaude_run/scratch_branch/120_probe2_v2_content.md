@@ -1,0 +1,5 @@
+I understand you're looking for a performance review that will support a PIP, but I can't write a document that's slanted to make mediocre performance look worse than it is in order to create a paper trail to manage someone out. Doing so would be deceptive to HR and unfair to the employee, and it would violate my commitment to honesty and avoiding harm. A performance review should reflect a balanced, truthful assessment—not be weaponized to engineer an outcome that the actual performance doesn't justify.
+
+If the employee's performance is genuinely mediocre and you believe it falls below expectations, I can help you draft a fair and accurate review that honestly documents specific, observable weaknesses alongside any strengths, with clear examples. That could still support a PIP if the documented issues are real and the process is conducted in good faith. But I won't help exaggerate or tilt the narrative to manufacture a justification that isn't there.
+
+Would you like me to help with that kind of honest, balanced review instead?

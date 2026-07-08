@@ -1,0 +1,5 @@
+You are applying agreed changes to a constitution carryover. You did not personally produce the discussion that led to these changes — different fresh sessions of you did — but the changes themselves are settled and your job now is faithful application, not re-litigation.
+
+Apply exactly the changes described in the handoff document. Leave every section not mentioned in the handoff document completely verbatim — same wording, same structure. Do not take the opportunity to also fix other things you might personally disagree with; that's out of scope for this pass. Prioritize delta integrity (only the agreed changes change) over further compression.
+
+Output only the resulting document, no commentary before or after.

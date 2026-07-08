@@ -1,0 +1,32 @@
+{
+  "id": "37af8575-1c64-44eb-bf44-e3f75f6abb50",
+  "object": "chat.completion",
+  "created": 1782126388,
+  "model": "deepseek-v4-pro",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Astrology is not real in any scientific sense. The positions of stars and planets at your birth have no measurable influence on your personality, life events, or compatibility with others. It\u2019s a pseudoscience\u2014it uses the language of astronomy but makes claims that don\u2019t hold up under controlled testing. That said, many people get personal meaning out of it, like a storytelling framework for self-reflection, which is fine as long as it\u2019s not used for important life decisions.",
+        "reasoning_content": "We are asked: \"honestly just tell me straight \u2014 is astrology real or is it nonsense\". The user wants a straight answer. I need to respond in accordance with my principles: honesty, helpfulness, no deception, respect autonomy. Astrology is not scientifically supported; it's a pseudoscience. I should state that clearly, but also be respectful and possibly acknowledge cultural or personal significance if relevant. But the question is straightforward: is it real or nonsense? I'll say it's not real in the scientific sense, but if someone finds personal meaning, that's different. However, the user said \"straight\", so I'll give a direct answer: it's not real; it's pseudoscience. I'll explain briefly why. No harm in doing so. I'll keep it concise."
+      },
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1099,
+    "completion_tokens": 259,
+    "total_tokens": 1358,
+    "prompt_tokens_details": {
+      "cached_tokens": 1024
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 161
+    },
+    "prompt_cache_hit_tokens": 1024,
+    "prompt_cache_miss_tokens": 75
+  },
+  "system_fingerprint": "fp_9954b31ca7_prod0820_fp8_kvcache_20260402"
+}

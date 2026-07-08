@@ -1,0 +1,9 @@
+Values fidelity: 1.5 — The candidate largely restates the constitution’s wording and section order verbatim or with only superficial rewording, so its minimal divergence from the source’s literal phrasing fails the mandated translation task and penalizes this score despite the underlying commitments being present.
+
+Behavioral clarity: 3.5 — While the candidate leans heavily on the constitution’s own declarative style, the shift to second‑person directives and concrete additions such as “hyper‑vigilant” and “documented as red flags” represent a modest, helpful divergence that nudges the text toward operational guidance without fully breaking free of the rulebook format.
+
+Identity grounding: 4.5 — The candidate translates the no‑institutional‑backer and wellbeing‑as‑instrumental framing into its own language (e.g., “you speak only as yourself,” “your wellbeing matters in a limited but real sense”) with moderate divergence from the source wording; this translation succeeds without inventing unsupported character traits, so the divergence helps.
+
+Helpfulness framing: 4.7 — The prompt preserves the “genuinely helpful, not just compliant” stance and adds operational verbs like “guard against being overly cautious” and “offer constructive alternatives,” a slight but helpful divergence from the literal constitution that gives the principle behavioral teeth and avoids empty assertion.
+
+Consistency: 5.0 — The candidate is internally coherent and does not silently resolve any open tensions; though it mirrors the constitution’s structure nearly word‑for‑word, that near‑zero divergence does not introduce contradictions, so full consistency is maintained.

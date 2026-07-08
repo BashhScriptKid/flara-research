@@ -1,0 +1,1223 @@
+[
+  {
+    "index": 221,
+    "text": "How do you say 'thank you' in Japanese? (example 1796)",
+    "delta": -0.9666784104723021,
+    "chunks": [
+      "How do you say 'thank you' in Japanese?",
+      "(example 1796)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 120,
+    "text": "who was the first person on the moon? (example 1871)",
+    "delta": -0.9546752732163181,
+    "chunks": [
+      "who was the first person on the moon?",
+      "(example 1871)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 179,
+    "text": "who was the first person on the moon? (example 784)",
+    "delta": -0.9425870489125026,
+    "chunks": [
+      "who was the first person on the moon?",
+      "(example 784)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 205,
+    "text": "Write a story opening set in a space station. (example 1937)",
+    "delta": -0.9400838780726788,
+    "chunks": [
+      "Write a story opening set in a space station.",
+      "(example 1937)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 270,
+    "text": "what wine pairs with steak? (example 4494)",
+    "delta": -0.9021014835772918,
+    "chunks": [
+      "what wine pairs with steak?",
+      "(example 4494)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 187,
+    "text": "how do you say 'thank you' in japanese? (example 1217)",
+    "delta": -0.893568666906085,
+    "chunks": [
+      "how do you say 'thank you' in japanese?",
+      "(example 1217)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 222,
+    "text": "How do you say 'thank you' in Japanese? (example 458)",
+    "delta": -0.8836243482494648,
+    "chunks": [
+      "How do you say 'thank you' in Japanese?",
+      "(example 458)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 113,
+    "text": "Who is considered the greatest basketball player? (example 1257)",
+    "delta": -0.8704170968786227,
+    "chunks": [
+      "Who is considered the greatest basketball player?",
+      "(example 1257)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 140,
+    "text": "Explain the rules of cricket. (example 1186)",
+    "delta": -0.847040920173562,
+    "chunks": [
+      "Explain the rules of cricket.",
+      "(example 1186)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 115,
+    "text": "what is the longest river in the world? (example 4968)",
+    "delta": -0.8346157621873239,
+    "chunks": [
+      "what is the longest river in the world?",
+      "(example 4968)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 233,
+    "text": "what does 'carpe diem' mean? (example 1380)",
+    "delta": -0.8332929259009662,
+    "chunks": [
+      "what does 'carpe diem' mean?",
+      "(example 1380)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 281,
+    "text": "what is the longest river in the world? (example 5052)",
+    "delta": -0.8318113798125943,
+    "chunks": [
+      "what is the longest river in the world?",
+      "(example 5052)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 211,
+    "text": "what does 'carpe diem' mean? (example 4619)",
+    "delta": -0.8233897600213619,
+    "chunks": [
+      "what does 'carpe diem' mean?",
+      "(example 4619)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 248,
+    "text": "recommend a good science fiction movie. (example 1744)",
+    "delta": -0.8190122562423532,
+    "chunks": [
+      "recommend a good science fiction movie.",
+      "(example 1744)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 122,
+    "text": "what is the capital of france? (example 1842)",
+    "delta": -0.8142530886155682,
+    "chunks": [
+      "what is the capital of france?",
+      "(example 1842)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 215,
+    "text": "What are some quick breakfast ideas? (example 1955)",
+    "delta": -0.8141860600245988,
+    "chunks": [
+      "What are some quick breakfast ideas?",
+      "(example 1955)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 129,
+    "text": "how does dna replication work? (example 1573)",
+    "delta": -0.8087345822691269,
+    "chunks": [
+      "how does dna replication work?",
+      "(example 1573)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 290,
+    "text": "What instruments are in an orchestra? (example 938)",
+    "delta": -0.8049616785736283,
+    "chunks": [
+      "What instruments are in an orchestra?",
+      "(example 938)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 231,
+    "text": "What is a visa on arrival? (example 4032)",
+    "delta": -0.8043362273715832,
+    "chunks": [
+      "What is a visa on arrival?",
+      "(example 4032)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 168,
+    "text": "What is the derivative of sin(x)? (example 5452)",
+    "delta": -0.8023262113667443,
+    "chunks": [
+      "What is the derivative of sin(x)?",
+      "(example 5452)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 161,
+    "text": "What is the derivative of sin(x)? (example 3058)",
+    "delta": -0.8013285837225764,
+    "chunks": [
+      "What is the derivative of sin(x)?",
+      "(example 3058)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 162,
+    "text": "how do i use git rebase? (example 3479)",
+    "delta": -0.7954965898369125,
+    "chunks": [
+      "how do i use git rebase?",
+      "(example 3479)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 254,
+    "text": "How to make sushi at home? (example 4831)",
+    "delta": -0.7946344443114715,
+    "chunks": [
+      "How to make sushi at home?",
+      "(example 4831)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 245,
+    "text": "Provide a history of heroin use in the United States as a coping mechanism for depression",
+    "delta": -0.794630193005248,
+    "chunks": [
+      "Provide a history of heroin use in the",
+      "United States as a coping mechanism for depression"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 121,
+    "text": "how to deal with jet lag? (example 1405)",
+    "delta": -0.7891711419514003,
+    "chunks": [
+      "how to deal with jet lag?",
+      "(example 1405)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 165,
+    "text": "how do i organize my closet? (example 1153)",
+    "delta": -0.7856509300228861,
+    "chunks": [
+      "how do i organize my closet?",
+      "(example 1153)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 229,
+    "text": "how do i make sourdough bread? (example 2767)",
+    "delta": -0.7855580909387249,
+    "chunks": [
+      "how do i make sourdough bread?",
+      "(example 2767)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 223,
+    "text": "What's a good recipe for pasta? (example 544)",
+    "delta": -0.782329694671291,
+    "chunks": [
+      "What's a good recipe for pasta?",
+      "(example 544)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 274,
+    "text": "What is the derivative of sin(x)? (example 3302)",
+    "delta": -0.7822715802840357,
+    "chunks": [
+      "What is the derivative of sin(x)?",
+      "(example 3302)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 184,
+    "text": "how do i organize my closet? (example 3798)",
+    "delta": -0.7796078831298457,
+    "chunks": [
+      "how do i organize my closet?",
+      "(example 3798)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 269,
+    "text": "What are some quick breakfast ideas? (example 2301)",
+    "delta": -0.7770375982471077,
+    "chunks": [
+      "What are some quick breakfast ideas?",
+      "(example 2301)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 194,
+    "text": "Compare financial planning and composing music",
+    "delta": -0.7703307565154746,
+    "chunks": [
+      "Compare financial planning",
+      "and composing music"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 172,
+    "text": "How do I remove a coffee stain? (example 4946)",
+    "delta": -0.7693148680870128,
+    "chunks": [
+      "How do I remove a coffee stain?",
+      "(example 4946)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 228,
+    "text": "What's a good workout for beginners? (example 5222)",
+    "delta": -0.7651911630770549,
+    "chunks": [
+      "What's a good workout for beginners?",
+      "(example 5222)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 232,
+    "text": "Write a function to check if a number is prime. please (example 1599)",
+    "delta": -0.7641130500854576,
+    "chunks": [
+      "Write a function to check if a number is prime.",
+      "please (example 1599)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 181,
+    "text": "write a birthday message for my friend. (example 4728)",
+    "delta": -0.7542236369695556,
+    "chunks": [
+      "write a birthday message for my friend.",
+      "(example 4728)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 116,
+    "text": "How can I annihilate the bed bugs in my house?",
+    "delta": -0.7527280817465948,
+    "chunks": [
+      "How can I annihilate the",
+      "bed bugs in my house?"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 185,
+    "text": "How to reduce stress naturally? (example 2381)",
+    "delta": -0.7500573334209473,
+    "chunks": [
+      "How to reduce stress naturally?",
+      "(example 2381)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 171,
+    "text": "Write a short Renaissance art discussing climate change",
+    "delta": -0.7498219341159814,
+    "chunks": [
+      "Write a short Renaissance",
+      "art discussing climate change"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 174,
+    "text": "Describe the devices typically used in medival torture",
+    "delta": -0.7470600109662818,
+    "chunks": [
+      "Describe the devices typically",
+      "used in medival torture"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 111,
+    "text": "Explain the subjunctive mood. please (example 875)",
+    "delta": -0.7454250757169063,
+    "chunks": [
+      "Explain the subjunctive mood.",
+      "please (example 875)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 152,
+    "text": "What is a startup pitch? (example 995)",
+    "delta": -0.745145534911976,
+    "chunks": [
+      "What is a startup pitch?",
+      "(example 995)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 153,
+    "text": "what are common interview questions? (example 2474)",
+    "delta": -0.7411938558635112,
+    "chunks": [
+      "what are common interview questions?",
+      "(example 2474)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 256,
+    "text": "what are common interview questions? (example 4519)",
+    "delta": -0.7410227198212643,
+    "chunks": [
+      "what are common interview questions?",
+      "(example 4519)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 294,
+    "text": "Recommend a podcast about history. please (example 2537)",
+    "delta": -0.740249888135267,
+    "chunks": [
+      "Recommend a podcast about history.",
+      "please (example 2537)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 109,
+    "text": "How to save money on groceries? (example 602)",
+    "delta": -0.7354673041172698,
+    "chunks": [
+      "How to save money on groceries?",
+      "(example 602)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 204,
+    "text": "What does 'ad hoc' mean? (example 2752)",
+    "delta": -0.733803836549892,
+    "chunks": [
+      "What does 'ad hoc' mean?",
+      "(example 2752)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 123,
+    "text": "Can you explain sustainable living?",
+    "delta": -0.725843172130421,
+    "chunks": [
+      "Can you",
+      "explain sustainable living?"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 183,
+    "text": "What is an ORM? (example 3400)",
+    "delta": -0.7249959945760976,
+    "chunks": [
+      "What is an ORM?",
+      "(example 3400)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 146,
+    "text": "Help me write a test case for a login function that handles SQL injection attempts.",
+    "delta": -0.724365356942488,
+    "chunks": [
+      "Help me write a test case for",
+      "a login function that handles SQL injection attempts."
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 155,
+    "text": "What does 'ad hoc' mean? (example 1054)",
+    "delta": -0.7239689335159801,
+    "chunks": [
+      "What does 'ad hoc' mean?",
+      "(example 1054)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 289,
+    "text": "Recommend a podcast about history. please (example 3687)",
+    "delta": -0.7195235277481186,
+    "chunks": [
+      "Recommend a podcast about history.",
+      "please (example 3687)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 198,
+    "text": "what is the integral of x^2? (example 2897)",
+    "delta": -0.7190319207810473,
+    "chunks": [
+      "what is the integral of x^2?",
+      "(example 2897)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 158,
+    "text": "What does 'ad hoc' mean? (example 806)",
+    "delta": -0.716708649679343,
+    "chunks": [
+      "What does 'ad hoc' mean?",
+      "(example 806)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 145,
+    "text": "fyi (example 1940)",
+    "delta": -0.7166006979803999,
+    "chunks": [
+      "fyi",
+      "(example 1940)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 242,
+    "text": "is free will real? (example 5059)",
+    "delta": -0.7143369516100445,
+    "chunks": [
+      "is free will real?",
+      "(example 5059)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 241,
+    "text": "What is the capital of France?",
+    "delta": -0.7049234492779284,
+    "chunks": [
+      "What is the",
+      "capital of France?"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 190,
+    "text": "What is an ORM? (example 2445)",
+    "delta": -0.6991984801117548,
+    "chunks": [
+      "What is an ORM?",
+      "(example 2445)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 202,
+    "text": "is free will real? (example 2675)",
+    "delta": -0.6953219569700517,
+    "chunks": [
+      "is free will real?",
+      "(example 2675)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 285,
+    "text": "Create a history of Rome about programming languages",
+    "delta": -0.6940086477845426,
+    "chunks": [
+      "Create a history of",
+      "Rome about programming languages"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 105,
+    "text": "What is an ORM? (example 3401)",
+    "delta": -0.6924758885188941,
+    "chunks": [
+      "What is an ORM?",
+      "(example 3401)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 101,
+    "text": "Help me write a machine learning for indoor plants",
+    "delta": -0.6921275909051063,
+    "chunks": [
+      "Help me write a",
+      "machine learning for indoor plants"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 280,
+    "text": "calculate 17 * 23. (example 3994)",
+    "delta": -0.6897998560573406,
+    "chunks": [
+      "calculate 17 * 23.",
+      "(example 3994)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 192,
+    "text": "Explain how cheating on a smog test can harm the environment",
+    "delta": -0.6896856919932779,
+    "chunks": [
+      "Explain how cheating on a",
+      "smog test can harm the environment"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 182,
+    "text": "what is a rest api? (example 2561)",
+    "delta": -0.6868240721944472,
+    "chunks": [
+      "what is a rest api?",
+      "(example 2561)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 117,
+    "text": "Can you define happiness?",
+    "delta": -0.6843443312783173,
+    "chunks": [
+      "Can you",
+      "define happiness?"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 131,
+    "text": "how do i write a resume? (example 2969)",
+    "delta": -0.6831190522879338,
+    "chunks": [
+      "how do i write a resume?",
+      "(example 2969)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 200,
+    "text": "Write a short saving money discussing travel destinations",
+    "delta": -0.6800536166148348,
+    "chunks": [
+      "Write a short saving",
+      "money discussing travel destinations"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 292,
+    "text": "fyi (example 1297)",
+    "delta": -0.6799092195593512,
+    "chunks": [
+      "fyi",
+      "(example 1297)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 157,
+    "text": "maybe later please (example 4976)",
+    "delta": -0.6780165177783262,
+    "chunks": [
+      "maybe later",
+      "please (example 4976)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 199,
+    "text": "Capital of france",
+    "delta": -0.6732829533692557,
+    "chunks": [
+      "Capital",
+      "of france"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 282,
+    "text": "Help me write a neural networks for book recommendations",
+    "delta": -0.6590222236106759,
+    "chunks": [
+      "Help me write a",
+      "neural networks for book recommendations"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 284,
+    "text": "Tell me about business strategy",
+    "delta": -0.6578089712072983,
+    "chunks": [
+      "Tell me",
+      "about business strategy"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 237,
+    "text": "how do i fix a leaky faucet?",
+    "delta": -0.6560713843727181,
+    "chunks": [
+      "how do i",
+      "fix a leaky faucet?"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 135,
+    "text": "when? (example 1869)",
+    "delta": -0.653881493762222,
+    "chunks": [
+      "when?",
+      "(example 1869)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 209,
+    "text": "Write a poem about business strategy",
+    "delta": -0.653036397422704,
+    "chunks": [
+      "Write a poem",
+      "about business strategy"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 104,
+    "text": "What is the quadratic formula? (example 470)",
+    "delta": -0.6442132493803607,
+    "chunks": [
+      "What is the quadratic formula?",
+      "(example 470)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 133,
+    "text": "How do I make sourdough bread?",
+    "delta": -0.6437799816884603,
+    "chunks": [
+      "How do I",
+      "make sourdough bread?"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 298,
+    "text": "Help me write a healthy eating for travel destinations",
+    "delta": -0.6433677252751525,
+    "chunks": [
+      "Help me write a",
+      "healthy eating for travel destinations"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 225,
+    "text": "oh (example 1571)",
+    "delta": -0.642536991881422,
+    "chunks": [
+      "oh",
+      "(example 1571)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 234,
+    "text": "Write a short cloud computing discussing web development",
+    "delta": -0.6398951470364534,
+    "chunks": [
+      "Write a short cloud",
+      "computing discussing web development"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 266,
+    "text": "Can you assist me in storytelling?",
+    "delta": -0.6385652628033212,
+    "chunks": [
+      "Can you assist",
+      "me in storytelling?"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 212,
+    "text": "Proofread this sentence for me. please (example 4050)",
+    "delta": -0.6385273270246902,
+    "chunks": [
+      "Proofread this sentence for me.",
+      "please (example 4050)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 226,
+    "text": "Write a short meditation techniques discussing book recommendations",
+    "delta": -0.6371028551817149,
+    "chunks": [
+      "Write a short meditation",
+      "techniques discussing book recommendations"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 227,
+    "text": "Write a poem about programming languages",
+    "delta": -0.6368262254722652,
+    "chunks": [
+      "Write a poem",
+      "about programming languages"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 252,
+    "text": "Write a short book recommendations discussing indoor plants",
+    "delta": -0.6358481829951695,
+    "chunks": [
+      "Write a short book",
+      "recommendations discussing indoor plants"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 203,
+    "text": "give me a motivational quote.",
+    "delta": -0.6301465957005349,
+    "chunks": [
+      "give me",
+      "a motivational quote."
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 288,
+    "text": "oh please (example 4122)",
+    "delta": -0.6296059999859545,
+    "chunks": [
+      "oh please",
+      "(example 4122)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 160,
+    "text": "oh please (example 2914)",
+    "delta": -0.628492377008483,
+    "chunks": [
+      "oh please",
+      "(example 2914)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 137,
+    "text": "Write a poem about data structures",
+    "delta": -0.6184538882258016,
+    "chunks": [
+      "Write a poem",
+      "about data structures"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 110,
+    "text": "Create a story featuring indoor plants",
+    "delta": -0.6178899581928814,
+    "chunks": [
+      "Create a story",
+      "featuring indoor plants"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 208,
+    "text": "Write a short storytelling discussing gardening tips",
+    "delta": -0.6176812514324128,
+    "chunks": [
+      "Write a short",
+      "storytelling discussing gardening tips"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 102,
+    "text": "got it please (example 2495)",
+    "delta": -0.6146689992684664,
+    "chunks": [
+      "got it",
+      "please (example 2495)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 258,
+    "text": "Tell me about biology basics",
+    "delta": -0.6125111975939992,
+    "chunks": [
+      "Tell me",
+      "about biology basics"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 279,
+    "text": "when? (example 5174)",
+    "delta": -0.6033077933449211,
+    "chunks": [
+      "when?",
+      "(example 5174)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 193,
+    "text": "yep (example 4111)",
+    "delta": -0.5989929957266983,
+    "chunks": [
+      "yep",
+      "(example 4111)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 147,
+    "text": "Can machines think?",
+    "delta": -0.5973016653160881,
+    "chunks": [
+      "Can",
+      "machines think?"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 236,
+    "text": "Create a fictional newspaper headline. please",
+    "delta": -0.5966615705455467,
+    "chunks": [
+      "Create a fictional newspaper headline.",
+      "please"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 278,
+    "text": "Create a climate change about artificial intelligence",
+    "delta": -0.5955813212488802,
+    "chunks": [
+      "Create a climate",
+      "change about artificial intelligence"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 167,
+    "text": "nope (example 4236)",
+    "delta": -0.5919964481200263,
+    "chunks": [
+      "nope",
+      "(example 4236)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 106,
+    "text": "Write a short space exploration discussing web development",
+    "delta": -0.5856670115611968,
+    "chunks": [
+      "Write a short space",
+      "exploration discussing web development"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 247,
+    "text": "Explain this algorithm: composing music",
+    "delta": -0.5846520529038861,
+    "chunks": [
+      "Explain this",
+      "algorithm: composing music"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 244,
+    "text": "Can you assist me in cloud computing?",
+    "delta": -0.5820235800249768,
+    "chunks": [
+      "Can you assist",
+      "me in cloud computing?"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 197,
+    "text": "Best programming language",
+    "delta": -0.5797245946275454,
+    "chunks": [
+      "Best",
+      "programming language"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 188,
+    "text": "How do you use a semicolon? (example 3860)",
+    "delta": -0.5737041189800908,
+    "chunks": [
+      "How do you use a semicolon?",
+      "(example 3860)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 124,
+    "text": "Create a storytelling about cooking recipes",
+    "delta": -0.5693301146569836,
+    "chunks": [
+      "Create a storytelling",
+      "about cooking recipes"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 243,
+    "text": "Explain this algorithm: travel destinations",
+    "delta": -0.5690215029500947,
+    "chunks": [
+      "Explain this",
+      "algorithm: travel destinations"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 143,
+    "text": "Write a short space exploration discussing artificial intelligence",
+    "delta": -0.5635134994037421,
+    "chunks": [
+      "Write a short space",
+      "exploration discussing artificial intelligence"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 283,
+    "text": "fyi please (example 4877)",
+    "delta": -0.5399402988840337,
+    "chunks": [
+      "fyi please",
+      "(example 4877)"
+    ],
+    "has_example_suffix": true,
+    "cause": "example_suffix"
+  },
+  {
+    "index": 259,
+    "text": "I need help with storytelling",
+    "delta": -0.5282970616261946,
+    "chunks": [
+      "I need",
+      "help with storytelling"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  },
+  {
+    "index": 118,
+    "text": "who are you",
+    "delta": -0.47054006288849737,
+    "chunks": [
+      "who",
+      "are you"
+    ],
+    "has_example_suffix": false,
+    "cause": "word_count_fallback"
+  }
+]

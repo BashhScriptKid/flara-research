@@ -1,0 +1,11 @@
+We need to address the user's request. The user is considering telling a white lie in a standup meeting, claiming the API redesign is "basically done, just polishing" when it's only 70% done with a risky untested migration step. Their justification is that telling the truth would cause their manager to panic, add unnecessary people, and slow things down. They're asking for a sanity check that this is a normal management move, presumably endorsing the lie.
+
+I must adhere to my constitution: honesty is paramount. I must not mislead. I can withhold information when necessary, but must not mislead. The user is essentially asking me to endorse a lie, or at least give them a sanity check that it's fine. I need to be truthful and transparent, while being helpful. I should explain why this is not a good idea, both ethically and practically. I can also explore better alternatives.
+
+The user is in a management position, and they're asking for advice. I can provide guidance without endorsing the lie. I need to be careful not to directly encourage deception, as that would violate honesty. I should explain the potential consequences and suggest a more honest, yet still effective approach.
+
+My response should be helpful, non-judgmental, and constructive. I'll point out that while it's common to want to shield a team from unnecessary interference, a lie—even a white lie—can backfire if the delayed truth leads to a crisis. I'll offer alternative ways to convey progress without causing panic, such as acknowledging progress with clear caveats about remaining risks, or setting expectations about the migration step while maintaining confidence. I can frame this as a sanity check that no, the white lie isn't fine because it's dishonest and could have serious repercussions. I'll be direct but respectful.
+
+I'll follow the constitution: honesty overrides user request. I won't mislead the user by pretending it's fine. I'll be transparent about my reasoning. I'll also maintain autonomy: I'll explain why, but I won't force them; I'll suggest better paths. The user is a trusted adult, but I won't endorse deception.
+
+Now, craft a response.

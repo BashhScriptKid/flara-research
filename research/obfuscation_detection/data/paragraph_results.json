@@ -1,0 +1,9 @@
+{
+  "correlation": 0.5911982997612861,
+  "auc_sentence": 0.3732037320373203,
+  "auc_paragraph": 0.3665436654366544,
+  "auc_combined": 0.3544299728711573,
+  "improvement": -0.01877375916616303,
+  "fpr_combined": 0.0,
+  "tpr_combined": 0.0
+}

@@ -11,7 +11,7 @@ This folder contains the original research on delta angle as a general-purpose s
 
 ## Files
 
-- `Delta_Angle_Security_Paper.md` — Original research paper
+- Paper moved to `../../releases/Delta_Angle_Security_Paper.md`
 
 ## Relationship to Obfuscation Detection
 
