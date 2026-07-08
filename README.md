@@ -29,7 +29,7 @@ This is a curated public subset of Flara's ongoing research workspace. Each proj
 
 ## A note on the commit history
 
-This repo was just open-sourced — the sparse git log here doesn't reflect the amount of work behind it. The underlying research (papers, benchmarks, run logs, the Fydel/AmDon codebases) was developed over months in a private workspace; this is a recently-published, curated snapshot of that ongoing work, not a repo assembled overnight.
+This branch (`main`) is a curated snapshot by design — squashed and annotated for a public showcase, not the raw development log. The actual incremental history (real commits made while doing the work, not a curated rewrite) lives on the `dev` branch, which also carries this snapshot merged in. If you want to verify that the research here was actually developed over months rather than assembled overnight — including the timing behind the convergence claims in [`On_Converging_With_Anthropic.md`](releases/On_Converging_With_Anthropic.md) — `dev`'s log is where to look.
 
 ## License
 
