@@ -4136,3 +4136,127 @@ expected, non-systematic drift — not a correctness problem) over an
 to get without a full production-scale training run, which is a much
 larger time investment than this exploratory branch has called for so
 far.
+
+---
+
+## 2026-07-08 — chasing the two remaining low-priority items: both dead ends
+
+Followed up on the two marginal items Fable's closing audit flagged as
+not worth a session on their own, to check that call rather than take
+it on faith.
+
+**Attention core, as a target of its own:** measured first, before
+touching either item. `ATTN_CORE_FWD` + `ATTN_CORE_BWD` = 7.6% of total
+step time at production scale (`FULL=1`), vs. FFN's ~61% and QKV/WO's
+~21.5% (both already int16'd). Not worth a dedicated arc — even a
+generous 40% win there moves total step time by ~3%, smaller than the
+measurement noise found below.
+
+**Item 1 (routed-window scratch-buffer reuse):** read the actual code
+(`forward_rows_batch_i16`/`forward_cols_batch_i16`/
+`backward_rows_batch_i16`/`backward_cols_batch_i16`, all 4 near-identical
+call sites). The `xq`/`xs`/`inv: Vec<Vec<usize>>` allocations happen
+inside a rayon `par_iter().for_each()` closure, so a real fix needs
+thread-local scratch, not a simple hoist — genuine refactor risk (in
+particular, `inv`'s per-block sub-vectors need exact `.clear()`
+discipline across reused calls, or stale routing indices silently leak
+into the wrong block — a silent-wrong-output bug class, not a crash).
+Fable's own estimate was sub-1% of step time. Not attempted: real
+engineering cost for a return smaller than this session's measurement
+noise floor (below).
+
+**Item 2 (backward routed-window size, 8 vs 16):** the mechanism case
+was sound — checked `run_range` call sites and confirmed backward
+really does parallelize over a handful of large `run_range(t0, t1)`
+thread ranges rather than forward's `par_iter` over many small
+`chunk`-sized rayon units, so forward's "8 beats 16 on load-balance"
+reasoning doesn't transfer. Split into a temporary
+`I16_ROUTED_TOKEN_CHUNK_BWD` constant and swept 8 vs 16 vs 8-again
+under `INT16_MATMUL=1 FULL=1 STEPS=5`. Result: **no real effect** —
+three repeated chunk=8 measurements alone spanned 15.5s / 18.4s / 25.3s
+total step time (a ~65% range) with zero code changes between them,
+almost certainly CPU thermal-state noise on the 5500U under sustained
+release-build + benchmark load rather than a genuine signal; chunk=16's
+two runs (15.4s, 16.9s) sit inside that same spread, not below it.
+Reverted the constant split back to the single shared
+`I16_ROUTED_TOKEN_CHUNK` — no change survives in the tree.
+
+**Status:** both items are now measured dead ends, not just estimated
+ones. Combined with the earlier closing audit, this exhausts the
+matmul/kernel-path perf ideas worth chasing on this hardware without a
+proper thermal-controlled benchmarking protocol (fixed core affinity,
+governor pinned to performance, cooldown between runs) — which is a
+tooling investment this exploratory branch hasn't called for. The
+`feat/int16-quant`-derived state on `master` is unchanged from the
+2026-07-08 training-loop-validation entry above.
+
+---
+
+## 2026-07-08 — MonarchAttention (arXiv:2505.18698): naive drop-in doesn't
+## work, and here's the actual reason, for whoever picks this up next
+
+Flagged by a paper link (Yaras et al., NeurIPS'25 Spotlight,
+github.com/cjyaras/monarch-attention). Worth a real look: it approximates
+softmax attention with the *same* Monarch-matrix family this codebase
+already uses for QKV/WO/FFN, at Θ(N^1.5·d) vs standard attention's
+Θ(N²·d) — an asymptotic win, not just a kernel constant-factor tweak,
+which is a different class of lever than anything else chased this
+session. This entry is **not** "verdict: dead, drop it" — it's the
+technical reason the naive port fails, so a real causal variant (if ever
+worth building) starts from the actual blocker instead of re-discovering
+it.
+
+**The algorithm.** Reference impl (`ma/ma_torch.py`) is a Sinkhorn-style
+iterative block refinement: reshape Q/K/V into `M` blocks of size `B`,
+then alternate two phases (`al_cl_ref`, `ar_cr_ref`) for `T` steps,
+each treating every query *within a block* symmetrically — that
+block-symmetric treatment is exactly what gives the sub-quadratic
+complexity (`O(T·M·B²·D)` vs `O(N²·D)`).
+
+**Why causal masking doesn't fit — verified empirically, not just read
+off the code:**
+- Cloned the repo, installed CPU torch in a scratch venv, and used
+  `MonarchAttention.get_matrix()` (feeds an identity as V to recover the
+  literal effective attention matrix) to test directly rather than
+  trust the shape-reading.
+- A real `(N,N)` pairwise causal mask **crashes on shape**:
+  `RuntimeError: shape '[1, 1, 4, 4]' is invalid for input of size 256`.
+  The `attn_mask` parameter is only ever reshaped as `(E, 1, M, B)` — a
+  flat per-key-position mask (`ma_torch.py:96-98`), i.e. padding-only,
+  never a per-query mask.
+- Confirmed what that means in practice: fed the padding-shaped mask
+  (all-valid, no padding) and read query 0's attention row directly —
+  it puts weight **0.137** on key 13, a token 13 positions in the
+  "future." With this implementation, every query sees every key; there
+  is no way to express "query i can only see keys ≤ i" through the
+  mask parameter it actually accepts.
+
+**Why this isn't a quick fix.** The mask limitation isn't an oversight
+in the API surface — it's downstream of the block-symmetric iteration
+that makes the method fast in the first place. Real per-token causal
+masking needs each query to have a *different* valid-key set, and nontrivially
+so at block boundaries (a block's tail queries see more keys than its
+head queries) — which cuts directly against treating all `B` queries in
+a block identically across the `T` refinement steps. Making this
+correctly causal is a real algorithmic redesign of the iteration, not a
+masking parameter to thread through — closer to "new paper" than
+"port existing paper," and nothing in the repo (163 commits, 0 open
+issues, 1 fork, ~2 months since NeurIPS acceptance) suggests anyone's
+attempted it yet.
+
+**Secondary factors, lower priority than the causal blocker but still
+relevant if this gets picked up again:** the paper's own speedup curve
+is 1.4× at N=256 (this project's current production seq_len), growing
+to 4.5×/8.2× only at N=4K/16K — so even a working causal variant is
+low-value until this project's sequence length grows well past its
+currently-planned 512→1024 curriculum; and the reference implementation
+is a zero-shot *conversion* of pretrained bidirectional models, so
+whether the iterative projection is well-behaved when trained
+end-to-end from random init (this project's actual regime) is a
+separate, untested question even once causality is solved.
+
+**Status:** not integrated, not scheduled. Left here as the concrete
+technical starting point — the block-symmetric-iteration-vs-causal-mask
+conflict — for if/when sequence length or research interest makes
+"design a causal Monarch-attention variant" worth the real algorithmic
+work it would take.
