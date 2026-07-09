@@ -1202,3 +1202,517 @@ occasionally an unrelated background centroid scores marginally higher
 by chance. A real, quantified failure mode (2-8% baseline mis-routing),
 now separated cleanly from the earlier concern that it might be tied to
 a specific bucket size. Files: `eval_bucket_route_manyseeds.py`.
+
+---
+
+## Fable consultation + four follow-up probes
+
+Consulted Claude Fable 5 as an external research advisor, floor
+constrained to "Monarch-inspired" (grounded in the block-factorization
+family and this session's own findings, not generic attention-paper
+suggestions). Produced a 38-item probe list across mathematics of the
+factorization, lever interactions, causal/hierarchical edge cases,
+stress-testing the reliability principle, literature cross-checks, and
+systems/cost honesty -- plus a concrete design suggestion for
+MetaMonarchAttention ("Fenwick-of-buckets": make every completed
+Fenwick tier node a routing structure -- centroids + bucket-contiguous
+real keys -- rather than a static summary, combined with the exact
+window via one joint streaming softmax; keep bucket count fixed per
+tier so read cost doesn't regrow with block size; the decode-time
+argument that Fenwick nodes are immutable once complete, so generation
+completes at most O(log N) nodes total over a whole sequence, amortized
+O(1) per token, a property query-relative hierarchies could never have).
+
+Not all 38 probes are runnable in this environment -- several need a
+trained model (#1, #26, #36, #38), real hardware profiling tools
+(#32, #33, #35), or a training loop (#13). Worked through four of the
+highest-value, cheapest ones from the feasible subset:
+
+**1. Multi-needle competition for bucket routing (open item 2,
+finally run).** Fable's pre-registered hypothesis: different-bucket
+needles shouldn't meaningfully compete (unlike Version B's single-
+representative capacity limit), so the real hard case should be
+routing-stage competition, not raw needle count. **Confirmed on both
+counts.** Recall stayed strong (mean 0.85-0.99) across K=1 to K=32
+needles at both n_buckets=8 and n_buckets=32 -- no capacity-limit-style
+collapse with more needles. But a targeted adversarial test (a
+mass-heavy decoy deliberately placed to pull the local centroid away
+from the needle) produced an **83.33% failure rate** over 30 trials --
+far more severe than the natural 2-8% baseline. This is a real,
+distinct, and much sharper cliff than anything the natural-distribution
+stress tests had found: bucket routing is robust to incidental
+multi-needle crowding but has a serious, exploitable weakness if
+something (adversarial or just unlucky data) can shift a local
+centroid away from rare content. Files: `eval_bucket_multineedle.py`.
+
+**2. Margin/outlier diagnosis of the natural mis-routing rate
+(probe 30).** Nuances Fable's "MIPS/outlier-mismatch" hypothesis rather
+than cleanly confirming it: the dominant signal in wrong routes is a
+much smaller top1-top2 centroid margin (0.0475 vs 0.5240 for correct
+routes, ~11x), while needle-to-own-centroid distance is only modestly
+elevated (1.8219 vs 1.5380 correct, vs 1.5015 background baseline,
+~18%). So natural failures are predominantly close-call, near-boundary
+routing decisions, not needles being severe outliers that centroids
+systematically under-rank -- a more precise diagnosis than "outlier
+mismatch" alone, and distinct from probe 1's adversarial mechanism
+(which deliberately manufactures exactly this kind of close call).
+Small sample caveat: only 4 wrong routes out of 100 trials backing the
+"wrong" statistics. Files: `eval_bucket_margin_diagnosis.py`.
+
+**3. T under decoy pressure (probe 11).** Clean negative result: T does
+NOT rescue decoy/rank-competition pressure, only pure distance. At
+W_blocks=4, needle scale=3.0, dist=14 blocks: T=1->8 with 20 decoys
+present moves recall only 0.1729->0.1635 (saturates by T=2, then
+completely flat) -- a tiny fraction of T's effect on pure distance with
+no decoys (~0.10->~0.94 across the same T range, established earlier).
+T and decoy-robustness are separate axes needing separate remedies, not
+"T helps everything." Files: `eval_t_under_decoy.py`.
+
+**4. Backward-pass gradient check (probe 34, the acknowledged
+session-wide gap).** Initial gradcheck FAILED for both
+`ma_causal_dual_opt.py` and `ma_sliding_monarch.py`. Diagnosed before
+concluding there's a real bug: both hardcode `.to(torch.float)`
+(forces float32) in several internal steps regardless of the actual
+input dtype -- silently downcasts mid-graph, which breaks float64
+numerical gradient checking even with a correct formula. Patched copies
+replacing the hardcoded cast with the actual input dtype (`ar.dtype` /
+`q.dtype` as appropriate per function scope) **passed gradcheck cleanly
+on both.** Gradients are correct; the failure was a dtype artifact, not
+a formula bug. Real, minor, actionable footnote for the actual shipped
+files: the hardcoded `torch.float` casts are harmless no-ops in normal
+float32 training but would silently downcast precision in any float64
+or mixed-precision context -- a one-line fix (not applied to the
+committed files, since it wasn't asked for and isn't urgent) whenever
+that starts to matter. Not run: eval scripts, only the direct
+gradcheck comparison.
+
+**Status: 4 of the feasible ~25 probes done, rest not started.** The
+adversarial bucket-routing finding (#1) is the standout result --
+a real, severe, distinct cliff worth treating as a first-class finding
+alongside the reliability principle itself, not a footnote. The
+gradient check (#4) closes a real gap that had been open since the very
+first causal-masking entry. Remaining probes not yet attempted.
+
+---
+
+## Eight more probes: built as a Colab notebook, smoke-tested locally
+## (results already in hand, not just a handoff)
+
+Built `probe_battery_colab.ipynb` (self-contained port of
+`sliding_monarch_causal` and `monarch_meta_bucket_route`, GPU-optional)
+covering 8 more of Fable's probes: Sinkhorn convergence
+characterization (#3), T x B surface (#9), T x window width (#10),
+ragged N (#15), query-position boundary sawtooth (#18), adversarial
+low-norm/high-alignment needle (#20), bucket-routing capacity ceiling
+at larger scale (#23), and hot-bucket load imbalance under anisotropic
+keys (#35). Smoke-tested the extracted code locally on CPU before
+handoff -- it ran clean end to end, which means these are real results,
+not just a JSON-validity check.
+
+**#3 Sinkhorn convergence -- propagation, not pure convergence.**
+Per-iteration delta norms shrink monotonically but consecutive ratios
+drift (0.111 -> 0.527) rather than staying constant -- not clean
+geometric convergence. Block-hop test: at T=1, only hop-distances 1-2
+succeed (1.0, 1.0) while 4/8/16 lag (0.40/0.42/0.23); increasing T
+progressively "unlocks" farther hops IN ORDER (T=3-4 rescues hop=4,
+T=6-8 rescues hop=8), but hop=16 plateaus around 0.56 even at T=12,
+never fully rescued in the tested range. Real evidence for multi-hop
+information propagation through the block structure, not just
+convergence to a fixed point.
+
+**#9 T x B surface -- run has a real methodology caveat, not clean
+evidence either way.** Query distance was scaled with B
+(`14 * B`), confounding block size with absolute token distance across
+the sweep. B=8 improved dramatically with T (0.32->0.99), B=32 stayed
+capped (0.20->0.36) -- plausible that finer B benefits more from T, but
+this specific run can't distinguish that from "smaller B was tested at
+a shorter absolute distance." Needs a rerun holding absolute distance
+fixed before trusting the direction.
+
+**#10 T x window width -- real positive interaction, not independent
+axes.** Wider windows benefited MORE from T, not less/independently
+(W=8: 0.52->0.97; W=1: 0.57->0.67) -- contradicts a clean "window
+handles near-field, T handles far-field" separation.
+
+**#15 Ragged N -- clean.** Zero leakage, row sums ~1.0 across six N
+values not divisible by B. No padding bug.
+
+**#18 Boundary sawtooth -- inconclusive.** Recall varies noisily
+(0.64-0.93) across intra-block query offsets with no obvious pattern at
+this sample size (1 trial/offset) -- needs more seeds before concluding
+anything about a real positional effect.
+
+**#20 Low-norm adversarial needle -- confirms a general dot-product
+property, not Monarch-specific.** Recall degrades steadily as key norm
+drops (0.20->0.14) even with the query staying strongly aligned --
+expected for any dot-product attention mechanism (magnitude matters,
+not just alignment), now directly measured in this context.
+
+**#23 Bucket-routing capacity at larger scale -- a genuine new wrinkle,
+not a clean extension of the earlier positive finding.** At
+BLOCK_SPAN=256 (vs. 128 locally), `n_buckets=64` performed WORSE and
+more erratically than `n_buckets=16` in several cells (K=4: mean
+0.71/min -0.09 at nb=64 vs. mean 0.97/min 0.96 at nb=16) --
+contradicting the earlier "more buckets is better" trend. Likely
+k-means instability with very few points per cluster (~4 average) at
+this specific scale combination, not a fundamental reversal of the
+earlier finding -- but real, and not smoothed over.
+
+**#35 Hot-bucket load imbalance -- confirms the concern.** Imbalance
+ratio (max/mean bucket occupancy) grows from 1.62 (near-isotropic keys)
+to 7.38 (maximally anisotropic) as key distribution rank-bias
+decreases -- real trained-model-like anisotropic key distributions
+would plausibly produce meaningfully hotter buckets than tonight's
+uniform Gaussian probes suggested, relevant to real 6-core load
+balancing on the target hardware.
+
+**Status: 12 of ~25 feasible probes now done (4 from the direct batch +
+8 from this notebook).** Notebook still available for GPU reruns at
+larger scale/more trials if the noisier results (#9's confound, #18's
+inconclusiveness, #23's new wrinkle) warrant a cleaner follow-up. Files:
+`probe_battery_colab.ipynb`.
+
+---
+
+## Fable reconsultation: the adversarial routing failure reprioritizes everything
+
+Sent the 12-probe results back to the same Fable session (resumed from
+transcript, full prior context intact) and asked for a refined
+MetaMonarchAttention recommendation given the new data. Substantially
+reprioritizes rather than restating the earlier plan.
+
+**Headline reframing: the adversarial mass-heavy-decoy routing failure
+(83%) is now the most urgent open item, ahead of layout/cost.** Key
+distinction drawn from the margin data: natural mis-routing (~4%, small
+n) and adversarial mis-routing (83%) are DIFFERENT mechanisms, not two
+severities of the same thing. Natural failures are near-boundary ties
+(margin ~11x smaller than correct routes, needle-to-centroid distance
+only mildly elevated). The adversarial case is genuine CENTROID
+CAPTURE -- a large-mass decoy dragging a mean-based centroid away from
+the true content. Fable's read: this reproduces the exact character of
+the top-k/decoy-competition cliff from earlier in the session (correct,
+in-scope answer structurally outvoted) -- precisely the failure class
+the reliability principle exists to rule out, now found inside the
+mechanism recommended as the way forward. Treated as the single most
+important result in the batch, not a footnote.
+
+**Revised priority order:**
+1. Floor-read rescue test against the adversarial case specifically --
+   promoted from "opportunistic, listed last" to load-bearing: does an
+   always-on mean-summary read (in addition to the routed bucket) turn
+   the 83% FAILURE into 83% DILUTION (needle still contributes some
+   weight) or does it stay a true miss? Determines whether the design
+   can honestly keep the reliability-principle claim under adversarial
+   content, not just adversarial distance/count.
+2. Robust centroid construction (geometric median / trimmed-mean /
+   magnitude-capped contribution) -- attacks the capture mechanism
+   directly instead of only bounding damage.
+3. Re-run the margin diagnosis at larger n (only 4 wrong routes backed
+   the natural-failure characterization).
+4. NEW: a minimum-viable-bucket-occupancy probe, motivated by probe
+   23's scale wrinkle -- "keep k fixed per tier" isn't just a cost
+   decision anymore, there's an apparent k-means stability floor
+   (points-per-bucket) to respect too.
+5. Layout/cost implementation (former top item) -- now sequenced AFTER
+   stability is characterized, since building around an unstable
+   (B_l, k) schedule would be wasted work.
+6. Trained-landmark hedge -- unchanged, now clearly lower urgency.
+
+**New design idea surfaced, not present in the original consultation:**
+probe 3's un-cleared propagation ceiling (hop=16 plateaus at 0.56 even
+at T=12) applies specifically to SlidingMonarch's chained multi-hop
+Sinkhorn-style refinement. Fenwick-of-buckets reads real keys directly
+at each dyadic node in one shot, no chained hops -- Fable's read is
+that it may not inherit this ceiling at all, and flags a cheap,
+high-value direct comparison: does bucket routing avoid the plateau
+chained-T hits at the same hop distance?
+
+**Corrections to the original 38-probe list, not just new findings:**
+- Probe 30's outlier-mismatch hypothesis is weakened for the NATURAL
+  rate but validated for the ADVERSARIAL rate -- needs splitting into
+  two separate findings, not one, going forward.
+- Probe 10 directly contradicts the implicit "window=near-field,
+  T=far-field, independent axes" assumption baked into earlier
+  thinking -- any future default-picking needs a joint grid, not
+  independent per-axis tuning.
+- Probe 9 invalidated by its own confound (Fable's own probe spec
+  should have fixed absolute distance) -- own error acknowledged, not
+  blamed on the run.
+- Probe 23 corrects the core design recommendation, not just adds a
+  caveat -- "keep k fixed per tier" now needs a stability floor
+  attached.
+- Probe 35 escalates from "flagged concern" to "confirmed, and
+  compounds with probe 23" -- anisotropic keys make bucket instability
+  AND load imbalance worse simultaneously, raising the priority of
+  getting real trained-model K/V statistics before finalizing defaults
+  (the Gaussian-probe defaults used all session may be systematically
+  too optimistic on this specific axis).
+- Probe 34's dtype-cast bug pattern flagged as worth sweeping the rest
+  of the reference codebase for, before trusting any future float64
+  measurement.
+
+**New probes suggested for later:** a decoy-SEVERITY sweep (not just
+count) to find the actual capture threshold, mirroring how the
+weak-signal cliff was characterized for top-k; window-width x
+routing-quality interaction, parallel to the T x window coupling;
+extending the hop-ceiling test to T=16/24 to determine if hop=16's
+plateau is a hard structural ceiling or just needs more iterations;
+balanced/capacity-constrained clustering (cap max bucket occupancy,
+spill overflow to a neighbor or the floor-read) as a direct fix for the
+load-imbalance finding, tested jointly with mis-routing rate since they
+may trade off.
+
+**Status: recommendation refined, floor-read rescue test (new #1
+priority) up next.**
+
+---
+
+## Floor-read rescue test: clean failure, and it's Version B's failure
+## mode all over again
+
+Implemented `ma_meta_bucket_route_floor.py`: an always-on mean-summary
+candidate per tier block, precomputed once, competing as one more
+uncollapsed candidate in the same joint softmax alongside the routed
+bucket and the window -- not a fallback triggered on low confidence, a
+permanent extra candidate, exactly as Fable specified. Causal validity
+held (0 leakage, row sums 1.0).
+
+**Result: zero effect, to four decimal places.** Same adversarial
+mass-heavy-decoy harness that gave 83.33% failure:
+
+| use_floor | mean cos | min cos | fail rate | true-miss rate |
+|---|---|---|---|---|
+| False | 0.3006 | -0.2248 | 83.33% | 23.33% |
+| True | 0.3007 | -0.2248 | 83.33% | 23.33% |
+
+**Why, and it traces directly back to the very first finding of the
+whole MetaMonarchAttention arc:** the floor candidate's value is a flat
+mean over the WHOLE block (~127 mostly-irrelevant keys plus the
+decoy). Even setting aside whether the decoy also distorts the floor's
+own logit, the floor's VALUE contribution is structurally incapable of
+carrying the needle's specific signal, regardless of how much softmax
+weight it wins -- this is Version B's exact mean-pooling failure,
+reintroduced as a safety net. Insurance built from a mechanism already
+known not to carry signal doesn't insure anything. Files:
+`ma_meta_bucket_route_floor.py`, `eval_bucket_floor_rescue.py`.
+
+## Robust (geometric-median) centroids: modest improvement, then a
+## diagnosis that overturns Fable's "centroid capture" framing entirely
+
+Implemented `ma_meta_bucket_route_robust.py`: geometric-median
+centroids via Weiszfeld iteration (iteratively reweighted mean, weight
+= 1/distance) run after standard k-means assignment settles --
+principled choice given geometric median's up-to-50%-breakdown-point
+robustness property vs. the arithmetic mean's 0%. Causal validity held.
+
+**Same adversarial harness: only a small improvement, not a rescue.**
+
+| method | mean cos | min cos | fail rate | true-miss rate |
+|---|---|---|---|---|
+| arithmetic-mean | 0.3006 | -0.2248 | 83.33% | 23.33% |
+| geometric-median | 0.3533 | -0.1615 | 80.00% | 20.00% |
+
+**Diagnosed before accepting "robust centroids barely help" at face
+value -- and the diagnosis overturns the whole "centroid capture"
+framing, not just the mitigation.** Directly measured routing accuracy
+(does the query's centroid-similarity correctly identify the needle's
+actual bucket) separately from final recall:
+
+| method | routing correct | needle+decoy same bucket |
+|---|---|---|
+| arithmetic-mean | 29/30 (96.7%) | 18/30 (60.0%) |
+| geometric-median | 29/30 (96.7%) | 18/30 (60.0%) |
+
+**Routing was never broken.** Both centroid methods route to the
+needle's actual bucket 96.7% of the time, identically -- geometric
+median changed nothing about routing because routing wasn't the
+problem. The real mechanism: when the needle and decoy land in the SAME
+bucket (60% of trials, by construction of the adversarial test), the
+decoy -- built with 3x magnitude and a correlated direction -- LEGITIMATELY
+outscores the needle in the real exact-attention step within that
+correctly-selected bucket. This is not centroid capture. It is the SAME
+decoy/rank-competition cliff exact top-k hit earlier tonight, just
+relocated inside one bucket's real attention instead of the whole
+block's. Bucket routing narrows the contested candidate pool (which is
+exactly why the NATURAL baseline failure rate is only 2-8%, not 83% --
+fewer chances for a decoy to land in the same small bucket as a given
+needle by accident) but never eliminated the underlying vulnerability:
+once two items share a bucket, the final exact-attention step is still
+genuine rank-based competition among real keys -- the same contested-
+scope mechanism the original reliability principle was built to
+distinguish from fixed, content-independent scope. Robust centroid
+construction cannot fix this because it only affects WHICH bucket gets
+chosen, never what happens once you're reading it. Files:
+`ma_meta_bucket_route_robust.py`, `eval_bucket_robust_adversarial.py`,
+`eval_bucket_robust_diagnosis.py`.
+
+**Status: both of Fable's top-2 mitigations (floor-read, robust
+centroids) tested and ruled out, for two DIFFERENT reasons -- floor-read
+because it recreates Version B's flat-mean failure, robust centroids
+because they fix a stage (routing) that was never actually broken. The
+real vulnerability has been re-identified as bucket-INTERNAL
+rank-competition, structurally the same class as exact top-k's decoy
+cliff, not a routing-stage problem at all. This is a correction to send
+back to Fable, not just more data -- it changes what "the mitigation"
+should even target.**
+
+---
+
+## Fable's third refinement, and the decisive dense-attention control it called for
+
+Sent the routing-diagnosis correction back to Fable. Response was
+notably self-critical: named the floor-read design-consistency lapse
+directly (proposed reusing mean-pooling -- the exact mechanism Version
+B's very first failure proved incapable of carrying a specific signal
+-- as a safety net for a signal-carrying failure; "a fallback should
+never be built from a mechanism already falsified for the property
+it's meant to insure").
+
+**Identified the decisive missing experiment, calling it what should
+have been probe 1:** run the identical needle+decoy construction
+through PLAIN DENSE CAUSAL SOFTMAX ATTENTION -- no Monarch, no
+bucketing, the actual ground truth. Reasoning: "3x magnitude and
+correlated direction legitimately outscores the needle" describes a
+property of dot-product softmax scoring itself, not of bucket routing,
+and is the same axis as probe 20 (recall degrading with LOW needle-key
+norm) attacked from the decoy's side instead. This single test would
+reclassify the whole finding: if dense attention also collapses, bucket
+routing is no worse than the ground truth it approximates; if it
+doesn't, small-candidate-pool dynamics specifically amplify domination
+-- a genuinely bucket-routing-specific problem.
+
+**Ran it. Decisive, and it flips the interpretation in bucket routing's
+favor:**
+
+| method | mean cos | fail rate (cos<0.5) | true-miss rate (cos<0.0) |
+|---|---|---|---|
+| dense causal softmax (ground truth) | 0.2181 | **90.00%** | 23.33% |
+| arithmetic-mean bucket routing | 0.3006 | 83.33% | 23.33% |
+| geometric-median bucket routing | 0.3533 | 80.00% | 20.00% |
+
+**Dense attention collapses too -- worse than either bucket-routing
+variant.** Confirms Fable's hypothesis decisively: the cliff is
+inherited from softmax scoring itself, not introduced or amplified by
+bucketing. This specific needle+decoy construction defeats real, exact,
+full-context softmax attention just as effectively as it defeats bucket
+routing -- bucket routing's "narrows exposure" property gave it a real,
+measurable edge here (83.33%/80.00% fail rate vs. dense's 90.00%),
+since it sometimes avoids putting the decoy in the same candidate pool
+as the needle at all, while dense attention always sees everything.
+
+**This was never a MetaMonarchAttention-specific vulnerability.** It's
+a fundamental property of dot-product softmax attention that no
+scope-selection mechanism -- geometric, learned, or otherwise -- can
+escape, and bucket routing is demonstrably no worse than, and modestly
+better than, the ground truth it approximates. Substantially changes
+the verdict on the whole adversarial-routing thread: from "here's a new
+cliff bucket routing introduced" to "here's a known limitation of
+attention itself, which bucket routing partially mitigates rather than
+inherits or worsens." Files: `eval_dense_attention_control.py`.
+
+**Status: sending this back to Fable to close the loop on the
+reliability-principle reframing (structural inclusion vs. outcome
+guarantee) and the "still the right headline design, weaker but more
+honest claim" verdict from the prior refinement.**
+
+---
+
+## Fable's close-out: a real positive claim, not just a null result, plus a targeted follow-up
+
+**True-miss rate (cos<0) is identical between dense and arithmetic-mean
+bucket routing: 23.33% both.** Validates the reframe exactly: once
+genuine contested co-location occurs, bucket routing offers zero extra
+protection over dense attention -- same rank-competition dynamics, same
+worst case.
+
+**But the soft-fail-rate gap (dense 90% vs. bucket routing 83.33-80%)
+is a real, mechanistically-grounded positive claim, not passive
+"narrows exposure."** Fable's framing: restricting candidate scope has
+a nonzero chance of removing a competitor from the contest ENTIRELY --
+something no full-context mechanism can offer by construction, since
+dense attention structurally cannot avoid exposing the needle to the
+decoy (every query sees every key, always), while bucket routing
+sometimes does avoid it as a byproduct of routing. Generalizes beyond
+bucket routing specifically -- same underlying logic as a sliding
+window helping against a decoy outside the window, arguably the same
+logic that motivated the original reliability principle. Scoped
+honestly, not overclaimed: "a genuine, partial, probabilistic
+mitigation against moderate dilution, with no advantage once true
+contested co-location occurs" -- not "solves the decoy problem."
+
+**Adversarial-cliff thread closed. MetaMonarchAttention priority list
+returns to the original sequence, reordered by one new fact:** bucket
+size is now a THREE-way tradeoff (cost, k-means stability from probe
+23, and now adversarial-exposure reduction), not two -- makes the
+occupancy sweep more valuable, since one probe now resolves three
+competing considerations instead of one:
+1. Margin diagnosis at larger n (still open, unaffected by any of this).
+2. Minimum-viable-bucket-occupancy probe, MERGED with a fail-rate-vs-
+   bucket-size sweep on the adversarial construction (was going to be
+   two separate asks, now one sweep resolves both).
+3. Layout/cost implementation, once a real (B_l, k) operating point exists.
+4. Trained-landmark hedge (unchanged, still last).
+
+**On repeating the dense-attention-control pattern elsewhere:** Fable's
+answer is targeted, not blanket. Worth running exactly once more --
+against exact top-k's decoy cliff specifically -- because top-k's
+failure mode (hard exclusion once decoy count exceeds k, deterministic
+cutoff) is mechanistically different from bucket routing's (soft
+dilution within a contested pool), so the outcome isn't predictable
+from this result. If top-k also partially benefits from exposure-
+reduction logic, that would soften the session's harshest verdict on
+it; if its true-miss rate spikes instead of staying flat, that sharpens
+the hard-exclusion-vs-soft-dilution distinction with real data instead
+of a qualitative argument. Explicitly NOT worth re-running for probe 20
+(low-norm cliff) -- that failure is about the needle's own signal
+strength, not competitive exposure, so scope-narrowing has no clear
+mechanism to help or hurt there.
+
+---
+
+## Dense-attention control vs. exact top-k's decoy cliff: the OPPOSITE
+## result from bucket routing, sharpening the distinction with real data
+
+Ran the targeted follow-up on the exact original top-k decoy-pressure
+construction (needle scale=3.0, query at distance 14 blocks, same seeds
+as the original test tonight).
+
+| num_decoys | dense (ground truth) | topk8 | topk16 |
+|---|---|---|---|
+| 0 | 0.8229 | 0.9539 | 0.9421 |
+| 5 | 0.6517 | 0.7085 | 0.7068 |
+| 20 | 0.4479 | **-0.0073** | 0.3134 |
+| 50 | 0.2634 | **-0.1063** | **-0.0996** |
+
+**Opposite pattern from the bucket-routing case.** Dense attention
+degrades gracefully and stays positive throughout the whole decoy
+sweep (0.82 -> 0.65 -> 0.45 -> 0.26). Exact top-k crashes to negative at
+both k values once decoy count exceeds k. This time the approximation
+is genuinely WORSE than the ground truth -- unlike bucket routing,
+where dense attention collapsed just as much or more than the
+approximation did.
+
+**Confirms Fable's predicted distinction with real, evidence-backed
+data rather than a qualitative argument:** bucket routing's soft
+dilution is no worse than (and sometimes better than) dense attention
+under adversarial pressure -- an inherited softmax-attention property,
+partially mitigated by scope-narrowing. Exact top-k's hard-exclusion
+cutoff is a genuine, approximation-SPECIFIC vulnerability that dense
+attention does not share -- not inherited, actually introduced by the
+top-k mechanism itself. Two cliffs that both "involve a decoy" turn out
+to be fundamentally different in kind, now with a controlled comparison
+establishing which is which rather than resting on the earlier
+qualitative "rank-based methods can lose the correct answer entirely"
+framing alone. This also retroactively strengthens the original
+derived reliability principle from earlier tonight (fixed-scope methods
+degrade gracefully, rank-based/contested-scope methods can fail
+outright) -- it's not just a pattern observed once for top-k, it's now
+shown to be the actual DIFFERENCE between top-k and everything else
+that's been tested against dense attention as a control. Files:
+`eval_dense_vs_topk_decoy.py`.
+
+**Status: dense-attention-control thread closed, per Fable's own scope
+recommendation (worth running for bucket routing and top-k specifically,
+not blanket-repeated elsewhere). MetaMonarchAttention priority list
+returns to: margin diagnosis at larger n, merged occupancy/exposure
+sweep, layout/cost implementation, trained-landmark hedge.**
