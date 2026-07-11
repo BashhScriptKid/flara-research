@@ -1716,3 +1716,2086 @@ recommendation (worth running for bucket routing and top-k specifically,
 not blanket-repeated elsewhere). MetaMonarchAttention priority list
 returns to: margin diagnosis at larger n, merged occupancy/exposure
 sweep, layout/cost implementation, trained-landmark hedge.**
+
+---
+
+## Margin diagnosis at larger n (item 1 of the returned priority queue)
+
+Re-ran the natural (non-adversarial) mis-routing margin analysis at
+n=1000 instead of the original n=100 (which had only 4 wrong routes --
+too few to trust). Got 36 wrong routes this time, a real sample.
+
+| | correct routes (n=964) | wrong routes (n=36) |
+|---|---|---|
+| top1-top2 centroid margin | mean 0.527, median 0.504 | mean 0.089, median 0.068 |
+| needle-to-own-centroid distance | mean 1.534, median 1.550 | mean 1.814, median 1.800 |
+
+**Routing accuracy: 96.40% (3.60% mis-routing)** -- lands in the middle
+of the earlier 2-8% estimate range, now pinned more precisely.
+
+**Margin ratio 5.96x (down from the original 11x estimate at n=100, but
+still clearly the dominant signal).** Confirms margin-tightness as the
+primary driver of natural failures, as the smaller sample suggested,
+just with a less inflated ratio now that n is real.
+
+**Distance ratio 1.18x -- identical to the n=100 estimate, but the
+larger sample reveals something the mean-only comparison couldn't
+show: the distributions barely overlap.** Wrong routes' distances
+cluster tightly in a right-shifted range (1.60-2.12, std 0.125), while
+correct routes span a much wider range (0.92-2.07, std 0.188) that dips
+well below where any wrong route lands. So the outlier-distance effect
+isn't just "mean 18% higher" noise that would wash out with more data
+-- it's a real, distributionally-separated secondary contributor.
+Refined verdict: BOTH mechanisms (margin-tightness, outlier-distance)
+are genuine and robust at scale; margin-tightness dominates in
+magnitude, distance-elevation is a real secondary signal, not noise.
+Files: `eval_bucket_margin_diagnosis_large.py`.
+
+**Status: item 1 done. Moving to item 2 (merged minimum-viable-bucket-
+occupancy + adversarial-exposure-vs-bucket-size sweep).**
+
+---
+
+## Item 2: merged occupancy/exposure sweep -- contradicts Fable's
+## exposure-reduction prediction, non-monotonic with a real mechanism
+
+Swept n_buckets = 4/8/16/32/64/128 at BLOCK_SPAN=256 (the scale where
+probe 23 found nb=64 unstable vs nb=16), tracking bucket-occupancy
+stats, natural single-needle recall, and the same adversarial mass-
+heavy-decoy fail rate together in one sweep.
+
+| n_buckets | avg occupancy | natural recall | adversarial fail rate |
+|---|---|---|---|
+| 4 | 64.0 | 0.8612 | 75.00% |
+| 8 | 32.0 | 0.8088 | 45.00% (best) |
+| 16 | 16.0 | 0.9005 | 80.00% |
+| 32 | 8.0 | 0.8056 | 75.00% |
+| 64 | 4.0 | 0.8822 | 80.00% |
+| 128 | 2.0 | 0.9881 | 90.00% (worst -- worse than nb=4)|
+
+**Adversarial fail rate is NON-MONOTONIC in bucket size, with a minimum
+around n_buckets=8 and the WORST result at the finest granularity
+tested (n_buckets=128).** This contradicts Fable's exposure-reduction
+prediction that smaller buckets should monotonically reduce adversarial
+exposure -- the opposite happens at the fine end.
+
+**Plausible mechanism, two competing effects:** reduced co-location
+PROBABILITY favors smaller buckets (fewer other members means less
+chance the decoy happens to land with the needle), but reduced within-
+bucket DILUTION once co-located favors larger buckets (at nb=128,
+avg occupancy ~2, once needle+decoy do share a bucket there's almost no
+other background content to dilute the decoy's built-in 3x magnitude
+advantage -- closer to a raw 1-on-1 competition the decoy wins even
+more cleanly than in a larger, more diluted bucket). These trade off
+with a real sweet spot, not a monotonic relationship.
+
+**Probe 23's stability wrinkle (nb=64 notably worse than nb=16) did not
+clearly reproduce here** -- natural recall stayed in a similar 0.81-0.99
+range across all bucket sizes tested, though this run used fewer trials
+(10) than probe 23's original test. Inconclusive rather than
+contradicted; the occupancy-instability question and the adversarial-
+exposure question turned out to be less coupled than expected -- worth
+tracking as two separate open questions rather than one.
+
+**Status: real correction to send back to Fable -- challenges the core
+mechanism behind the "narrow bucket size for exposure reduction"
+recommendation from the prior refinement.** Files:
+`eval_bucket_occupancy_exposure_sweep.py`.
+
+---
+
+## Fable's response, and the larger split sweeps it recommended
+
+Fable's refinement: the co-location-probability half of the two-effects
+hypothesis holds, but the dilution half needed sharpening into a
+softmax entropy/normalization effect (low-scoring background
+contributes negligibly to the softmax denominator regardless of count,
+so "more background helps" isn't quite the right frame) -- proposed
+testing with orthogonalized background keys to isolate this. Flagged a
+real confound: n_buckets=128 (avg occupancy ~2) is exactly probe 23's
+original instability regime, so results there could be routing noise,
+not pure post-routing competition. Statistical caution: n=10 fail-rate
+estimates (45/75/80/90%) have binomial confidence intervals too wide to
+trust the "sweet spot" shape -- flagged as the same small-sample
+curve-shape risk that already bit probe 23 once. Most importantly:
+even at its best point, fail rate was 45% -- catastrophic regardless of
+exact curve shape, reinforcing "treat as bounded accepted risk, choose
+bucket size on cost/stability grounds, report adversarial number as a
+footnote" rather than tuning architecture to chase this curve.
+Recommended splitting into two separate, larger sweeps rather than one
+merged low-n one.
+
+**Stability-only sweep, n=50 (`eval_bucket_stability_large.py`):**
+natural recall stays FLAT across all bucket sizes (mean 0.87-0.93, no
+degradation trend) -- CONTRADICTS probe 23's original "nb=64 unstable"
+finding at real sample size, confirming Fable's suspicion the original
+read was itself noise. But a more precise, different pattern emerged:
+worst-case outcomes get notably worse at smaller bucket sizes even
+though the MEAN doesn't move (min -0.52 at nb=8, -0.44 at nb=128) --
+not "smaller buckets have worse average quality," but "smaller buckets
+have more occasional bad outliers." A real finding, just not the one
+probe 23 originally suggested.
+
+**Adversarial exposure sweep, n=25, two background variants
+(`eval_bucket_exposure_large.py`):**
+
+| n_buckets | normal background fail rate | orthogonalized background fail rate |
+|---|---|---|
+| 4 | 80.00% | 96.00% |
+| 8 | 44.00% | 96.00% |
+| 16 | 76.00% | 96.00% |
+| 32 | 76.00% | 88.00% |
+| 64 | 72.00% | 96.00% |
+| 128 | 84.00% | 68.00% |
+
+Normal-background curve reproduces the earlier sweet spot reasonably
+well (44% at nb=8, close to the earlier 45%). Orthogonalized-background
+does NOT show the predicted monotonic decrease -- it's mostly WORSE
+(96% at most bucket sizes) than normal background, with only one drop
+(68% at nb=128).
+
+**Diagnosed as a likely confound in the test construction, not a clean
+refutation of Fable's hypothesis:** orthogonalizing background keys
+against the query direction makes their dot-product score exactly
+zero -- but `exp(0)=1` is not negligible softmax weight. Ordinary
+random background keys often have NEGATIVE dot products with the
+query, and `exp(negative)` genuinely is near-zero -- so normal
+background may actually contribute LESS aggregate competing mass than
+a bucket full of exactly-zero-scored orthogonalized keys, the opposite
+of what the manipulation intended to isolate. "Score near zero" and
+"softmax weight near zero" are not the same thing once sign isn't also
+controlled. A cleaner isolation would need background keys with
+STRONGLY NEGATIVE dot product against the query, not merely orthogonal
+ones.
+
+**Status: this specific sub-thread (precise exposure-curve mechanism)
+closed as inconclusive rather than resolved, per explicit user
+direction ("okay, so be it") after the confound was identified --
+not pursued further with a corrected re-test.** What's actually settled
+and usable: (1) probe 23's original stability-mean claim doesn't
+reproduce at n=50 (real finding), (2) worst-case variance does increase
+at small occupancy (real, different finding), (3) Fable's standing
+recommendation from before this sub-thread started still holds
+regardless of the exact curve mechanism -- treat the adversarial cliff
+as a bounded, accepted risk, pick bucket size on cost/stability/natural-
+recall grounds, report the adversarial number as a footnote rather than
+a design driver. Returning to the main priority queue: item 3 (layout/
+cost implementation) is next.
+
+## Fable's close-out on the split sweeps
+
+Sent the sweep results (including the honest confound writeup) back to
+Fable rather than skipping that step -- caught mid-thread when asked
+directly whether I had.
+
+**Adversarial thread: no change, reinforced, not reopened.** Every
+bucket size in the n=25 run is catastrophic (44-84%), so the exact
+non-monotonicity mechanism doesn't matter for any design decision. The
+nb=8 dip replicated at both n=10 and n=25 (45% -> 44%) -- probably real
+and mild, usable as a last-resort tiebreaker if cost/stability leave
+options tied, but should never outrank them.
+
+**Stability thread: genuinely updated, in a useful and actionable
+direction.** Confirms probe 23's mean-based read was noise, but
+reframes the real finding as a methodology fix: bucket size should be
+selected on TAIL-RISK/WORST-CASE recall, not mean recall -- mean is
+flat and uninformative across the whole range (0.87-0.93), but the
+min/std pattern found in the n=50 stability sweep is a real,
+discriminating signal a mean-only criterion would have missed entirely.
+
+**Confound-test rerun: deprioritized, not blocked on.** The "even at
+best it's catastrophic" argument makes the exact entropy mechanism
+moot for design purposes. Parked as an optional footnote-level
+experiment if there's appetite for the mechanistic story itself later,
+not a gate before further work.
+
+**Durable methodology lesson, independent of this specific test:**
+"near-zero score" and "near-zero softmax weight" are NOT
+interchangeable -- exp(0)=1 is not negligible, only genuinely negative
+logits contribute near-zero weight via exp(). Any future synthetic
+probe claiming to isolate "negligible background contribution" needs
+to control the SIGN of the dot product, not just its magnitude. Worth
+carrying forward to any future probe construction in this arc.
+
+**Status: both sub-threads closed. Proceeding to item 3 (layout/cost
+implementation) with a refined three-part bucket-size selection
+criterion going forward -- cost, tail-risk stability (not mean), and
+the adversarial rate as a reported footnote -- replacing the
+mean-recall-only criterion implicitly assumed earlier in this arc.**
+
+---
+
+## External research artifact: Louver (threshold-based selection) and
+## Multipole Attention, synthesized against the whole session
+
+A user-provided research document surfaced several external findings
+directly relevant to this arc, most notably **Louver / "Sparse
+Attention as a Range Searching Problem"** (arXiv 2605.06763, preprint,
+single-workstation benchmarks, not clearly peer-reviewed): reframes
+sparse attention as halfspace range searching -- given threshold tau,
+return exactly {k : <q,k> >= tau}, a fixed geometric predicate with a
+proven zero-false-negative guarantee (relative to tau), via bounding
+balls over fixed-size key groups pruned only when provably below tau.
+Reports real CPU C++/AVX/FP16 kernels, "faster than highly optimized
+dense attentions such as FlashAttention" on an AMD Threadripper.
+Also **Multipole Attention** (Hooper et al., NeurIPS 2025): exact
+attention for near/important keys + CENTROID-approximated (never
+dropped) attention for far keys, progressively coarser with distance --
+close to this session's Fenwick design but never routes-and-discards.
+Also independent literature corroboration of THREE of this session's
+own negative results: MQAR/Jelassi formally prove the mean-pooling
+capacity ceiling; Landmark Attention's own literature found untrained
+landmarks underperform, matching all-five-heuristics-failed; MoBA
+derives a closed-form SNR (~sqrt(d/B)) for exactly the router this
+session built via k-means bucket routing.
+
+**Ran a fresh (new-transcript) Fable consultation to synthesize this
+against everything found tonight**, specifically asking for the same
+skepticism that caught the floor-read and robust-centroid failures
+earlier rather than accepting the artifact's framing at face value.
+
+**Verdict: Louver genuinely fixes one failure family, provably
+relocates a second, and cannot touch a third.**
+
+- **Genuinely fixes:** the EXCLUSION failure -- top-k's decoy cliff and
+  bucket routing's 3.60% natural mis-routing floor. Under a threshold
+  predicate, the needle's inclusion depends only on its own score
+  against a fixed bar; a decoy can't evict it, since there's no budget
+  being competed for. Matches the STRUCTURAL half of the refined
+  reliability principle exactly.
+- **Relocates, not resolves:** tau-estimation. Budget-driven tau is
+  top-k in disguise (vacuous guarantee); absolute tau makes the
+  guarantee real but makes survivor count adversary-controlled --
+  degrading toward dense O(N^2) under pressure. Fable's framing:
+  "Louver converts a correctness cliff into a cost cliff, plus a
+  residual soft correctness dependence on tau-estimation. That is
+  progress, not a solution."
+- **Cannot touch, using data already in hand:** the adversarial
+  construction. Dense attention is effectively tau=-infinity (zero
+  false negatives, everything computed) and it STILL failed at 90%,
+  worse than bucket routing (already established in this session). The
+  decoy legitimately exceeds any sane tau, enters the survivor set, and
+  outscores the needle inside the exact softmax -- a SCORING-stage
+  failure no SELECTION-stage guarantee can reach. Sharpened principle:
+  "Louver addresses the structural half; nothing selection-side
+  addresses the outcome half."
+
+**Produced a clean, falsifiable, cheap-to-run prediction using the
+existing harness, no new kernels needed:** threshold selection with
+ORACLE tau should drive the 3.60% natural mis-routing floor to ~0, and
+should NOT materially improve the 83% adversarial number. If either
+half fails, the mental model is wrong -- explicitly the most valuable
+possible outcome either way.
+
+**Revised queue:** don't replace the sparse-gather cost work (item 2),
+generalize it -- the gather machinery (take indices, exact-attend over
+them) is identical for both bucket routing and threshold selection, so
+building it selection-agnostic serves both without duplicating work.
+Sequence: (1) the oracle-tau vs reservoir-tau correctness experiment,
+cheap, no kernels -- up next; (2) the now-broadened cost
+implementation; (3) full Fenwick integration only if (1) is positive;
+(4) trained-landmark hedge stays parked but with improved priors from
+the Landmark Attention literature match.
+
+**Other findings:** MoBA's SNR formula adopted as a closed-form
+explanation of the measured 3.6% floor, with a real tension flagged for
+later reconciliation -- SNR says smaller blocks help, but this
+session's own sweep found tail-risk WORSE at small occupancy, so
+something outside the SNR model (centroid variance, boundary effects)
+is driving that. Titans/Gated DeltaNet parked (different paradigm,
+requires training, abandons zero-shot). NoMAD-Attention judged relevant
+to the SEPARATE Jumping Seedling CPU-kernel track, not this attention-
+mechanism thread.
+
+**Status: proceeding to the oracle-tau vs reservoir-tau correctness
+experiment next.**
+
+---
+
+## Oracle-tau vs reservoir-tau experiment: both halves of Fable's
+## prediction confirmed cleanly
+
+Implemented threshold-based (Louver-style) selection in isolation
+(exact scores over the whole stressed block, no bucketing, no new
+kernels) and ran it on the exact same natural and adversarial harnesses
+used throughout this arc.
+
+**Part 1, natural mis-routing floor, n=200:**
+
+| tau_mode | mean cos | fail rate | avg survivors |
+|---|---|---|---|
+| oracle | 0.9991 | 0.00% | 1.0/128 |
+| reservoir | 0.9620 | 0.00% | 13.0/128 |
+
+Both drive the natural 3.60% mis-routing floor to exactly 0% -- even
+the realistic, needle-blind reservoir estimator (top-10% quantile of
+the block's own scores) works essentially perfectly here.
+
+**Part 2, adversarial construction, n=30:**
+
+| tau_mode | mean cos | fail rate |
+|---|---|---|
+| oracle | 0.2162 | 90.00% |
+| reservoir | 0.2154 | 90.00% |
+
+Identical to each other, and identical to the DENSE-ATTENTION baseline's
+own 90.00% fail rate found earlier in this arc -- actually worse than
+bucket routing's 83.33%. Makes sense in hindsight: oracle tau set just
+below the needle's own (unremarkable) score includes essentially
+everything scoring at or above it, including the decoy -- converging
+toward dense attention's own behavior in this regime. Threshold
+selection buys nothing here because the adversarial failure was never
+an exclusion problem.
+
+**Both halves of Fable's falsifiable prediction confirmed exactly, not
+overturned.** Threshold selection is a real, clean fix for the
+EXCLUSION failure family (top-k's decoy cliff, bucket routing's natural
+floor) and genuinely useless against the INHERITED scoring-stage
+vulnerability (the adversarial construction) -- validates the
+sharpened reliability principle ("structural inclusion guarantee !=
+outcome quality guarantee") with a precise, falsifiable test rather
+than accepting the artifact's framing at face value. Files:
+`eval_threshold_selection.py`.
+
+**Status: mental model validated. Sending back to Fable to close the
+loop, then proceeding to the broadened (selection-agnostic) sparse-
+gather cost implementation.**
+
+---
+
+## Fable's close-out, plus the tau-inflation follow-up: resolved in
+## the reservoir estimator's favor
+
+Fable's response to the oracle/reservoir results: the exact 90%/90%
+symmetry on the adversarial case is itself informative -- it means
+tau-estimation quality was never the bottleneck there, since the single
+strong decoy clears tau under both estimators equally, so the failure
+happens downstream in scoring, not admission. Flagged one real gap:
+that construction never exercised tau-estimation's precision on the
+EXCLUSION side. Proposed the specific test: inject k MODERATE
+(individually-unremarkable) decoys, sweep k and strength, oracle tau
+held fixed at the true no-decoy quantile as a control, reservoir tau
+re-estimated from the corrupted sample -- the "many weak attackers
+shift the population" attack shape, different from "one strong decoy."
+Also sharpened the integration recommendation: threshold selection
+should be the DEFAULT front-end now (strictly dominates bucket routing
+on every natural-case number, no natural-case regime where bucket
+routing wins), bucket routing kept only as fallback pending this test;
+cost/cache-blocking plans should be built around the RESERVOIR
+estimator's survivor count (~13/128), not oracle's (1/128, a
+correctness ceiling not a deployable estimator).
+
+**Ran the tau-inflation test (`eval_tau_inflation.py`): resolved
+cleanly in the reservoir estimator's favor, with an unexpectedly
+positive mechanism, not just "no problem found."**
+
+Needle exclusion rate: **0.0% across every configuration tested** --
+both oracle and reservoir tau, decoy count 0-40, decoy strength
+0.8x-1.5x the needle's own norm. The needle is never pushed below
+threshold by many moderate decoys. What happens instead is graceful
+dilution (mean cos 0.957 -> 0.51 at the harshest setting, 40 decoys at
+1.5x strength) -- a weight-competition effect, not exclusion.
+
+**Reservoir tau consistently OUTPERFORMED oracle tau, not just matched
+it** (e.g. 0.5643 vs 0.5084 mean cos at the harshest setting).
+Mechanism: as decoys accumulate, reservoir tau (estimated from the
+corrupted sample) rises ABOVE the fixed oracle baseline, becoming more
+selective. Since these decoys are individually weaker than the
+needle's own score, the rising threshold filters out more of the WEAK
+competing decoys while the needle keeps clearing it easily -- reducing
+dilution rather than risking exclusion. The adaptive estimator is
+mildly SELF-CORRECTING in this regime, not fragile.
+
+**Conclusion: the relocated-attack-surface concern doesn't materialize
+as feared.** Tau-inflation from many moderate decoys doesn't drag the
+needle below threshold -- it only becomes a real problem once a SINGLE
+decoy is individually stronger than the needle itself, which is exactly
+the original single-strong-decoy construction already classified as an
+inherited, unfixable-at-selection-layer scoring vulnerability (matches
+dense attention's own 90% failure rate). No new crack found; an
+additional piece of clean good news for threshold selection. Files:
+`eval_tau_inflation.py`.
+
+**Status: threshold selection (Louver-style) now the validated default
+front-end for MetaMonarchAttention's read step -- exclusion failures
+resolved (0% floor, both natural mis-routing and moderate-decoy
+inflation), scoring-stage vulnerability correctly identified as
+inherited and out of scope for any selection-layer fix. Proceeding to
+the broadened, selection-agnostic sparse-gather cost implementation
+next, built around the reservoir estimator's real survivor-count
+operating point (~13/128, ~10%).**
+
+---
+
+## Real sparse-gather cost implementation: honest result, same lesson
+## FlashMonarchAttention taught earlier
+
+Built two implementations of the identical threshold-selection math:
+`full_mask` (dense (B,Bl) scores, mask non-survivors to -inf, single
+dense matmul against the full v_block -- what every reference
+implementation in this session has actually done) and `sparse_gather`
+(real gather via `torch.nonzero` + `scatter_reduce` + `index_add`,
+touching ONLY survivor (query,key) pairs in the value-aggregation step,
+never the full block). Correctness verified first (max abs diff
+1.49e-07 between the two -- same computation, different execution path).
+
+**Wall-clock: sparse_gather is SLOWER than full_mask at every block
+size tested (0.40x-0.79x, i.e. sparse takes 1.3-2.5x longer), despite
+touching only ~10% of the entries:**
+
+| Bl | full_mask | sparse_gather | speedup | avg survivors |
+|---|---|---|---|---|
+| 128 | 0.107ms | 0.136ms | 0.79x | 12.8 |
+| 512 | 0.137ms | 0.197ms | 0.70x | 51.2 |
+| 2048 | 0.387ms | 0.959ms | 0.40x | 204.8 |
+| 8192 | 2.108ms | 3.366ms | 0.63x | 819.2 |
+| 32768 | 6.985ms | 12.477ms | 0.56x | 3276.8 |
+
+**Same lesson as FlashMonarchAttention's naive first benchmark:**
+`torch.nonzero`/`scatter_reduce`/`index_add` each carry real per-op
+dispatch overhead and irregular memory access; `full_mask`'s value
+aggregation is a single, highly-optimized dense matmul. Doing
+genuinely less arithmetic doesn't win if it costs more, smaller,
+irregular ops in a high-level runtime.
+
+**Important caveat, not a final verdict, stated precisely:** this is
+PyTorch reference code specifically. The earlier FlashMonarchAttention
+investigation found that PyTorch op-dispatch overhead can make a
+genuinely-less-work approach look worse than compiled code would show.
+This result says "the naive PyTorch sparse-gather path isn't a free
+win" -- it does NOT say "sparse gather can't work on the actual
+Rust/AVX2 target." Those are different claims; only the first has
+evidence here. Files: `eval_threshold_sparse_gather.py`.
+
+**Status: complicates the "threshold selection as default" recommendation
+on the COST axis specifically -- the QUALITY case (0% exclusion floor
+vs bucket routing's 3.6%, robust to moderate-decoy inflation) remains
+completely intact and unaffected by this result. Sending back to Fable
+for reaction before deciding how to proceed.**
+
+---
+
+## Fable's response, plus the padded-dense follow-up: decisive, PyTorch
+## reference timing hits a genuine wall here
+
+**Fable's reaction, precise:** the recommendation splits into two
+independently-decided halves. The QUALITY case (0% exclusion floor,
+now doubly load-bearing after the clean tau-inflation result) is a
+property of the selection predicate -- confirmed, unaffected. The COST
+case is a property of THIS specific PyTorch realization -- not yet
+informative either way, same posture the FlashMonarchAttention
+investigation eventually settled into (don't retract a correctness win
+over a dispatch-overhead artifact, don't claim an unearned cost win
+either). Proposed one more cheap, diagnostic test before escalating to
+a real kernel: pad to a fixed max-survivor-count and do a single dense-
+but-smaller matmul (torch.topk + fixed-shape gather, no scatter_reduce/
+index_add) -- if THAT also loses, that's a stronger, more decisive
+result than the first.
+
+**Ran it. Decisive, and it's the stronger result Fable predicted.**
+Padded-dense (`padded_dense_attention`, pad_width ~1.5-2x average
+survivors) verified correct first (max diff 1.19e-07 vs full_mask),
+then benchmarked:
+
+| Bl | pad_width | full_mask | sparse_gather | padded_dense | pd speedup |
+|---|---|---|---|---|---|
+| 128 | 24 | 0.092ms | 0.140ms | 0.138ms | 0.67x |
+| 512 | 96 | 0.133ms | 0.198ms | 0.288ms | 0.46x |
+| 2048 | 384 | 0.331ms | 0.390ms | 0.874ms | 0.38x |
+| 8192 | 1536 | 1.318ms | 1.872ms | 2.976ms | 0.44x |
+| 32768 | 6144 | 4.876ms | 11.361ms | **18.197ms** | **0.27x** |
+
+**Padded-dense also loses, and by MORE at scale -- actually worse than
+sparse_gather at the largest size tested** (18.2ms vs 11.4ms at
+Bl=32768). `torch.topk` itself carries real overhead (partial sorting,
+not free), making the "smarter," dispatch-minimized approach the WORST
+of all three at large Bl. Two genuinely different sparse strategies
+(ragged scatter-based, fixed-shape topk-based) both lose to naive dense
+masking, at every scale tested. Exactly Fable's predicted stronger
+conclusion: PyTorch's fixed per-op dispatch costs dominate here
+regardless of gather strategy -- real evidence (not just diagnosed
+cause) that no further PyTorch-level rewrite will reveal sparse
+gather's real advantage. A compiled kernel is the honest next step to
+evaluate this cost question at all, matching the pattern already
+established for FlashMonarchAttention's own eventual CPU/GPU
+resolution. Files: `eval_threshold_sparse_gather.py` (updated).
+
+**Standing methodology note, written down per Fable's suggestion so
+this doesn't get re-litigated a third time:** PyTorch-level timing in
+this arc has now produced one false negative (Flash fusion, reversed
+once shape/dispatch was isolated) and one confirmed-genuine wall
+(sparse gather, two independent strategies both lose, real signal not
+just an artifact). Reference-implementation wall-clock numbers in this
+codebase should be treated as CORRECTNESS SCAFFOLDING ONLY -- never a
+cost verdict about the Rust/AVX2 target -- until the actual kernel is
+written. Any cost claim made from PyTorch timing alone should be
+labeled provisional in the same entry that makes it, not corrected
+retroactively.
+
+**Status: MetaMonarchAttention's design is now settled on quality
+grounds (threshold selection, Louver-style, is the validated default
+read mechanism, exclusion failures resolved, scoring-stage
+vulnerability correctly scoped as inherited and out of the selection
+layer's reach) and explicitly UNSETTLED on cost grounds pending a real
+Rust/AVX2 kernel -- not a gap to keep chasing in PyTorch further, a
+genuine boundary of what this reference-code investigation can honestly
+answer.**
+
+---
+
+## Fable's overall-next-move check-in, and the first full integration
+## test -- T-iteration structurally superseded, plus a real new trade-off
+
+Asked Fable for the overall next step given both halves of threshold
+selection (quality settled, cost unsettled pending a real kernel).
+Identified three items still doable in Python (none requiring the Rust
+kernel): (1) a full end-to-end integration test -- every prior
+threshold-selection result was measured on an isolated single block,
+never the assembled system (Fenwick tiers + threshold-selection read +
+Multipole-style residual centroid + window + whatever's left of T),
+flagged as the last real correctness gap; (2) an analytical (not
+wall-clock) roofline cost model for the 5500U, using numbers already in
+hand; (3) a quick re-check of whether the MoBA-SNR-vs-tail-risk tension
+resurfaces at the threshold-selection ball-tree's leaf-size parameter.
+Trained-landmark hedge and the remaining 38-probe-list items stay
+parked. Recommended sequence: (1) then (3) then (2), full handoff to
+kernel-writing after.
+
+**Built and ran item 1 (`ma_meta_threshold.py`,
+`eval_meta_threshold_integration.py`): Fenwick dyadic tier selection +
+threshold-selection read (real exact attention over survivors) +
+Multipole-style residual-centroid for non-survivors + the exact local
+window -- with NO Monarch/Sinkhorn T-iteration refinement anywhere.**
+
+**Deliberate architectural claim tested directly, not assumed:**
+Monarch's T-iteration machinery exists to build a good APPROXIMATE
+representative cheaply, avoiding an O(B_l) real read. Threshold
+selection already reads REAL keys directly for the survivor set -- so
+once every tier is read this way, there is no more Monarch
+representative left to refine. This is a stronger claim than "reduces
+dependence on T" -- it says T becomes structurally UNUSED, not just
+less important. Causal validity held (0 leakage, row sums 1.0).
+
+**Distance axis: confirmed decisively, in the strongest possible
+form.** Threshold-selection-without-T matches ground truth EXACTLY at
+every distance tested, including the hardest (1.0000 at dist=14) --
+where SlidingMonarch needed T=8 just to reach 0.9387 without ever
+quite hitting perfect, and was near-useless at T=1 (0.0984-0.2295).
+Zero Monarch refinement iterations, better result than eight.
+
+**Decoy axis: a genuine, non-obvious trade-off, not another clean win.**
+Threshold selection starts far stronger (0.9580 vs 0.2868 at 0 decoys)
+but degrades faster under decoy pressure and goes NEGATIVE at 50
+decoys (-0.1312), while SlidingMonarch's much-weaker-baseline
+T-refined representative stays weakly positive throughout (0.1444 at
+50 decoys). Plausible mechanism: many decoys individually strong enough
+to also clear tau become real competing survivor candidates in the
+same joint softmax (threshold selection guarantees inclusion, not
+favorable competition once included -- the already-established
+limitation). Monarch's compression, while much weaker at capturing a
+genuine distant signal, may incidentally average away some decoy-
+specific signal too, giving accidental damping against high decoy
+counts that real-key reads don't get for free. Not predicted going in;
+a real result from actually building and running the assembled system,
+exactly the kind of interaction effect component-level tests couldn't
+have shown. Files: `ma_meta_threshold.py`,
+`eval_meta_threshold_integration.py`.
+
+**Status: sending this to Fable -- it both confirms the strongest form
+of the T-supersession hypothesis and surfaces a genuine new open
+question (does the design need BOTH mechanisms, threshold selection for
+distance and something Monarch-like for decoy-damping, rather than one
+replacing the other outright?) before calling MetaMonarchAttention's
+integration complete.**
+
+---
+
+## Fable's response, plus the tier-concentration diagnosis: a genuinely
+## new, structural failure mode confirmed, not a re-derivation
+
+**Fable's reframing of the damping hypothesis:** correct in substance,
+relocated in mechanism. Not "incidental averaging helps" -- the SAME
+capacity ceiling from the very first Version B finding, now showing
+its other side. A fixed-size compressed representation can't capture a
+real signal well (the disqualifying half, already established), but
+that same boundedness caps how much adversarial mass can ever enter the
+final read, no matter how many decoys exist upstream. Threshold
+selection has no such cap by design -- exactly what makes it win on
+distance (every real signal gets an uncompressed read) and lose on
+decoy count (every survivor, real or decoy, adds full uncapped weight
+to the same joint softmax). The 0-decoy and 50-decoy numbers are "the
+same lever, cutting both ways," not two separate phenomena.
+
+**Corrected the T-supersession claim rather than retracting it:** what's
+unused is ITERATIVE REFINEMENT for the distance problem specifically --
+holds cleanly, confirmed by the distance table. What's still needed is
+something with Monarch's BOUNDEDNESS property as a counterweight to
+threshold selection's unboundedness -- a property of fixed-capacity
+compression in general, not Sinkhorn iteration specifically.
+
+**Flagged one diagnostic before trusting the framing fully:** are the
+50 decoys concentrated in the needle's own tier (re-derivation of the
+already-known same-bucket finding) or spread across many tiers (a
+genuinely new failure mode -- each tier independently applies its own
+tau test with no knowledge that a sibling tier already admitted several
+decoys, so survivor count accumulates ADDITIVELY across the whole tree)?
+
+**Ran it (`eval_tier_concentration_diagnosis.py`): confirms the new,
+more concerning failure mode, not a re-derivation.**
+
+```
+tier l=0 (Bl=16):  2 survivors, 2 decoys
+tier l=1 (Bl=32):  4 survivors, 4 decoys
+tier l=2 (Bl=64):  7 survivors, 7 decoys
+tier l=3 (Bl=128): 13 survivors, 13 decoys  <- contains needle
+```
+
+**Concentration: exactly 50%.** The needle's own tier has 13 decoy
+survivors, but ANOTHER 13 are spread across the three sibling tiers
+that have nothing to do with the needle at all -- each tier
+independently admits ~10% of its own block as survivors, unaware three
+other tiers are doing the same into the SAME final softmax. This
+confirms the structurally new failure: total competing candidate pool
+scales with the NUMBER OF ACTIVE TIERS (L), not just with decoy density
+wherever the needle happens to sit. A decoy in a tier that doesn't even
+contain the needle still contributes real competing mass to the same
+softmax the needle's output comes from -- dilution without co-location.
+For longer sequences with deeper Fenwick hierarchies this would amplify
+further, independent of where the needle actually is. This would not
+show up in ANY single-tier test -- exactly why the integration test
+mattered; the reliability principle's structural-inclusion guarantee
+holds per-tier but the aggregate competitive pressure across tiers
+compounds in a way isolated component tests couldn't reveal. Files:
+`eval_tier_concentration_diagnosis.py`.
+
+**Status: sending this confirmed-new-failure-mode result to Fable before
+deciding whether to build the proposed hybrid (capacity-bounded
+aggregation over the query-aware survivor set, post-selection) --
+the diagnostic outcome changes how urgently that mitigation is needed,
+not just whether it's worth trying.**
+
+---
+
+## Fable's response: reframes the mitigation design, but flags the
+## real gating question first -- and it resolves in the reassuring
+## direction
+
+**Fable's read on the confirmed cross-tier finding:** raises the
+stakes, since it's a property of hierarchy DEPTH (L, active tier count)
+rather than decoy placement -- meaning it scales with exactly the axis
+MetaMonarchAttention exists to handle (longer context -> deeper
+hierarchy -> more tiers -> more independent tau-admissions feeding one
+softmax).
+
+**On mitigation design (global vs per-tier cap):** global, in
+principle -- a per-tier cap of size C still permits a total pool of
+L*C, exactly what was measured (four tiers, each independently
+admitting ~10%, summing to 50%). But flagged a real trap: if "global
+cap" means rank-and-truncate the union of all tiers' survivors, that's
+top-k with extra steps -- the SAME exclusion cliff this session already
+ruled out twice, now relocated to the top of the hierarchy. The
+non-regressive version: extend the post-selection, query-aware
+compression hybrid to operate over the UNION of survivors across all
+active tiers, not each tier separately -- keeps the structural
+inclusion guarantee at the tier level while capping total mass
+globally, the way Monarch's boundedness did before, but now
+post-selection instead of pre-selection (the piece that was missing
+when blind pre-selection compression failed identically five times
+earlier this session).
+
+**On a simpler fix:** a cheaper variant worth trying before full
+aggregation -- one SHARED reservoir-tau estimate across the pooled
+score distribution of all active tiers, instead of each tier
+independently computing its own local 90th percentile blind to its
+siblings. Still an absolute threshold (not rank-truncation, so it
+doesn't reintroduce the exclusion cliff), directly targets the
+"zero awareness of siblings" gap, much cheaper than the aggregation
+hybrid.
+
+**But identified the actually-most-urgent question, ahead of building
+either fix:** does cross-tier accumulation also degrade the NATURAL
+(zero-decoy) case as tier count grows with sequence length? If yes,
+this stops being a bounded/accepted adversarial risk and becomes a
+core-value-proposition problem -- the architecture's own long-context
+scaling axis would ALSO be its core vulnerability, since tau is
+quantile-based (relative, not absolute) and every tier structurally
+admits ~10% of its own block regardless of relevance, even with zero
+adversary.
+
+**Ran it (`eval_natural_tier_scaling.py`): resolved decisively in the
+reassuring direction.** Swept N=256 through N=8192 (active tier count
+4 through 9), needle strength and position fixed, ZERO decoys:
+
+| N | active tiers | mean cos | min cos |
+|---|---|---|---|
+| 256 | 4 | 1.0000 | 1.0000 |
+| 512 | 5 | 1.0000 | 1.0000 |
+| 1024 | 6 | 1.0000 | 1.0000 |
+| 2048 | 7 | 1.0000 | 1.0000 |
+| 4096 | 8 | 1.0000 | 1.0000 |
+| 8192 | 9 | 1.0000 | 1.0000 |
+
+**Zero degradation at any tier count tested, min identical to mean at
+every configuration.** Background survivors admitted by other tiers
+are still ordinary random content, not adversarially engineered -- so
+even as more of them accumulate with growing tier count, their
+aggregate weight relative to a strongly-aligned needle score stays
+negligible. Confirms the failure is ADVERSARIAL-PRESSURE-SPECIFIC, not
+a core-scaling-axis vulnerability -- exactly the outcome Fable was
+hoping to rule out, and it did. Files: `eval_natural_tier_scaling.py`.
+
+**Status: the cross-tier accumulation finding stays filed as a
+bounded, accepted risk -- same category as every other adversarial
+cliff in this session -- rather than a blocking architectural problem.
+The natural case, which is the vast majority of real usage and the
+architecture's actual value proposition, is completely unaffected by
+tier count growth. Mitigation work (shared-tau estimate, or the
+post-selection global aggregation hybrid) remains worth doing
+eventually but is no longer urgent -- can be sequenced behind the
+cost/kernel work rather than ahead of it.**
+
+## Shared-tau: the last correctness-side experiment
+
+Fable's final recommendation before declaring the design phase closed:
+build the shared-tau estimate now anyway ("cheap insurance, not
+deferred work"), since the fix is small and the natural-case result
+already showed it isn't urgent -- rather than leaving it as unfinished
+business. Implemented `ma_meta_threshold_shared_tau.py`: identical
+Fenwick-tier/threshold-selection/residual-centroid/window structure to
+`ma_meta_threshold.py`, but restructured into two passes per query --
+pass 1 computes raw scores for every active tier's candidate block and
+pools them into one combined sample; pass 2 computes a SINGLE
+`torch.quantile` from that pooled sample and applies the same tau to
+every tier's own survivor test, instead of each tier independently
+computing its own local 90th percentile with zero awareness of
+siblings (the mechanism the tier-concentration diagnosis pinned down).
+
+**Causal validity confirmed first:** leak = 0.00000000 (perturbing a
+future key at position 200 leaves all outputs at positions <190 exactly
+unchanged), all outputs finite. Files: `ma_meta_threshold_shared_tau.py`.
+
+**Ran the 50-decoy cross-tier adversarial sweep** (`eval_shared_tau_check.py`,
+same construction as `eval_tier_concentration_diagnosis.py` /
+`eval_meta_threshold_integration.py`'s decoy sweep), comparing
+shared-tau against the existing independent-per-tier-tau baseline:
+
+| num_decoys | independent-tau | shared-tau |
+|---|---|---|
+| 0 | 0.9580 | 0.9399 |
+| 5 | 0.7205 | 0.7290 |
+| 20 | 0.4445 | 0.4358 |
+| 50 | -0.1312 | -0.1228 |
+
+**Null result -- shared-tau does not meaningfully narrow the gap.**
+Differences at every decoy count are within trial noise (largest gap
+0.018, no consistent direction: shared-tau is fractionally worse at 0
+and 20 decoys, fractionally better at 5 and 50). At the worst case (50
+decoys) both variants land in the same negative-cosine failure regime.
+Sharing tau across tiers does not change the fundamental problem:
+adversarially-crafted decoys score high enough to clear ANY reasonable
+absolute threshold, pooled or per-tier -- the scoring-stage
+vulnerability threshold selection inherits from dense attention itself
+(established earlier: matches dense attention's 90% adversarial fail
+rate exactly) dominates over the cross-tier-awareness gap it was meant
+to close. Files: `eval_shared_tau_check.py`.
+
+**Status: shared-tau implemented, validated, and tested -- confirmed as
+cheap insurance that costs nothing and closes out the mitigation
+question, but does not measurably improve the crafted-adversarial
+case, consistent with that case being accepted as unfixable at the
+selection layer. Sent to Fable.**
+
+**Fable's response: agrees this is a clean null and closes the thread.**
+Frames it as the FOURTH independent confirmation that the
+crafted-adversarial gap sits at the scoring layer, not the selection
+layer -- dense attention 90%, bucket routing 83%/80%, oracle/reservoir
+threshold-selection 90%/90%, now shared-tau 90%-equivalent -- and says
+this classification should now be treated as settled, not tentative;
+further selection-layer mitigation attempts would be re-testing an
+already-falsified hypothesis. Cross-tier accumulation stays filed as
+adversarial-only and non-blocking (confirmed zero-impact in the natural
+case regardless of tau scheme, per the N=256->8192 sweep).
+
+**Status: MetaMonarchAttention design-quality thread declared COMPLETE.**
+Final state carried forward: threshold selection (shared-tau variant)
+as the read mechanism, no T-iteration, Multipole-style residual
+centroid for non-survivors, cross-tier accumulation filed as
+adversarial-only/non-blocking, crafted-adversarial gap filed as
+inherited-and-accepted with four-way cross-validation. Fable's
+explicit go-ahead: proceed to item 2, the analytical (not wall-clock)
+roofline cost model for the 5500U, using this confirmed read pattern.
+Flagging for user check-in before starting item 2, since it's a new
+substantial piece of design/analysis work.
+
+## Item 2 detour: the O(N^2) complexity finding, and the bounding-ball recheck
+
+Before building the roofline model, the FLOPs accounting for
+`ma_meta_threshold.py` exposed a complexity-class problem, not a
+constant-factor one. The Fenwick tiering picks O(log N) *blocks* per
+query, but each tier's block size grows geometrically (`Bl = B*2^l`),
+and the block sizes across active tiers sum to `n*B` -- the FULL causal
+prefix. Threshold selection needs a real q.k score for every key in
+every active tier's block before applying the quantile cutoff, so QK^T
+scoring is O(N) per query, O(N^2) total -- the SAME complexity class as
+dense causal attention. Sent to Fable.
+
+**Fable's response: this is real, and traced to a specific gap.** The
+original Stage-1 recommendation ("threshold/bounding-ball test -- skip
+a block only if PROVABLY below tau, contribute centroid instead of
+nothing for skipped blocks") only got its second half implemented --
+the Multipole-style centroid -- never the actual pruning half. The
+current build scores every key first, then filters -- masking, not
+range-search. Fable's proposed fix: precompute a bounding ball per tier
+block (center = mean of keys, radius = max distance from center to any
+key), once, query-independent; at read time, a single O(1)
+Cauchy-Schwarz test (`sm_scale*(<q,center> + ||q||*radius) < tau` =>
+provably prunable) skips real scoring for blocks that fail it. Fable
+draws a real distinction from the five prior failed centroid-style
+mitigations (floor-read, robust/geometric-median centroid, etc.): those
+were CONTENT proxies (guess what's probably in the block, fails when
+the needle is atypical); a bounding ball is a PROVABLE UPPER BOUND (by
+convexity, nothing inside can score above the bound, regardless of how
+atypical the true point is) -- a different mathematical object, not the
+same failure mode recurring a sixth time.
+
+**Implemented and tested** (`ma_meta_threshold_ball_prune.py`,
+`eval_ball_prune_check.py`). Necessary structural change beyond just
+adding the bound test: the bound test needs an ABSOLUTE, pre-score tau
+-- the original per-tier quantile is computed FROM that tier's own
+scores, a chicken-and-egg problem for pruning. Seeded tau from the
+local window's own exact, always-computed scores instead, used as one
+shared threshold for both pruning and survivor selection.
+
+Results:
+- Causal validity: leak=0.00000000, all outputs finite. Clean.
+- Natural (N=256, n=200): 0.00% fail rate, matches baseline exactly.
+- 50-decoy adversarial sweep: did NOT come back identical to baseline
+  (0.8188/0.6495/0.4496/0.2652 vs. baseline's
+  0.9580/0.7205/0.4445/-0.1312 at 0/5/20/50 decoys) -- worse at low
+  decoy counts, better at 50. Diagnosed as a side effect of switching
+  tau's SOURCE (local window, only 16 keys) rather than a bug in the
+  bound math, and flagged as a real design delta rather than assumed
+  benign.
+- **Prune rate across N=256->8192, zero decoys: 0.00% at every single
+  scale tested.** The bound test never fired once.
+
+**Ran the follow-up oracle-tau isolation Fable requested**
+(`eval_oracle_tau_prune_check.py`): tau computed from the FULL pooled
+real scores across all active tiers (diagnostic-only, cheats with full
+knowledge, isolates "are the balls too loose" from "was the local-
+window tau_seed biased/noisy"). **Result: 0.00% prune rate at every N
+from 256 to 8192, again.** Confirms the pessimistic branch decisively
+and independent of tau source: the bounding balls are genuinely too
+loose on this key geometry (D=16, the toy dimension used throughout
+this session for fast iteration -- flagged as a real transferability
+caveat, not chased further here).
+
+**Status: ball-pruning branch discarded, confirmed nonviable on this
+data. The O(N)-per-query / O(N^2)-total complexity of threshold
+selection stands as a genuine property of the design, not an
+implementation gap.** No complexity-class recovery is available via
+bounding-ball pruning. Item 2 reverts to being a constant-factor cost
+model (dense O(N^2) vs. threshold-selection O(N^2) with a smaller
+AV/softmax coefficient from the ~10% survivor rate), scoped over the
+original confirmed design: shared-tau threshold selection, no
+T-iteration, Multipole-style residual centroid, no pruning. Sent to
+Fable.
+
+**Fable's correction, before any roofline write-up started:** the
+"~10% survivors" figure only applies to the AV/softmax stage, not to
+total attention cost. Dense attention splits roughly evenly between two
+comparable-size stages per query: QK^T (score every key) and AV
+(weight-and-sum every value). In this design, QK^T gets ZERO savings
+(every key in every active tier is still scored, per the O(N^2)
+finding above) -- only AV+softmax benefits from the survivor rate, and
+even there total survivors summed across all active tiers still scale
+~O(N) (dominated by the largest/coarsest tier), just with a constant
+discount (~5-10x). Net: honest blended speedup ceiling is ~1.5-2x, not
+the order-of-magnitude the AV-only figure would suggest in isolation.
+Also recommended memory traffic / working-set footprint be reported as
+its own axis in the roofline (separate from FLOP count), given the
+actual target is cache-constrained (8MB L3) -- the AV stage's smaller
+value working set could matter for cache residency independent of the
+FLOP ratio.
+
+**User asked to verify this empirically before proceeding.** Built
+`eval_flop_accounting.py`: instruments a real run of
+`monarch_meta_threshold_shared_tau` (final confirmed design) with real
+random data at N=256 through 4096, counting actual QK^T terms (every
+real key scored, every active tier) and actual AV terms (local window +
+real survivors + one residual centroid per tier with any non-survivor),
+compared against dense attention's `N(N+1)/2` causal pair count.
+
+| N | QK ratio | AV ratio | blended ratio |
+|---|---|---|---|
+| 256 | 1.000 | 0.178 | 0.589 |
+| 512 | 1.000 | 0.141 | 0.571 |
+| 1024 | 1.000 | 0.122 | 0.561 |
+| 2048 | 1.000 | 0.111 | 0.556 |
+| 4096 | 1.000 | 0.106 | 0.553 |
+
+**Confirms Fable's correction precisely.** QK ratio is exactly 1.000 at
+every N (zero savings on scoring, exact match to prediction). AV ratio
+converges toward ~0.10 as N grows (matches the estimated 5-10x
+discount). Blended ratio settles around 0.55 -- a real, honest **~1.8x
+speedup ceiling**, landing inside Fable's predicted 1.5-2x range, not
+the misleading order-of-magnitude figure the AV-only fraction would
+imply read in isolation. Files: `eval_flop_accounting.py`.
+
+**Status: stage-separated FLOP accounting empirically verified.**
+Roofline write-up scope is now locked: two-stage accounting (QK^T: 1.0x
+unchanged, AV+softmax: ~0.1-0.2x discount, blended: ~0.55x / ~1.8x
+speedup ceiling) plus memory-traffic/working-set as a separate axis,
+over the confirmed design (shared-tau threshold selection, no
+T-iteration, Multipole-style residual centroid, no pruning). Fable
+requested the memory-traffic axis be measured, not just proposed --
+sent to Fable.
+
+## Memory-traffic axis: measured, and it reframes the headline number
+
+Fable's ask (measure, don't estimate, since the instrumentation harness
+already existed) surfaced a real scoping question: a naive byte-count
+extension of the FLOP counters would just reproduce the FLOP ratios
+(bytes-per-term and FLOPs-per-term both scale linearly with D), adding
+no information. Real memory-traffic analysis requires modeling cache
+REUSE, not just counting touches -- scoped as two honest BOUNDS rather
+than a full LRU/eviction simulator (a simulated cache model in Python
+carries the same false-precision risk already ruled out for PyTorch
+wall-clock timing -- not trustworthy until there's a real Rust/AVX2
+kernel to profile with real hardware counters on the actual 5500U).
+
+Key reframing: threshold selection reads REAL keys/values directly
+(`k_flat.view(...)` is a reshaped VIEW over the same underlying K,V
+tensors, not a separate compressed copy per tier) -- so DRAM-resident
+DATA VOLUME is identical between dense and threshold selection: N*D*4 +
+N*Dv*4 bytes per head. The real question is access pattern / reuse, not
+footprint.
+
+Built `eval_memory_traffic_bounds.py` at PRODUCTION-scale parameters
+(D=Dv=64, H=8 -- not the toy D=16 used elsewhere in this session for
+fast iteration, since toy-D trivially fits in L3 and would make the
+axis uninformative). Two bounds: FLOOR (every K/V byte read exactly
+once, best case, identical for both mechanisms) and NAIVE (actual
+measured traffic in the current query-major loop, zero reuse credit
+beyond within-query-group batching).
+
+**First pass had a bug, caught before reporting**: the dense baseline
+used raw O(N^2) per-query-pair counting while the threshold-selection
+count credited free reuse within each batch of B queries sharing a
+key-block -- an apples-to-oranges comparison that produced a misleading
+~60x-favorable ratio. Fixed by applying the SAME block-tiled convention
+(FlashAttention-style: a block of B queries shares one read of its
+causal-prefix keys/values) to dense's baseline too.
+
+**Corrected results:**
+
+| N | K+V floor (MB) | fits L3? | dense naive (MB) | threshold naive (MB) | ratio |
+|---|---|---|---|---|---|
+| 1024 | 4.19 | yes | 35.7 | 39.8 | 1.117 |
+| 2048 | 8.39 | yes | 138.4 | 148.7 | 1.074 |
+| 4096 | 16.78 | no | 545.3 | 569.6 | 1.045 |
+| 8192 | 33.55 | no | 2164.3 | 2219.8 | 1.026 |
+| 16384 | 67.11 | no | 8623.5 | 8744.8 | 1.014 |
+
+**Threshold selection shows essentially ZERO memory-traffic advantage
+over a properly block-tiled dense implementation -- ratio converges to
+~1.0 as N grows, slightly WORSE at smaller N.** Once dense is also
+tiled (queries in blocks of B, sharing one causal-prefix key read per
+block), its own traffic already drops to O(N^2/B), the same order
+threshold selection achieves. The earlier ~1.8x figure was a
+COMPUTE-only win; on bytes moved, threshold selection and well-tiled
+dense are roughly break-even. K+V no longer fits in L3 past N~2048 at
+this production scale, confirming genuine cache pressure exists (unlike
+the toy-D case, where everything trivially fit). Files:
+`eval_memory_traffic_bounds.py`.
+
+**Status: this reframes the item-2 headline.** Since attention is
+typically memory-bandwidth-bound rather than compute-bound on real
+hardware, and threshold selection's memory-traffic profile is roughly
+break-even with well-tiled dense, the realizable wall-clock benefit on
+the 5500U could sit much closer to ~1.0x than the ~1.8x compute
+ceiling -- a materially more sobering number than what was sent to
+Fable in the previous round. Sending this to Fable now, before writing
+the roofline document, since it may bear on whether the Rust/AVX2
+investment is worth it at all.
+
+## Ridge-point check: resolves whether the FLOP win is realizable
+
+**Fable's response**: don't treat "close to 1.0x" as final -- one more
+cheap, purely arithmetic step (no new instrumentation, no simulator)
+resolves it: compare the kernel's implied arithmetic intensity (FLOPs
+per byte, from numbers already measured) against the 5500U's roofline
+ridge point (peak AVX2 FLOP/s / peak DRAM bandwidth). Below the ridge =
+memory-bound, cutting FLOPs buys ~nothing; above it = compute-bound,
+the FLOP win shows up directly. Also flagged a real practical concern:
+the memory-traffic ratio was WORST exactly at N=512-4096 (1.117 down to
+1.045), the range most plausibly relevant to this project, not the
+N=16384+ range where it approaches 1.0 -- worth checking Fydel's actual
+target context length against that table before writing the headline
+number.
+
+**Checked**: `RESEARCH_LOG.md`'s full-attention-layer benchmarks use
+context lengths 512/2048/8192, with full-attention layers identified as
+~92% of decode cost at ctx=8192 -- confirming the realistic operating
+range is exactly where the memory-traffic ratio was weakest, not the
+asymptotic-comfort zone.
+
+**Built `eval_roofline_ridge_point.py`**: computes 5500U peak
+FLOPs/bandwidth from public specs (Zen 2, 6 cores, AVX2 256-bit, dual-
+channel DDR4-3200), both a theoretical-peak bound and a
+conservative-efficiency estimate (flagged explicitly as unmeasured,
+same caveat as everywhere else in this session PyTorch/analytical
+numbers stand in for real hardware profiling): ridge point ~4.6-7.9
+FLOPs/byte. Computes implied AI for dense (tiled) and threshold
+selection from the FLOP counts (`eval_flop_accounting.py`) and byte
+counts (`eval_memory_traffic_bounds.py`) already measured.
+
+**First pass had a bug, caught before reporting**: used H=8 uniformly
+for both compute and memory scaling, but forgot to multiply
+`dense_flops` by H at all (single-head FLOPs vs. multi-head bytes) --
+produced a spurious result where threshold selection's AI looked HIGHER
+than dense's, backwards from the structural expectation (fewer FLOPs +
+~same bytes should give LOWER AI). Fixed the H-scaling bug, then went
+further: checked the real production config (`src/model/config.rs`)
+instead of assuming uniform H=8. Found `head_dim=64` and `kv_block=64`
+matched the assumption, but the model uses **grouped-query attention**:
+`n_q_heads=14`, `n_kv_heads=2` (7 query heads share each KV head) --
+compute scales with n_q_heads, K/V memory traffic scales with the much
+smaller n_kv_heads. Rebuilt the script on the real GQA config.
+
+**Corrected, production-config results:**
+
+| N | dense AI | thresh AI | regime |
+|---|---|---|---|
+| 512 | 199.5 | 104.5 | both compute-bound |
+| 1024 | 211.0 | 109.8 | both compute-bound |
+| 2048 | 217.3 | 114.4 | both compute-bound |
+| 4096 | 220.6 | 117.8 | both compute-bound |
+| 8192 | 222.3 | 120.1 | both compute-bound |
+
+**Both mechanisms land 15-50x above the ridge point at every target
+context length -- decisively compute-bound, not memory-bound.** GQA's
+low n_kv_heads=2 (vs n_q_heads=14) makes K/V memory traffic much
+smaller relative to compute than a uniform-head model would suggest,
+pushing the result further into compute-bound territory than the
+initial H=8 approximation showed. Files: `eval_roofline_ridge_point.py`.
+
+**Status: the sobering "close to 1.0x" memory-traffic framing does NOT
+dominate -- the ~1.8x FLOP reduction should be realizable in wall-clock
+time**, because bytes were never the bottleneck at this design's real
+GQA configuration. This reverses the previous round's tentative
+conclusion, now on a decisively stronger empirical footing (real
+production config, not an assumed uniform-head approximation). Sent to
+Fable.
+
+## The residual-centroid cost: the omission that erases the whole win
+
+**Fable's response gave the write-up go-ahead, with one required
+addition**: before presenting the 1.8x figure as a wall-clock
+expectation, account for threshold selection's own bookkeeping/overhead
+(tau maintenance, Fenwick traversal, gather/index logic, residual-
+centroid combination) as O(log N) or O(1) against the O(N) dominant
+term, since being compute-bound means any uncounted FLOPs now show up
+directly in wall time with no memory-stall slack to hide behind. Framed
+as a short analytical paragraph, not a new experiment -- "plausibly
+negligible is exactly the kind of claim this thread has learned not to
+accept without checking."
+
+**Checked it properly instead of asserting it -- and it was NOT
+negligible.** The original FLOP accounting (`eval_flop_accounting.py`)
+only counted terms entering the FINAL combined softmax (real survivors
++ one residual slot per tier) -- it never counted the cost of
+COMPUTING that residual slot: `mean_k`/`mean_v` is a masked reduction
+over ALL of a tier's Bl keys (~90% are non-survivors), an O(Bl*D)
+operation, the SAME ORDER as that tier's own QK scoring matmul.
+
+Built `eval_flop_accounting_with_residual.py` to measure this
+directly:
+
+| N | blended (QK+AV+residual) | blended (+ quantile-sort) |
+|---|---|---|
+| 256 | 1.056 | 1.167 |
+| 512 | 1.054 | 1.184 |
+| 1024 | 1.052 | 1.201 |
+| 2048 | 1.051 | 1.217 |
+| 4096 | 1.051 | 1.232 |
+
+**Including the residual-centroid reduction cost, the blended FLOP
+ratio flips from ~0.55 (the reported 1.8x speedup) to ~1.05 --
+essentially ZERO net FLOP savings versus dense.** Including the
+quantile-sort overhead (torch.quantile is sort-based, O(n log n), not
+the O(1)-amortized reservoir-sampling Louver's own design calls for --
+the validated shared-tau implementation uses full-pool sorting for
+correctness-checking purposes, not the cheaper streaming estimator) it
+comes out ~1.05-1.23, i.e. **worse than dense** at every N tested.
+
+The residual-centroid reduction roughly DOUBLES the "unavoidable O(N)"
+portion of the kernel (QK scoring + residual reduction, both O(N) per
+query), which swallows essentially all of the AV-stage savings that
+produced the earlier 1.8x figure. This is the single largest previously
+-uncounted cost anywhere in this cost-accounting arc -- not a rounding
+error, and it directly validates Fable's own warning about not
+accepting "negligible" without checking.
+
+**Status: the 1.8x headline does not survive a complete FLOP account.**
+On FLOPs alone, threshold selection as currently designed (with a real
+per-tier residual centroid, recomputed fresh per query) offers little
+to no computational advantage over dense attention -- independent of
+the separately-resolved compute-bound/memory-bound question, which is
+now moot if there's no FLOP saving to realize. Open question: whether
+the residual-centroid mechanism itself needs to be redesigned (e.g.
+computed incrementally/maintained rather than recomputed fresh per
+query) to recover any real advantage. Sent to Fable.
+
+## Exact-algebraic residual fix: recovers most of the FLOP saving
+
+**Fable's response**: this is fixable, and NOT via another content-
+approximation heuristic (the category that already failed five times
+this session) -- an exact algebraic identity instead:
+`sum(non-survivors) = sum(all keys in block) - sum(survivors)`.
+`sum(all keys in block)` is query-independent (same value for every
+query touching that tier's block), so precompute it ONCE when the
+block finalizes -- same reuse pattern already validated for bounding
+balls and k-means centroids. `sum(survivors)` costs O(num_survivors*D),
+same order as work already paid for the AV gather. Since this computes
+the IDENTICAL mathematical quantity, not an approximation, none of the
+reliability/quality harnesses need rerunning -- only the cost harness.
+Also recommended swapping the sort-based `torch.quantile` (O(n log n))
+for the reservoir-sampling tau estimator, whose QUALITY was already
+validated in the earlier oracle-vs-reservoir round -- pure cost
+substitution, no new correctness question.
+
+**Implemented** (`ma_meta_threshold_fast_residual.py`): precomputes
+per-tier full-block K/V sums once, computes residual mean via
+subtraction instead of a full masked reduction.
+
+**Verified numerically exact first** (`eval_fast_residual_check.py`,
+N=256 to 8192): max abs diff ~3-6e-8 (float32 rounding-noise level, not
+a real discrepancy) at every N. Causal validity: leak=0.00000000, all
+outputs finite. Confirmed before trusting any FLOP-cost claim.
+
+**Re-ran the FLOP accounting** (`eval_flop_accounting_fast_residual.py`)
+with both fixes applied -- residual cost counted at its REAL achievable
+O(num_survivors*D) (gather-equivalent, same order as already-paid AV
+work) plus a one-time O(Bl*D) full-block-sum cost amortized across the
+whole sweep (not per query), and tau cost counted at O(reservoir_size)
+instead of O(n log n):
+
+| N | QK+AV only | +survivor-gather residual | +onetime block-sum | +reservoir-tau | **Full blended** |
+|---|---|---|---|---|---|
+| 256 | 0.589 | 0.637 | 0.645 | +0.0007 | **0.646** |
+| 512 | 0.571 | 0.620 | 0.625 | +0.0005 | **0.625** |
+| 1024 | 0.561 | 0.610 | 0.613 | +0.0003 | **0.614** |
+| 2048 | 0.556 | 0.605 | 0.607 | +0.0002 | **0.607** |
+| 4096 | 0.553 | 0.603 | 0.604 | +0.0001 | **0.604** |
+| 8192 | 0.552 | 0.601 | 0.602 | +0.0001 | **0.602** |
+
+**Full blended ratio settles around ~0.60-0.65 -- a real ~1.5-1.7x
+speedup ceiling.** Not the original naive 1.8x (the survivor-gather
+residual term is a genuine, non-zero marginal cost -- not literally
+free), but a substantial recovery from the ~1.05-1.23x (no-savings-or-
+worse) result found before the fix. Files:
+`ma_meta_threshold_fast_residual.py`, `eval_fast_residual_check.py`,
+`eval_flop_accounting_fast_residual.py`.
+
+**Status: FLOP saving recovered and re-verified at ~1.5-1.7x, on a
+design that is numerically identical to the already-validated
+reliability results (exact algebraic identity, not a new heuristic).**
+This is the number the ridge-point/compute-bound result should now be
+checked against, since that check was previously answering "is the
+1.8x realizable" -- a premise that no longer holds unmodified. Sent to
+Fable.
+
+**Fable's response**: no full re-run needed, and directionally the
+correction can only widen the existing margin, never shrink it -- the
+fix recovers savings but adds FLOPs versus the naive 0.55x estimate
+(0.55x -> ~0.60-0.65x), while bytes moved are completely unaffected (a
+separate measurement the residual-computation method doesn't touch).
+More FLOPs over the same bytes means HIGHER arithmetic intensity, i.e.
+further right on the roofline, deeper into compute-bound territory.
+Still asked for the five-line arithmetic recompute rather than skipping
+it on the strength of the direction alone -- consistent with the
+thread's own discipline ("a plausible-sounding argument gets verified,
+not trusted," which is exactly what caught the residual-cost omission
+two rounds ago).
+
+**Ran it** (`eval_roofline_ridge_point_v2.py`): recomputed AI using the
+corrected fast-residual+reservoir-tau FLOP figures against the same
+unchanged byte counts and real GQA production config:
+
+| N | AI (old, pre-fix) | AI (corrected) | regime |
+|---|---|---|---|
+| 512 | 104.5 | 112.6 | compute-bound |
+| 1024 | 109.8 | 119.1 | compute-bound |
+| 2048 | 114.4 | 124.5 | compute-bound |
+| 4096 | 117.8 | 128.4 | compute-bound |
+| 8192 | 120.1 | 130.9 | compute-bound |
+
+**Confirms Fable's directional prediction arithmetically: margin
+widened at every N, both stay ~15-28x above the realistic ridge point
+(4.62 FLOPs/byte).** Compute-bound conclusion holds on the corrected
+FLOP figures. Files: `eval_roofline_ridge_point_v2.py`.
+
+**Status: item 2 is now fully resolved and internally consistent.**
+Final numbers for the roofline document: ~1.5-1.7x FLOP-level speedup
+ceiling (fast-residual + reservoir-tau design, both fixes verified
+numerically exact against the reliability-validated implementation),
+confirmed compute-bound at the real production GQA config with a wide
+margin (15-28x above ridge point), ball-pruning branch confirmed dead
+and discarded (0% prune rate under oracle tau, any N). Proceeding to
+write the roofline document itself.
+
+## Item 2 deliverable: ROOFLINE_5500U.md written
+
+Wrote `ROOFLINE_5500U.md`: confirmed final design (Fenwick tiers,
+shared-tau threshold selection, reservoir-tau, exact-algebraic
+fast-residual, no T-iteration, no pruning, exact local window),
+headline ~1.5-1.7x FLOP-level speedup ceiling with the full
+stage-by-stage table (QK 1.0x, AV ~0.10-0.18x, residual-centroid cost
+called out explicitly as the largest correction in this arc, tau
+estimation cost), roofline placement (compute-bound, 15-28x margin at
+real GQA production config, held robust across the residual-cost
+correction), memory-traffic axis reported as secondary/non-deciding,
+bounding-ball pruning documented as tried-and-ruled-out, and an
+explicit limitations section (analytical not measured-on-hardware,
+D=16 ball-pruning caveat, adversarial-scoring-stage vulnerability filed
+separately as a quality property). Sending to Fable for final review.
+
+**Status: item 2 (analytical roofline cost model) complete**, pending
+Fable's final pass. This closes the Fable-artifact-driven segment that
+began with the Louver/threshold-selection research synthesis --
+MetaMonarchAttention's design-quality thread (declared complete
+earlier) and its cost thread now both resolved and cross-validated.
+
+## Final review: two precision fixes, both applied
+
+**Fable's final pass**: overall a strong, honest closing document --
+corrections represented in the right order and weight, residual-
+centroid catch genuinely called out rather than softened. Two issues
+flagged, both fixed directly (precision fixes to already-verified
+content, not new findings needing re-verification):
+
+1. **Real overstatement**: the document stated "both dense and
+   threshold selection land 15-28x above the ridge point," but only
+   threshold selection's AI was ever shown in that table -- dense's AI
+   (~199.5-222.3, from the earlier round) against the same ridge range
+   actually gives ~25-48x, a meaningfully wider margin than threshold
+   selection's. Single shared range implied the two mechanisms sit
+   closer to the ridge than they actually do. Fixed: table now shows
+   both AI columns side by side, prose states both ranges separately
+   (thresh ~15-28x, dense ~25-48x) with threshold selection correctly
+   identified as the tighter of the two margins.
+
+2. **Completeness gap**: "no T-iteration" was presented as a clean win
+   without the caveat, established earlier in this same investigation,
+   that removing it also removes Monarch's incidental bounded-
+   compression damping against decoy pressure (T-refined
+   SlidingMonarchAttention stayed weakly positive at 50 decoys; pure
+   threshold selection went negative at the same decoy count). Fixed:
+   added to the limitations section, explicitly scoped as a quality
+   trade-off (not a cost consideration) with the global-aggregation
+   mitigation noted as parked future work, not resolved.
+
+Everything else in the document checked out without changes: the
+1.8x -> 1.05-1.23x -> 1.5-1.7x progression, the memory-traffic
+numbers (exact match to the earlier measured round), the H=8-uniform
+caveat, the bounding-ball dead-end (both local-window and oracle-tau
+citations), the floating-point cancellation check, and the
+adversarial-scoring-vulnerability scoping were all confirmed sound as
+written.
+
+**Status: ROOFLINE_5500U.md finalized. Fable-artifact-driven segment
+CLOSED.** MetaMonarchAttention's design-quality thread and its cost
+thread are both complete, cross-validated, and internally consistent.
+Final architecture: Fenwick dyadic tiers, shared-tau threshold
+selection with reservoir-tau, exact-algebraic fast-residual centroid,
+no T-iteration (quality trade-off documented), no bounding-ball
+pruning (confirmed dead), exact local window. Confirmed ~1.5-1.7x FLOP
+speedup ceiling, decisively compute-bound at the real production GQA
+config with a wide margin. Adversarial-scoring-stage vulnerability and
+the no-T-iteration decoy-damping trade-off both remain filed as
+accepted, cross-validated quality properties, separate from this cost
+analysis.
+
+## Fable's sign-off
+
+Confirmed both fixes land correctly. Final summary of what "closed"
+means for this arc: design settled as threshold selection (shared-tau,
+reservoir estimation, exact-algebraic residual, no T-iteration, no
+pruning) with a real, honestly-derived ~1.5-1.7x FLOP-level ceiling,
+confirmed compute-bound at the real production GQA config with wide
+margin. Every mitigation that didn't survive scrutiny -- bounding-ball
+pruning, the naive 1.8x figure, memory-traffic as an independent win,
+per-tier tau, floor-reads, robust centroids, static landmarks -- is
+documented as tried-and-ruled-out with the specific evidence that
+killed it, not quietly dropped. Crafted-adversarial scoring-stage
+vulnerability correctly filed as inherited-and-accepted, cross-
+validated four separate ways, not claimed fixed.
+
+One forward-looking note (already covered by the limitations section,
+not a new action item): the very first real Rust/AVX2 hardware
+profiling run, whenever that phase begins, should be treated as a
+CHECK on this document's central claims (compute-bound regime,
+~1.5-1.7x ceiling), not an assumption they'll hold -- every number here
+is an analytical estimate against public 5500U specs, never measured
+on the actual chip.
+
+**ARC CLOSED.** Fable-artifact-driven MetaMonarchAttention investigation
+(Louver/threshold-selection synthesis through the roofline cost model)
+is complete: 10 mechanisms tried in sequence (bucket routing -> floor-
+read -> robust centroids -> threshold selection -> T-iteration removal
+-> full integration -> shared-tau -> bounding-ball pruning -> roofline/
+FLOP accounting -> exact-algebraic fast-residual), each tested
+adversarially rather than accepted on plausibility, with two rounds of
+self-caught errors (the tiling-convention bug in the memory-traffic
+comparison, the H-scaling bug and missing GQA correction in the
+ridge-point check, and the omitted residual-centroid cost in the FLOP
+accounting) corrected before being reported rather than after.
+
+## New phase: empirical Rust validation (monarch-attn-kernel)
+
+Per user request, started building a standalone Rust crate
+(`../monarch-attn-kernel/`, sibling to Jumping Seedling, independent
+`Cargo.toml`) to empirically test Causal, Sliding, and Meta
+MonarchAttention against ROOFLINE_5500U.md's analytical claims --
+the "first real measurement" that document's own limitations section
+called for. Installed `perf` (`pkexec pacman -S perf`) for hardware-
+counter profiling.
+
+**Scalar-correctness phase complete, all three kernels validated:**
+- Causal: dense causal attention with GQA support, validated against
+  real PyTorch `scaled_dot_product_attention(is_causal=True)` at the
+  production config (head_dim=64, n_q_heads=14, n_kv_heads=2), max abs
+  diff <1e-3.
+- Sliding: faithful scalar port of `ma_sliding_monarch.py`'s T-iteration
+  Sinkhorn-style cross-block refinement (read the exact reference file
+  rather than reimplementing from memory, given the algorithm's
+  complexity) -- validated against the real PyTorch reference, max abs
+  diff 1.49e-7 (float32 rounding-noise level) on first attempt.
+- Meta: faithful scalar port of
+  `ma_meta_threshold_fast_residual.py` (the final confirmed design:
+  Fenwick tiers, shared-tau, exact-algebraic fast-residual, sort-based
+  quantile matching `torch.quantile`'s linear-interpolation default) --
+  validated against the real PyTorch reference, max abs diff 1.19e-7.
+
+Every cross-validation follows the same pattern: Python export script
+(imports the actual validated reference function, not a reimplementation)
+-> raw f32 binary test vectors -> Rust integration test diffing against
+them. Files: `monarch-attn-kernel/src/{causal,sliding,meta}.rs`,
+`export_{causal,sliding,meta}_vectors.py`, `tests/*_reference_check.rs`.
+
+**Status: correctness foundation complete for all three kernels.**
+Remaining: AVX2 versions of each (correctness-first design explicitly
+chosen so SIMD work stays separable from correctness debugging), then
+criterion.rs wall-clock benchmarks + `perf stat` hardware-counter
+measurements (L2/L3 miss rate, instructions retired) comparing all
+three against each other and against ROOFLINE_5500U.md's predictions
+(compute-bound, ~1.5-1.7x FLOP-level ceiling for Meta vs. Causal).
+
+## Bench/profiler infrastructure verified before AVX2
+
+Per user request: verify the benchmark/profiler binaries themselves
+before adding AVX2 complexity on top, rather than assuming they call
+the kernels correctly.
+
+Built `src/bin/verify.rs`: runs the same reference-vector checks as
+`tests/*_reference_check.rs`, but as a `--release`-mode binary (LTO,
+opt-level=3, codegen-units=1) -- `cargo test` always uses the `test`
+profile, never `release`, so it alone couldn't confirm optimized
+codegen preserves correctness. Ran it: **all three kernels PASS in
+release mode**, same diffs as debug (causal/sliding 1.49e-7, meta
+1.19e-7) -- confirms no fast-math/reordering issues from optimization
+(expected, since no fast-math flags are used, but verified rather than
+assumed).
+
+Built `src/bin/profile.rs`: the actual `perf stat` / wall-clock
+profiling target (deliberately not criterion -- criterion's harness
+overhead and statistical resampling make it a poor target for
+hardware-counter attachment; a plain fixed-iteration-count binary is
+standard practice for this). Takes `<kernel> <seq_len> <iterations>`,
+uses a dependency-free deterministic xorshift RNG for inputs, prints a
+checksum (sum of output) both to prevent dead-code elimination and as
+a sanity signal.
+
+**Sanity-checked the profiler binary itself** across edge cases (seq_len
+1, 63, 64/block-aligned, 65, 512) for all three kernels: no crashes, all
+checksums finite and non-zero. Notable internal-consistency signal:
+Sliding and Meta produce IDENTICAL checksums at seq_len<=64 (single
+block, no far-context mechanism ever activates for either design) --
+both degenerate to the same local-window-only computation when there's
+nothing to route to a far mechanism, exactly as expected structurally.
+They diverge starting at seq_len=65 (second block appears, far
+mechanisms start differing). Also confirmed determinism: repeated runs
+at the same (kernel, seq_len) produce bit-identical checksums.
+
+**Status: bench/profiler infrastructure verified correct and
+deterministic.** Proceeding to AVX2 versions next, now that the
+harness they'll be measured with is itself trustworthy.
+
+## AVX2 wired into all three kernels, correctness re-verified
+
+Built `src/simd.rs`: `dot()` and `axpy()` primitives, AVX2/FMA with
+runtime feature detection and scalar fallback, correctness-tested
+against scalar reference at both AVX2-aligned and remainder-tail
+lengths (1,7,8,9,15,16,17,64,100) before touching any kernel.
+
+Wired into causal.rs, sliding.rs, meta.rs by replacing their inner
+dot-product and value-accumulation loops. Re-ran the full PyTorch
+cross-validation suite plus the release-mode `verify` binary after each
+kernel's conversion -- all still pass, diffs unchanged at float32
+rounding-noise level (1e-7 to 2e-7).
+
+Measured real speedups via `profile` (seq_len=512): **causal
+80ms->28ms (~2.8x), sliding 90ms->44ms (~2x)**. Meta only improved
+modestly at first (99ms->80ms, ~1.25x) -- its actual bottleneck turned
+out to be elsewhere.
+
+**Found and fixed a real inefficiency in meta.rs while investigating
+the smaller SIMD win**: the pass-2 survivor loop was storing a value
+clone and a logit for EVERY key in every tier block (survivor or not),
+even though non-survivors get a -inf logit contributing exactly 0
+softmax weight -- an O(Bl) storage cost per tier instead of the
+O(num_survivors) the FLOP accounting had already established as the
+real cost. Skipping non-survivor storage entirely is mathematically
+identical to the reference (removing zero-weight terms from a softmax
+doesn't change the result) -- verified this is true, not assumed: full
+test suite + release verify binary still pass at identical precision.
+Meta improved further: 80ms->50.9ms (~1.9x total from the pre-SIMD
+baseline), checksum bit-identical before/after confirming the
+optimization is a pure efficiency fix, not a behavior change.
+
+**Status: all three kernels AVX2-accelerated and re-verified correct.**
+Proceeding to the criterion.rs + perf-stat benchmark harness -- the
+actual empirical check on ROOFLINE_5500U.md's predictions.
+
+## First empirical result: ROOFLINE_5500U.md's headline number does NOT survive real measurement
+
+Built `benches/attention_bench.rs` (criterion, sample_size=10 given
+seq_len=8192's O(N^2)-ish cost) and `perf_measure.sh` (perf stat,
+cycles/instructions and cache-references/cache-misses in separate
+runs -- combining them hit this CPU's limited PMC slots and dropped
+counters, confirmed empirically; asked about disabling the NMI
+watchdog to free a slot but that request was correctly denied by the
+auto-mode classifier as exceeding the perf-install pkexec authorization
+-- worked around it by splitting event groups instead, no system change
+needed). Ran both across seq_len 512/2048/8192 (the project's actual
+target range per RESEARCH_LOG.md) for all three kernels, in sequence
+(not concurrently, to avoid CPU contention skewing results).
+
+**Wall-clock (criterion):**
+
+| N | Causal | Sliding | Meta |
+|---|---|---|---|
+| 512 | 28.8ms | 35.8ms | 38.4ms |
+| 2048 | 460ms | 172ms | 658ms |
+| 8192 | 9.11s | 1.04s | 11.69s |
+
+**Meta is SLOWER than Causal at every N tested -- the opposite of
+ROOFLINE_5500U.md's ~1.5-1.7x speedup prediction.** Sliding wins
+decisively at every scale (8-9x faster than both at N=8192), despite
+T-iteration being "structurally superseded" in the design-quality
+thread's conclusion (a claim about quality under threshold-selection
+vs. Monarch-representative reads, never about implementation
+efficiency of the actual code).
+
+**Hardware counters (perf stat) confirm this isn't a wall-clock
+artifact:**
+
+| kernel/N | instructions/iter (billions) | IPC | cache-miss rate |
+|---|---|---|---|
+| causal/8192 | 51.79 | 2.00 | 1.30% |
+| sliding/8192 | 10.04 | 2.67 | 22.40% |
+| meta/8192 | 82.11 | 1.89 | 14.57% |
+
+Meta executes **1.59x MORE real instructions than Causal** at N=8192 --
+`instructions retired` is a direct hardware count, not subject to
+wall-clock noise. Directly contradicts the FLOP-based accounting, which
+only counted mathematically-necessary QK/AV/residual operations, never
+implementation overhead.
+
+**Ran `perf record`/`perf report` on meta at N=8192 to find the actual
+cause rather than continuing to hypothesize:** ~56% of ALL CPU cycles
+are spent in `core::slice::sort::stable::quicksort` and related sort
+functions. **The sort-based tau quantile -- ROOFLINE_5500U.md's own
+flagged placeholder ("this is the CORRECTNESS reference; the
+reservoir-sampling cost optimization... is a follow-up, not yet
+implemented") -- turned out to be the single largest real-world cost in
+the entire kernel.** Exactly the "plausibly negligible, actually
+dominant" pattern this whole research arc has repeatedly caught
+(residual-centroid cost, H-scaling bug, tiling-convention bug) --
+except this time caught via real hardware profiling rather than
+analytical FLOP accounting, which is precisely why Fable's own
+limitations-section caveat ("treat the first real profiling run as a
+check on this document's claims, not an assumption they'll hold") was
+right to include.
+
+**Status: ROOFLINE_5500U.md's headline ~1.5-1.7x speedup claim for Meta
+is EMPIRICALLY FALSIFIED as currently implemented** -- the sort-based
+tau is real, dominant, unaccounted-for cost, not a rounding error.
+Files: `benches/attention_bench.rs`, `perf_measure.sh`,
+`/tmp/meta_perf.data` (perf record capture, not checked in). Sending
+this finding to Fable now (fresh transcript, per established pattern
+for a result this consequential to a previously-declared-closed arc).
+
+## Fable's read: correction not retraction, but bigger than expected -- and the real headline is Sliding
+
+**Fable's response** (fresh transcript, grounded in the actual repo
+files rather than just the summary given): two separable claims in the
+roofline doc's headline have different fates. "~1.5-1.7x FLOP reduction
+vs dense" is plausibly NOT falsified -- stripping the sort's ~56% cycle
+share from meta/8192's 11.69s gives ~5.1s, vs causal's 9.11s, landing
+almost exactly in the predicted band. What's actually wrong is
+"compute-bound -> FLOPs translate to wall-clock": instructions != FLOPs,
+and the roofline model never accounted for per-key branchy threshold
+tests or per-query heap allocation churn. Also identified something the
+JOURNAL narrative missed: the sort as written is an O(N^2 log N)
+COMPLEXITY-CLASS regression (sorts the full pooled tier scores, O(N)-
+sized for the largest tier, once per query), not just a constant-factor
+placeholder. And: reservoir-tau would close most of the gap to CAUSAL,
+but a zero-cost-tau bound still leaves Meta ~5x behind SLIDING -- a
+comparison the roofline document never made at all (it only ever
+benchmarked Meta against dense). Fable's recommended sequencing: a
+free-tau control first (cheap, ~zero cost) to get the hard upper bound
+before implementing anything, or a one-line `select_nth_unstable_by`
+(quickselect, O(n)) swap as a real intermediate fix.
+
+**Tried the free-tau control first, as recommended -- and it was
+confounded, caught before trusting it.** Fixed tau to a constant
+(0.0) to skip the sort entirely: `meta_freetau` came back SLOWER
+(28.9s) than the real sort-based version (18.4s at that run), the
+opposite of expected. Diagnosed directly: scores are roughly symmetric
+around 0, so tau=0.0 makes ~50% of keys "survive" instead of the real
+~10% (90th-percentile threshold) -- and since survivor storage was
+already optimized to scale with num_survivors, 5x more survivors means
+~5x more storage/accumulation work. The "control" wasn't isolating sort
+cost at all, it was testing a completely different, heavier workload.
+Discarded this approach rather than report a misleading number.
+
+**Implemented Fable's quickselect suggestion properly instead**
+(`TauMode::Quickselect` in `meta.rs`, using `select_nth_unstable_by` for
+both the floor and ceil interpolation points of the linear-
+interpolation quantile). This produces the mathematically IDENTICAL tau
+value to sort-based tau -- same survivor rate, same output -- just via
+O(n) partial reordering instead of O(n log n) full sort. **Verified
+numerically identical before trusting any timing** (new test
+`quickselect_tau_matches_sort_based_tau`, max abs diff <1e-5) and
+release-mode `verify` binary still passes at unchanged precision for
+all three kernels.
+
+**Clean, apples-to-apples timing comparison at N=8192** (all four from
+the same `profile` binary, single-iteration, immediately sequential to
+minimize system-state drift):
+
+| | Causal | Sliding | Meta (sort) | Meta (quickselect) |
+|---|---|---|---|---|
+| time | 10.9s | 1.42s | 16.5s | ~8.9s |
+| vs Causal | -- | 7.7x faster | 1.51x slower | **1.22x faster** |
+| vs Sliding | -- | -- | -- | still **6.3x slower** |
+
+Checksums identical between sort-based and quickselect meta (confirms
+correctness -- same tau, same survivors, same output, only the
+algorithm computing tau changed). **Confirms Fable's prediction almost
+exactly**: quickselect took Meta from losing to Causal to beating it by
+~1.2x (short of the original naive 1.8x/1.5-1.7x prediction -- real
+non-sort overhead remains, exactly as Fable flagged), and did
+essentially nothing to close the gap to Sliding, which stays at ~6.3x.
+Files: `src/meta.rs` (TauMode enum, quickselect implementation),
+`tests/meta_reference_check.rs` (quickselect correctness test),
+`src/bin/profile.rs` / `benches/attention_bench.rs` (meta_quickselect
+variant).
+
+**Status: quickselect fix implemented, verified correct, and measured.**
+Meta now legitimately beats Causal on FLOPs-that-matter, closing the
+gap the roofline document originally claimed (in a different, more
+honest way than the document's own analytical argument). The gap to
+Sliding remains wide and is NOT a tau-cost problem -- per Fable's
+structural read, Sliding's Monarch-representative reads never score
+every key (avoiding threshold selection's O(N)-per-query QK scoring
+entirely), which is a genuine complexity-class advantage threshold
+selection gave up when it replaced representative-reads with real-score
+reads (the original design-quality tradeoff, now shown to also be a
+real cost tradeoff, not just a quality one). Reporting full results
+back to Fable now.
+
+## Fable pushes back: reservoir-tau confirmed dead, but "recenter on Sliding" not yet earned
+
+**Fable's read**: agrees the reservoir-tau question is closed (the 6.3x
+gap to Sliding originates at QK scoring, a stage no tau estimator
+touches). Also identifies the "parked hybrid" I'd referenced was
+Meta-side (global-aggregation on top of Meta, to recover T-iteration's
+decoy-damping) -- since it only ADDS cost to Meta's already-capped
+stage, it's foreclosed for the same structural reason, not worth
+parking further.
+
+**The real pushback**: Sliding's founding correctness claim (JOURNAL
+line 364, "first build, correctness-only, strong result") predates the
+SAME-NORM CONTROL this session later introduced (`eval_bucket_
+multineedle.py`'s `BACKGROUND_NORM` fix) -- a control that subsequently
+unmasked a magnitude-scaling artifact silently inflating "passes" for
+FIVE separate untrained representative-construction mechanics tried for
+Meta's R-landmark generalization (all five failed single-needle
+detection outright once needle-key norm was forced equal to background
+norm). Sliding, using a single fixed representative (R=1, the TIGHTEST
+version of the arc's own established capacity ceiling), was never
+re-checked under this corrected methodology. Recommended: rerun a
+same-norm-controlled single/multi-needle probe against Sliding
+specifically before treating its cost win as a production decision.
+
+**Ran it** (`eval_sliding_multineedle_samenorm.py`): needle(s) placed in
+a FAR block (outside the local exact window, so only the T-iteration-
+refined Monarch representative can carry the signal), same-norm control
+applied to needle keys (`BACKGROUND_NORM = 0.5*sqrt(D)`, matching
+background key norm -- no magnitude shortcut available).
+
+| K needles | mean cos | min cos | frac>0.5 |
+|---|---|---|---|
+| 1 | -0.2152 | -0.2152 | 0.00 |
+| 2 | 0.4188 | 0.2132 | 0.50 |
+| 4 | 0.2823 | 0.1717 | 0.00 |
+| 8 | 0.1370 | -0.1109 | 0.00 |
+
+**K=1 (single needle, ZERO competition) fails outright -- mean cos
+negative.** Not a capacity-ceiling degradation pattern (that would show
+K=1 passing cleanly, then degrading as K grows) -- a complete detection
+failure with no competition at all.
+
+**Sanity-checked before trusting this** (`eval_sliding_multineedle_
+sanity_check.py`): identical far-block placement, window boundary, and
+T-iteration wiring, but WITHOUT the same-norm control (needle key at
+large magnitude, matching the style used throughout most of this
+session's earlier SlidingMonarchAttention work). Result: K=1 passes
+cleanly (cos=0.548), K=2/K=4 hold up reasonably, K=8 degrades (the
+expected capacity-ceiling pattern). **Confirms the probe mechanics are
+correct and the same-norm version's K=1 failure is real, specifically
+caused by removing the magnitude shortcut -- not a bug in the adapted
+script.**
+
+**Status: Sliding's founding correctness claim does not survive the
+same-norm control.** Its T-iteration-refined block representative
+relies on a magnitude shortcut to "find" a needle -- exactly the same
+artifact that killed all five untrained landmark mechanics tried for
+Meta. Under a fair test (needle indistinguishable from background by
+magnitude), Sliding cannot do single-needle retrieval from its far
+region at all. This disqualifies Sliding as a "leading production
+candidate" on the strength of its cost advantage alone -- the 8x cost
+win is moot if basic retrieval fails under realistic key-norm
+conditions. Files: `eval_sliding_multineedle_samenorm.py`,
+`eval_sliding_multineedle_sanity_check.py`. Sending this to Fable now.
+
+## Fable catches a real methodological gap: the K-sweep was single-trial, not statistically established
+
+**Fable's response**: first verified the same-norm control itself was
+correctly calibrated (BACKGROUND_NORM=2.0 at D=16 matches background
+keys' actual expected norm -- that part is solid). The real problem:
+`make_scene(seed=1, K=K)` used ONE seed per K value -- K=1's -0.2152 was
+a single trial, not an average, and K values weren't even independently
+comparable (directions/values drawn as separate list comprehensions, so
+the RNG stream diverges after the first draw -- K=1's needle isn't the
+same draw as K=2's first needle despite sharing a seed). The apparent
+K=1->K=2 non-monotonicity could be single-draw noise, not a real
+mechanism crossover. Recommended: rerun with 20-50 independent seeds
+per K, report mean/min/CI, before hand-tracing anything.
+
+**Ran it** (`eval_sliding_multineedle_samenorm_multiseed.py`, 30
+independent seeds per K, all recalls per scene included):
+
+| K | n | mean cos | +-1 SE | min | max | frac>0.5 |
+|---|---|---|---|---|---|---|
+| 1 | 30 | 0.2150 | 0.0414 | -0.44 | 0.71 | 7% |
+| 2 | 60 | 0.1886 | 0.0314 | -0.34 | 0.65 | 10% |
+| 4 | 120 | 0.1814 | 0.0233 | -0.48 | 0.68 | 10% |
+| 8 | 240 | 0.2023 | 0.0162 | -0.52 | 0.84 | 12% |
+
+**Materially different, less alarming finding than the single-trial
+run suggested.** Mean cos is POSITIVE across all K (~0.19-0.22, tight
+SE) -- the original -0.2152 was an unlucky single draw, exactly the
+"wide variance straddling zero" alternative Fable flagged as the
+less-alarming outcome. This is NOT systematic detection failure or
+anti-alignment. But it's also not good: mean cos ~0.2 is weak signal,
+and only 7-12% of trials clear the cos>0.5 "good recall" bar, roughly
+FLAT regardless of competition level (K=1 through K=8 all land in the
+same mediocre range -- no clear capacity-ceiling degradation pattern
+either). Files: `eval_sliding_multineedle_samenorm_multiseed.py`.
+
+**Status: corrected finding -- Sliding's far-region retrieval under
+same-norm control is chronically WEAK and UNRELIABLE (not a clean
+detection failure), a different and less dramatic problem than
+"collapse."** Still a real correctness concern (7-12% good-recall rate
+is far short of what a production attention mechanism needs), but the
+"systematic anti-alignment" framing from the single-trial result does
+not hold up. Sending this corrected picture to Fable.
+
+## Fable: don't conclude anything without a GT/Meta baseline on the same scenes -- and it's decisive
+
+**Fable's response**: cited the arc's own established practice from
+Sliding's ORIGINAL validation (JOURNAL line 412-419: "even ground truth
+degrades hard [at low signal]... rather than diverging negative") -- a
+weak absolute cosine number is uninterpretable without knowing the
+achievable ceiling at that signal strength. Two very different stories
+are consistent with "~0.2 mean cos": (a) Sliding leaves real signal on
+the table (GT scores much higher -> genuine defect) or (b) this exact
+scene is intrinsically hard even for exact attention (GT also lands
+near ~0.2 -> a harness finding, not a Sliding finding). Recommended
+running GT (exact dense attention) and Meta (threshold selection) on
+the IDENTICAL seeds/scenes before drawing any conclusion, and before
+the hand-trace.
+
+**Ran it** (`eval_sliding_multineedle_samenorm_gt_meta.py`, same
+generator/seeds/needle-placement/norm-control, all three mechanisms on
+every scene):
+
+| K | mech | n | mean cos | +-1 SE | min | max | frac>0.5 |
+|---|---|---|---|---|---|---|---|
+| 1 | GT | 30 | 0.8686 | 0.0082 | 0.7705 | 0.9458 | 1.00 |
+| 1 | Meta | 30 | 0.9207 | 0.0057 | 0.8367 | 0.9820 | 1.00 |
+| 1 | Sliding | 30 | 0.2150 | 0.0414 | -0.4383 | 0.7050 | 0.07 |
+| 2 | GT | 60 | 0.8619 | -- | -- | -- | 1.00 |
+| 2 | Meta | 60 | 0.9122 | -- | -- | -- | 1.00 |
+| 2 | Sliding | 60 | 0.1886 | -- | -- | -- | 0.10 |
+| 4 | GT | 120 | 0.8588 | -- | -- | -- | 1.00 |
+| 4 | Meta | 120 | 0.9119 | -- | -- | -- | 1.00 |
+| 4 | Sliding | 120 | 0.1814 | -- | -- | -- | 0.10 |
+| 8 | GT | 240 | 0.8592 | -- | -- | -- | 1.00 |
+| 8 | Meta | 240 | 0.9126 | -- | -- | -- | 1.00 |
+| 8 | Sliding | 240 | 0.2023 | -- | -- | -- | 0.12 |
+
+**Decisive: GT retrieves the needle cleanly and reliably at every K
+(mean ~0.86-0.87, 100% frac>0.5) -- the scene is NOT intrinsically
+hard.** Meta matches or slightly EXCEEDS GT (~0.91-0.92, also 100%
+frac>0.5). Sliding sits at ~0.18-0.22 with only 7-12% frac>0.5 -- a
+massive, reproducible gap against both baselines on the exact same
+scenes, not an artifact of scene difficulty. Files:
+`eval_sliding_multineedle_samenorm_gt_meta.py`.
+
+**Status: Sliding's disqualification is now confirmed on solid
+empirical footing** (not a single-trial artifact, not an ambiguous
+"maybe the scene is hard" explanation) -- its T-iteration-refined
+representative genuinely loses real, retrievable signal that both
+dense attention and threshold selection successfully capture. This ALSO
+empirically confirms the structural hypothesis about Meta: real-per-
+key-score selection does NOT inherit Sliding's weakness, matching or
+exceeding dense attention's own retrieval quality on the identical
+adversarial-norm scenes.
+
+## Closing polish: two cheap sweeps confirm the mechanism precisely
+
+**Fable's response**: production call doesn't change (Meta ships
+either way), but flagged one specific, cheap, testable hypothesis worth
+15 minutes before fully closing the entry: CROSS-BLOCK dilution, not
+just within-block. The far region isn't one block's representative vs.
+the window -- EVERY Monarch block strictly before the window
+contributes its own representative, all combined in ONE joint softmax
+(~31 competitors at QUERY_POS=256, B=8). A needle's signal gets diluted
+TWICE: once within its own block (Sinkhorn-averaged with background
+keys, pre-score), then again competing against every other purely-
+background far-block representative (post-score, already-diluted).
+Directly echoes Meta's own earlier cross-tier-accumulation finding, but
+Sliding is far more exposed since it dilutes PRE-score, not post-score.
+Proposed two sweeps: far-region-length (tests dilution-by-competition
+directly) and T-iteration budget (distinguishes "needs more compute"
+from "structural ceiling regardless of budget" -- matters given how
+much of this arc's effort went into T-iteration specifically).
+
+**Ran both** (`eval_sliding_dilution_sweeps.py`, K=1, 30 seeds/config):
+
+Sweep 1 (far-region length, T=3 fixed):
+| QUERY_POS | n_far_blocks | mean cos | frac>0.5 |
+|---|---|---|---|
+| 80 | 2 | 0.4307 | 0.40 |
+| 96 | 4 | 0.4126 | 0.43 |
+| 128 | 8 | 0.3702 | 0.27 |
+| 192 | 16 | 0.2958 | 0.10 |
+| 256 | 24 | 0.2661 | 0.10 |
+| 384 | 40 | 0.2242 | 0.07 |
+| 480 | 52 | 0.1872 | 0.10 |
+
+Clean, monotonic degradation as far-region grows -- confirms cross-
+block dilution as the dominant mechanism.
+
+Sweep 2 (T-iteration budget, QUERY_POS=256 fixed):
+| T | mean cos | frac>0.5 |
+|---|---|---|
+| 3 | 0.2661 | 0.10 |
+| 5 | 0.2661 | 0.10 |
+| 10 | 0.2661 | 0.10 |
+| 20 | 0.2661 | 0.10 |
+
+**Perfectly flat -- identical to four decimal places at every T.** Zero
+effect from additional refinement iterations. Confirms a STRUCTURAL
+ceiling, not an iteration-budget problem: no amount of T-iteration
+compute would ever have fixed Sliding at this configuration. Files:
+`eval_sliding_dilution_sweeps.py`.
+
+**Status: mechanism fully understood and confirmed.** Sliding's
+disqualification is precise, not just empirical: R=1 block-
+representative collapse, pre-score, competing against every other far
+block in one joint softmax, is a structural ceiling independent of
+refinement budget. The closing statement is "the R=1 block-
+representative design class is disqualified regardless of budget," not
+merely "Sliding as configured underperforms." Sending final results to
+Fable, plus a new question: is there an alternative way to build a
+"sliding" (window + far-region) Monarch-family mechanism that avoids
+this specific pre-score collapse-then-compete structure?
+
+## Fable's final answer: salvageable in principle, but the fix converges back to Meta -- category closed for production
+
+**Why the flat T-sweep is earned, not just observed**: T-iteration only
+ever refines representatives AGAINST OTHER REPRESENTATIVES under a
+block-triangular mask -- it never reaches back to raw per-key K/V
+content. Once a block's content is collapsed to one vector at
+construction time, no amount of representative-to-representative
+message-passing can recover information never carried into that vector
+in the first place. The flat-to-four-decimals result is exactly what
+this architecture predicts, not a surprising empirical fact needing its
+own explanation -- confirmation that the loss happens at CONSTRUCTION,
+and iteration downstream of construction is structurally incapable of
+fixing it. This is the precise justification for "regardless of
+refinement budget," now earned by the sweep rather than asserted.
+
+**Two separable defects were conflated in "Sliding fails"**:
+1. **Content-blind (pre-score) construction** -- the representative is
+   built without knowing what the query is looking for, so it's
+   whatever T-iteration's Sinkhorn dynamics converge to over the
+   block's random content, uncorrelated with any particular query's
+   needle. FIXABLE: build the representative AFTER computing real
+   per-key scores against the actual query (the scoring step Meta
+   already does) -- e.g. hard top-1 or a real-score-weighted average.
+2. **Collapse to exactly one candidate per block, however constructed**
+   -- the generic R=1 capacity ceiling already derived earlier in this
+   arc (line 871: "more than R genuinely-distinct simultaneous needles
+   in one block WILL collide"). Separate from defect 1, and NOT fixable
+   by better representative construction.
+
+**A genuinely new observation**: the K-sweep (K=1..8 needles in the
+SAME far block) never actually measured defect 2 in isolation -- it
+was flat at ~0.2 across all K because defect 1 was already flooring
+performance before defect 2 ever became the binding constraint. A
+real-score-fixed variant would, for the first time in this arc, let the
+true R=1 capacity ceiling be observed cleanly (expected: K=1 jumps to
+~GT/Meta level, K=2/4/8 show genuine monotonic degradation this time).
+Flagged as a real, cheap, well-motivated experiment -- but explicitly
+OPTIONAL, non-blocking, documentation-value only.
+
+**Does the fix rescue Sliding as a genuine alternative? No.** Fixing
+defect 1 properly just converges back to Meta's own construction
+principle (score first, decide what matters using real content, only
+THEN compress) applied one level coarser (collapse survivors to one
+representative per block instead of keeping them all, as Meta does).
+There's no way to fix defect 1 without reintroducing Meta's own
+machinery, and no way to fix defect 2 without abandoning the collapse
+-- which is Sliding's entire reason for existing. The fixed variant
+would be a strictly WORSE version of Meta: no path to beating Meta on
+quality (Meta has zero collapse-loss for survivors by design) and no
+cost advantage either (any real-score-gating step it needs is the same
+QK-scoring cost Meta already pays).
+
+**Status: "sliding window + far-region compression" is CLOSED as a
+production category, unconditionally.** Meta (shared-tau threshold
+selection, quickselect tau, exact-algebraic fast-residual, no
+T-iteration) remains the confirmed production recommendation on both
+correctness (matches/exceeds dense attention's own quality, including
+on the exact adversarial-norm scenes that break Sliding) and cost
+(honest ~1.22x wall-clock win over dense, hardware-measured on the real
+5500U). The real-score-fixed-representative variant is noted as an
+optional future experiment for isolating the R=1 capacity ceiling
+analytically derived at line 871 but never yet directly observed --
+standalone documentation value only, not gating, not a production path.
+This closes the Sliding-vs-Meta investigation.
+
+## Design-space closure check: is any other variant possible?
+
+Asked Fable directly whether the whole design space (not just Sliding)
+has been exhausted, given every mechanism ruled out in this arc shares
+one thing: untrained representative-construction heuristics.
+
+**R>1 real-score-gated representatives**: provably dominated by Meta,
+not just similar. Building even one query-aware representative requires
+real per-key QK scoring for the whole block first -- the expensive
+stage Meta already fully pays (ROOFLINE_5500U.md line 35). Collapsing
+scored candidates down to R representatives only touches the AV/softmax
+stage, which is already the CHEAP stage (~0.10-0.18x of dense, line
+36). Saves nothing on the bottleneck, adds risk on the stage that's
+already cheap.
+
+**Multi-scale block sizes with real scoring at every tier**: this isn't
+a variant to test, it IS Meta's own definition (Fenwick/binary-
+decomposition tiers + real per-key threshold selection at each tier,
+already built and shipping). No daylight to explore.
+
+**Cheap-prefilter-then-exact-attention**: same failure family one level
+up. Any signature cheap enough to avoid full per-key scoring is some
+kind of block summary (mean centroid, robust centroid, magnitude,
+FPS-style spread) -- every one tried independently in this arc diluted
+a strong outlier into a coarse aggregate and lost it before the query
+got a real look. Block-mean prefilter = bucket routing with a different
+backend (dead). Bounding-ball prefiltering = another cheap-signature
+family (dead, confirmed 0% prune rate). One genuinely UNTESTED specific
+mechanism: LSH-style hashing (per-key randomized-hyperplane sign, not
+block-pooling) -- technically distinct, never tried, but Fable predicts
+(lower confidence, genuinely untested) it fails the same same-norm
+control since it's still a proxy computed without seeing real
+query-key relevance -- structurally the same exclusion-cliff risk
+threshold selection was invented to eliminate at the very start of this
+arc. Burden of proof is now on any cheap-proxy scheme, given 4-5
+independent proxy families have all failed the identical control.
+
+**The one axis that's genuinely still open**: every mechanism ruled out
+used an UNTRAINED construction heuristic (k-means, magnitude, FPS,
+maxpool, random-reuse, Sinkhorn-refined single representative). This was
+a deliberate methodology choice for fast standalone iteration, flagged
+explicitly at the time (line 930-937: "a real trained model would have
+LEARNED landmark/pseudo-query parameters... this probe cannot speak to
+that version at all"). A TRAINED summarizer (gradient-optimized to
+produce a useful block representative, not reusing random content or an
+unweighted statistic) has never been tested here. Literature precedent
+noted in passing (line 1947, Landmark Attention) is that real published
+efficient-attention systems using this general shape of idea use
+trained landmarks, not untrained ones -- suggestive, not proof.
+"Compress before scoring" is NOT provably doomed as a category -- only
+the untrained-construction version actually tested here is.
+
+**Practical read: don't chase it.** Validating a trained-representative
+variant means an entirely different, much more expensive research arc
+(trainable summarizer module, real gradient training, generalization
+validation across real training data) -- disproportionate scope for a
+from-scratch single-developer CPU-target 1B model that already has a
+fully validated, real-hardware-measured, honest production candidate on
+the table. File the trained-representative axis explicitly as
+"genuinely open, deliberately unexplored by this arc's methodology,"
+NOT "ruled out" -- but it should not gate or delay shipping Meta. If
+ever worth revisiting, it's a training-loop co-design question for a
+later phase, not a next step in this standalone-probe arc.
+
+**Status: design-space exploration for standalone (untrained,
+probe-testable) MonarchAttention variants is COMPLETE.** Meta ships as
+the production recommendation. The only unexplored axis (trained
+representative construction) is out of scope for this arc by
+deliberate methodology, not oversight, and is documented as future
+work rather than a blocker. This closes the entire Fable-artifact-
+driven MetaMonarchAttention investigation, from the original Louver/
+threshold-selection synthesis through the Rust/AVX2 empirical
+validation phase.
+
+**User's call**: pursue the two flagged-as-open items (LSH-style
+per-key hashing prefilter, genuinely untested; trained representative
+construction, deliberately out of scope for this arc) as a follow-up
+phase AFTER Meta ships, not before. Consistent with Fable's own
+recommendation not to let either gate or delay the production
+recommendation already on the table.
+
+## Cleanup pass: promote quickselect to the crate's "meta" default, revise ROOFLINE_5500U.md
+
+Two loose ends flagged when asked "what's left": (1) `monarch-attn-kernel`'s
+"meta" entry point (profiler binary, verify binary, criterion bench) still
+defaulted to `TauMode::SortBased` -- the slower reference mode -- while the
+actual production-recommended Quickselect variant only existed as a separate
+`meta_quickselect` entry. (2) `ROOFLINE_5500U.md` still reflected the
+pre-quickselect-fix, pre-Sliding-disqualification picture: the stale ~1.5-1.7x
+headline, no mention of the sort-cost discovery, no mention of Sliding at all.
+
+**Fixed (1)**: swapped `profile.rs`/`benches/attention_bench.rs`'s "meta"
+entries to `TauMode::Quickselect`, renamed the reference-only sort-based
+entry to `meta_sortref` (kept for direct before/after comparison, not a
+recommendation). `verify.rs`'s correctness check deliberately LEFT on
+SortBased, since its job is comparing against the PyTorch ground truth
+reference specifically (which itself is sort-based) -- a different purpose
+from the production/profiling entries. Rebuilt, reran full test suite +
+release verify binary: all still pass, checksums identical between `meta`
+and `meta_sortref` confirming the rename didn't change behavior.
+
+**Fixed (2)**: substantial revision to `ROOFLINE_5500U.md`. Added a "Real
+hardware validation" section up front (before the analytical section) with
+the actual measured numbers: Meta initially falsified at 11.69s vs Causal's
+9.11s, the perf-record sort-cost discovery (~56% of cycles), the quickselect
+fix bringing it to a real ~1.22x win, and a full SlidingMonarchAttention
+subsection (7.7x faster than Meta, then disqualified on the same-norm needle
+probe, cross-block-dilution mechanism, structural-ceiling confirmation via
+the flat T-sweep). Relabeled the original analytical section as "superseded
+headline, kept for its derivation" rather than removing it -- it's still a
+correct and informative FLOP-counting result, just not the final wall-clock
+number. Corrected the τ-estimation table row, which had asserted reservoir
+sampling without ever building or measuring it (the actual gap that caused
+the whole falsification). Updated "Known limitations" to remove the
+now-stale "not measured on real hardware" caveat (most of the document now
+IS real hardware measurement) and added the design-space-closure and
+trained-representative-axis findings as documented future work. Fixed a
+typo (`n_kv_keads` -> `n_kv_heads`).
+
+**Status: both cleanup items complete.** `monarch-attn-kernel`'s "meta"
+now means what it should (the actual production recommendation), and
+`ROOFLINE_5500U.md` is internally consistent with the full validation
+history in this JOURNAL rather than frozen at the pre-hardware-check
+snapshot. This is the true final closing state of the Fable-artifact-driven
+MetaMonarchAttention investigation.
+
+## The stash, item 1: LSH-style per-key hashing prefilter -- tested, dead
+
+Per user direction, picking up the deferred design-space items (LSH-style
+hashing, trained representative construction) as their own follow-up work,
+independent of Jumping Seedling's model design (which is complete).
+
+**First pass** (`eval_lsh_prefilter_samenorm.py`): needle at a fixed
+position, query built maximally aligned with the needle's exact direction
+(same construction as every other same-norm probe in this arc), SimHash-
+style bucketing (sign of dot product against 8 random hyperplanes),
+Hamming-distance-gated survivor filter feeding real softmax over survivors.
+Result: 100% needle survival, mean cos 0.96-1.0 at every Hamming threshold
+tested -- APPEARED to contradict Fable's prediction that LSH would fail
+the same-norm control like every other cheap-proxy family.
+
+**Recognized this was the easiest possible case, not a fair test** (per
+this arc's own established discipline: bucket routing passed its natural
+case at 96.4% before failing 83% under adversarial construction -- a
+favorable natural-case result alone proves nothing). Query-maximally-
+aligned-with-needle is exactly the case LSH is BUILT to handle well
+(angular-similarity preservation). Built two harder tests before drawing
+any conclusion (`eval_lsh_prefilter_adversarial.py`):
+
+**Test 1 (boundary case)**: needle direction perturbed off the query
+direction by increasing amounts (0.0 to 0.5), simulating realistic
+imperfect correlation instead of artificial perfect alignment.
+
+| perturb | needle_survival | mean cos | frac>0.5 |
+|---|---|---|---|
+| 0.0 | 100.00% | 0.9844 | 1.00 |
+| 0.1 | 73.33% | 0.7332 | 0.73 |
+| 0.2 | 40.00% | 0.4102 | 0.40 |
+| 0.3 | 26.67% | 0.2575 | 0.27 |
+| 0.5 | 20.00% | 0.2094 | 0.20 |
+
+**A real, sharp exclusion cliff** -- survival rate collapses as soon as
+the needle isn't perfectly aligned with the query, tracking mean cosine
+almost exactly. This is the same failure mode Louver-style threshold
+selection was specifically invented to eliminate: LSH is a PROBABILISTIC
+proxy (can silently exclude a real needle before scoring), not a
+guaranteed-inclusion test.
+
+**Test 2 (adversarial decoy pressure)**: many same-hash-bucket decoys
+competing in the post-filter softmax.
+
+| n_decoys | needle_survival | mean cos | frac>0.5 |
+|---|---|---|---|
+| 0 | 100.00% | 0.9838 | 1.00 |
+| 5 | 100.00% | 0.7806 | 1.00 |
+| 20 | 100.00% | 0.5623 | 0.67 |
+| 50 | 100.00% | 0.4452 | 0.43 |
+
+Needle survives the FILTER 100% of the time even under heavy decoy
+pressure, but still loses the downstream softmax competition -- this is
+the ALREADY-KNOWN, already-accepted scoring-stage vulnerability (matches
+dense attention's own inherited ~90% adversarial ceiling), not a new
+LSH-specific problem. Test 1 is the decisive result; Test 2 just
+reconfirms the pre-existing, inherited-and-accepted finding.
+
+**Status: LSH-style per-key hashing prefilter CONFIRMED DEAD**, via a
+real exclusion cliff (Test 1), consistent with every other untrained
+cheap-proxy family already ruled out in this arc (k-means centroids,
+robust centroids, magnitude, FPS, bounding balls). Fable's prediction
+holds -- the natural-case-only result was misleading exactly as this
+arc's own discipline would predict it might be; the harder boundary test
+was necessary to see the real failure. Files:
+`eval_lsh_prefilter_samenorm.py`, `eval_lsh_prefilter_adversarial.py`.
+This closes item 1 of the stash. Item 2 (trained representative
+construction) remains genuinely open, out of scope for standalone-probe
+methodology per Fable's read -- a training-loop co-design question, not
+a next step here.
