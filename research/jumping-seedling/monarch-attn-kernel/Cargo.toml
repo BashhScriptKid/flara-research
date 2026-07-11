@@ -1,0 +1,29 @@
+[package]
+name = "monarch-attn-kernel"
+version = "0.1.0"
+edition = "2024"
+description = "Empirical Rust/AVX2 validation of Causal, Sliding, and Meta MonarchAttention against the analytical roofline model (see ../monarch-attn-causal/ROOFLINE_5500U.md). Standalone from Jumping Seedling."
+
+[lib]
+name = "monarch_attn_kernel"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "attention_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
