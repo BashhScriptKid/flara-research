@@ -12,7 +12,8 @@
 //! Exit code 0 = all checks passed, non-zero = at least one failed
 //! (prints which, and by how much) -- suitable for CI/script use.
 
-use monarch_attn_kernel::causal::dense_causal_attention;
+use monarch_attn_kernel::causal_monarch::{causal_monarch_attention, CausalMonarchConfig};
+use monarch_attn_kernel::dense::dense_causal_attention;
 use monarch_attn_kernel::meta::{monarch_meta_threshold_fast_residual, MetaConfig, TauMode};
 use monarch_attn_kernel::sliding::{sliding_monarch_causal, SlidingConfig};
 use monarch_attn_kernel::{AttnConfig, HeadTensor};
@@ -65,7 +66,20 @@ fn main() {
         let expected = read_f32(&testdata("causal_out_ref.bin"));
         let out = dense_causal_attention(&q, &k, &v, &cfg);
         let (d, idx) = max_abs_diff(&out.data, &expected);
-        check("causal (release build)", d, 1e-3, idx, &mut all_ok);
+        check("dense (release build)", d, 1e-3, idx, &mut all_ok);
+    }
+
+    // --- CausalMonarchAttention ---
+    {
+        let cfg = CausalMonarchConfig { head_dim: 16, n_heads: 2, block: 8, t: 3 };
+        let seq_len = 37;
+        let q = HeadTensor { data: read_f32(&testdata("causal_monarch_q.bin")), n_heads: cfg.n_heads, seq_len, head_dim: cfg.head_dim };
+        let k = HeadTensor { data: read_f32(&testdata("causal_monarch_k.bin")), n_heads: cfg.n_heads, seq_len, head_dim: cfg.head_dim };
+        let v = HeadTensor { data: read_f32(&testdata("causal_monarch_v.bin")), n_heads: cfg.n_heads, seq_len, head_dim: cfg.head_dim };
+        let expected = read_f32(&testdata("causal_monarch_out_ref.bin"));
+        let out = causal_monarch_attention(&q, &k, &v, &cfg);
+        let (d, idx) = max_abs_diff(&out.data, &expected);
+        check("causal_monarch (release build)", d, 1e-3, idx, &mut all_ok);
     }
 
     // --- Sliding ---

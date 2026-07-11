@@ -1,5 +1,5 @@
-//! Wall-clock benchmarks (criterion) comparing Causal, Sliding, and Meta
-//! MonarchAttention at the context lengths this project actually targets
+//! Wall-clock benchmarks (criterion) comparing Dense, CausalMonarch, Sliding,
+//! and Meta MonarchAttention at the context lengths this project actually targets
 //! (512/2048/8192, per RESEARCH_LOG.md's own full-attention-layer
 //! benchmarks, cited in ROOFLINE_5500U.md). This is the wall-clock half
 //! of the empirical check; `perf stat` against `src/bin/profile.rs`
@@ -8,7 +8,8 @@
 //! for -- see that binary's doc comment.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use monarch_attn_kernel::causal::dense_causal_attention;
+use monarch_attn_kernel::causal_monarch::{causal_monarch_attention, CausalMonarchConfig};
+use monarch_attn_kernel::dense::dense_causal_attention;
 use monarch_attn_kernel::meta::{monarch_meta_threshold_fast_residual, MetaConfig, TauMode};
 use monarch_attn_kernel::sliding::{sliding_monarch_causal, SlidingConfig};
 use monarch_attn_kernel::{AttnConfig, HeadTensor};
@@ -27,8 +28,8 @@ fn randn_tensor(n_heads: usize, seq_len: usize, head_dim: usize, seed: u64) -> H
 
 const SEQ_LENS: [usize; 3] = [512, 2048, 8192];
 
-fn bench_causal(c: &mut Criterion) {
-    let mut group = c.benchmark_group("causal");
+fn bench_dense(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dense");
     let cfg = AttnConfig::production(); // head_dim=64, n_q_heads=14, n_kv_heads=2 (GQA)
     for &seq_len in &SEQ_LENS {
         let q = randn_tensor(cfg.n_q_heads, seq_len, cfg.head_dim, 1);
@@ -36,6 +37,20 @@ fn bench_causal(c: &mut Criterion) {
         let v = randn_tensor(cfg.n_kv_heads, seq_len, cfg.head_dim, 3);
         group.bench_with_input(BenchmarkId::from_parameter(seq_len), &seq_len, |b, _| {
             b.iter(|| black_box(dense_causal_attention(black_box(&q), black_box(&k), black_box(&v), black_box(&cfg))));
+        });
+    }
+    group.finish();
+}
+
+fn bench_causal_monarch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("causal_monarch");
+    let cfg = CausalMonarchConfig { head_dim: 64, n_heads: 8, block: 64, t: 3 };
+    for &seq_len in &SEQ_LENS {
+        let q = randn_tensor(cfg.n_heads, seq_len, cfg.head_dim, 1);
+        let k = randn_tensor(cfg.n_heads, seq_len, cfg.head_dim, 2);
+        let v = randn_tensor(cfg.n_heads, seq_len, cfg.head_dim, 3);
+        group.bench_with_input(BenchmarkId::from_parameter(seq_len), &seq_len, |b, _| {
+            b.iter(|| black_box(causal_monarch_attention(black_box(&q), black_box(&k), black_box(&v), black_box(&cfg))));
         });
     }
     group.finish();
@@ -101,6 +116,6 @@ criterion_group! {
         .sample_size(10)
         .warm_up_time(std::time::Duration::from_secs(2))
         .measurement_time(std::time::Duration::from_secs(15));
-    targets = bench_causal, bench_sliding, bench_meta, bench_meta_sortref
+    targets = bench_dense, bench_causal_monarch, bench_sliding, bench_meta, bench_meta_sortref
 }
 criterion_main!(benches);

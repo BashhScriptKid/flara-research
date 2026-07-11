@@ -7,7 +7,8 @@
 //! is an analytical estimate against public 5500U specs, never measured on
 //! the actual chip -- this crate is the first real measurement.
 
-pub mod causal;
+pub mod causal_monarch;
+pub mod dense;
 pub mod meta;
 pub mod simd;
 pub mod sliding;

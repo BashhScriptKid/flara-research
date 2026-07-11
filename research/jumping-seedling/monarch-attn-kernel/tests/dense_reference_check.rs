@@ -4,7 +4,7 @@
 //! seq_len=37 (deliberately not block-aligned). Regenerate the reference
 //! vectors with `python export_reference_vectors.py` if this config changes.
 
-use monarch_attn_kernel::causal::dense_causal_attention;
+use monarch_attn_kernel::dense::dense_causal_attention;
 use monarch_attn_kernel::{AttnConfig, HeadTensor};
 use std::path::PathBuf;
 

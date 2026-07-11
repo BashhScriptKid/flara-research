@@ -8,9 +8,10 @@
 //! are comparable/sane-checkable, and so the compiler cannot prove the
 //! output is unused and dead-code-eliminate the whole computation.
 //!
-//! Usage: `profile <causal|sliding|meta> <seq_len> <iterations>`
+//! Usage: `profile <dense|sliding|meta> <seq_len> <iterations>`
 
-use monarch_attn_kernel::causal::dense_causal_attention;
+use monarch_attn_kernel::causal_monarch::{causal_monarch_attention, CausalMonarchConfig};
+use monarch_attn_kernel::dense::dense_causal_attention;
 use monarch_attn_kernel::meta::{monarch_meta_threshold_fast_residual, MetaConfig, TauMode};
 use monarch_attn_kernel::sliding::{sliding_monarch_causal, SlidingConfig};
 use monarch_attn_kernel::{AttnConfig, HeadTensor};
@@ -41,7 +42,7 @@ fn checksum(t: &HeadTensor) -> f64 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 4 {
-        eprintln!("usage: profile <causal|sliding|meta> <seq_len> <iterations>");
+        eprintln!("usage: profile <dense|sliding|meta> <seq_len> <iterations>");
         std::process::exit(2);
     }
     let kernel = &args[1];
@@ -52,13 +53,23 @@ fn main() {
     let start = Instant::now();
 
     match kernel.as_str() {
-        "causal" => {
+        "dense" => {
             let cfg = AttnConfig::production(); // head_dim=64, n_q_heads=14, n_kv_heads=2
             let q = randn_tensor(cfg.n_q_heads, seq_len, cfg.head_dim, 1);
             let k = randn_tensor(cfg.n_kv_heads, seq_len, cfg.head_dim, 2);
             let v = randn_tensor(cfg.n_kv_heads, seq_len, cfg.head_dim, 3);
             for _ in 0..iterations {
                 let out = dense_causal_attention(&q, &k, &v, &cfg);
+                total_checksum += checksum(&out);
+            }
+        }
+        "causal_monarch" => {
+            let cfg = CausalMonarchConfig { head_dim: 64, n_heads: 8, block: 64, t: 3 };
+            let q = randn_tensor(cfg.n_heads, seq_len, cfg.head_dim, 1);
+            let k = randn_tensor(cfg.n_heads, seq_len, cfg.head_dim, 2);
+            let v = randn_tensor(cfg.n_heads, seq_len, cfg.head_dim, 3);
+            for _ in 0..iterations {
+                let out = causal_monarch_attention(&q, &k, &v, &cfg);
                 total_checksum += checksum(&out);
             }
         }
@@ -105,7 +116,7 @@ fn main() {
             }
         }
         other => {
-            eprintln!("unknown kernel: {other} (expected causal|sliding|meta|meta_sortref)");
+            eprintln!("unknown kernel: {other} (expected dense|causal_monarch|sliding|meta|meta_sortref)");
             std::process::exit(2);
         }
     }
