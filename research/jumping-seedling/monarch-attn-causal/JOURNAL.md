@@ -3799,3 +3799,167 @@ This closes item 1 of the stash. Item 2 (trained representative
 construction) remains genuinely open, out of scope for standalone-probe
 methodology per Fable's read -- a training-loop co-design question, not
 a next step here.
+
+## Terminology correction: "Causal" meant CausalMonarchAttention, not dense -- new branch "monarchy"
+
+User clarified: earlier requests to test "Causal, Sliding, and Meta
+monarch" in Rust meant CausalMonarchAttention (`ma_causal_dual_opt.py`,
+the original Monarch-family causal-masking building block predating
+Sliding), not plain dense causal attention. Jumping Seedling's own
+model design is complete/frozen; this whole trained-representative +
+Rust-kernel-comparison track is independent follow-up research, on a
+new branch (`monarchy`, off `dev`, after committing all outstanding
+work: threshold-selection/roofline/Sliding-disqualification research
+and the standalone monarch-attn-kernel crate, in two commits).
+
+**Rust crate updated**: renamed the existing plain-attention kernel
+`causal` -> `dense` throughout (module, tests, profiler, verify binary,
+benches) -- kept as the ceiling/GT baseline, not replaced. Added a new,
+faithful Rust port of the actual CausalMonarchAttention algorithm
+(`src/causal_monarch.rs`): T-iteration-refined DUAL representatives per
+block -- `al_c` (causal-masked, used as a diagonal fast-path for a
+block's own causal self-attention) and `al_f` (full/non-causal, used
+for reuse by strictly later query blocks). Structurally different from
+Sliding: there is NO exact local window anywhere in this mechanism,
+even the query's own/diagonal block is compressed via `al_c`, never
+read directly. Cross-validated against the real PyTorch reference:
+passed on first attempt, max abs diff 2.62e-6. Wired into
+verify/profile/bench alongside dense/sliding/meta.
+
+## CausalMonarchAttention: same-norm probe confirms the suspicion, and it's worse than Sliding
+
+Flagged when reading the algorithm: since Sliding already failed the
+same-norm control despite having a REAL exact window to fall back on,
+CausalMonarchAttention (strictly less real-data access -- no exact
+region anywhere) should be expected to fail at least as badly, quite
+possibly worse. Verified directly rather than assumed
+(`eval_causal_monarch_samenorm.py`, 30 independent seeds from the
+start, GT + Meta on identical scenes as the fair baseline -- learned
+from the earlier single-trial mistake on Sliding).
+
+Two needle placements: FAR block (needle in an earlier block,
+retrieved via `al_f` -- same construction as the Sliding probe), and
+DIAGONAL/own-block (needle in the SAME block as the query, causally
+before it -- the easiest possible placement, since for Sliding this
+would have been a trivial win via its exact window).
+
+| Placement | GT | Meta | CausalMonarch |
+|---|---|---|---|
+| Far-block | mean=0.8837, frac>0.5=100% | mean=0.9312, frac>0.5=100% | mean=0.1533, frac>0.5=3.33% |
+| Diagonal/own-block | mean=0.8830, frac>0.5=100% | mean=0.9296, frac>0.5=100% | mean=0.2294, frac>0.5=10.00% |
+
+**Confirmed, decisively, on the first properly-powered (multi-seed)
+attempt: CausalMonarchAttention fails BOTH placements, including the
+easiest possible one.** Because it has no real exact-attention region
+anywhere -- even the query's own block goes through the causal-masked
+representative `al_c`, never real per-key data -- it cannot get the
+"free win" Sliding got from its local window. It is disqualified on the
+same grounds as Sliding (same-norm-controlled needle retrieval
+failure), but MORE thoroughly: Sliding at least worked within its
+window; CausalMonarchAttention has no region where it works at all.
+Files: `eval_causal_monarch_samenorm.py`.
+
+**Status: CausalMonarchAttention confirmed dead as a production
+candidate**, joining Sliding in the disqualified column. Meta remains
+the sole validated production recommendation. This closes the "Causal"
+terminology question empirically as well as definitionally -- whichever
+mechanism the user meant, the real per-key-scoring design (Meta) is the
+only one that survives.
+
+## Trained-landmark axis: closed, via kill criterion + independent corroboration
+
+Continuing the trained-representative thread (the genuinely-open axis
+flagged by the design-space-closure consult) with Fable's design-
+scrutiny sequencing. Step 1 (train-for-selection, listwise CE directly
+on block_scores, 3 seeds, RichLandmark architecture from v2): resolved
+objective-mismatch-vs-ceiling decisively -- CE-trained select_acc
+(37.11% mean, 3-seed spread 3.00%) landed within noise of the earlier
+soft-pooled-trained number (34.67%). Objective was never the
+bottleneck. Margin distribution (needle_score - max_other_score) was
+NEGATIVE on average at every seed (-0.46 to -0.50 at M=16) -- more than
+half of trials have the needle scoring below the best competing block
+even under direct margin-training. M-sweep confirmed Fable's order-
+statistic hypothesis almost exactly (margin falling smoothly from -0.05
+at M=8 to -2.00 at M=128, tracking predicted ~sqrt(2 ln M) noise-
+ceiling growth, curve shape identical regardless of training
+objective).
+
+**Kill criterion set explicitly BEFORE running step 2** (per Fable,
+required not optional): recovering >=80% of Meta's mean_cos must not
+require admitting >50% of blocks into real per-key scoring, or the
+mechanism has no economic case over Meta.
+
+Step 2 (threshold+residual read, replacing hard top-k): first attempt
+used a FIXED QUOTA (topk) -- PASSED the kill criterion easily (30%
+admit_frac recovered 84.5% of Meta's quality). But this was later
+self-caught as measuring the wrong thing: a fixed quota always admits
+exactly round(admit_frac*M) blocks regardless of actual score
+confidence, an implicit guarantee real Louver-style thresholding
+doesn't have. Rebuilt as a genuine tau threshold (first attempt used a
+per-query quantile of that SAME query's own scores -- caught via
+std_admit_frac=0.000 across every trial, revealing it was STILL
+rank-based in disguise; fixed by calibrating a FIXED, GLOBAL tau from
+the pooled cross-query score distribution, confirmed genuinely variable
+via std_admit_frac 0.15-0.42).
+
+**Under real thresholding, the kill criterion FAILS**: the 80%-of-Meta
+target (mean_cos>=0.7437) is only reached at tau=-2.0, requiring 61.73%
+average admission -- well past the 50% cap. Below 50% admission,
+mean_cos tops out around 0.65. The earlier "PASSES" result was
+purely an artifact of the fixed-quota's hidden guarantee.
+
+**Separately, FLOP accounting** (verified via direct arithmetic, not
+assumed): the RichLandmark forward pass (MLP + 4-head pooling) costs
+72x a real QK dot product per key (confirmed precisely, D-independent
+as predicted: ratio = 2*hidden). Non-amortized (landmark rebuilt fresh
+per query): 72x more expensive than Meta's entire QK-scoring stage --
+catastrophic, dead on arrival. Amortized (landmark built once per key,
+cached, reused by all future queries -- architecturally plausible,
+mirrors Meta's own precomputed-sum pattern, but UNVERIFIED for causal/
+streaming generation): would have been genuinely promising (~3x
+cheaper than Meta's QK stage at the fixed-quota's 30% admit rate) IF
+the accuracy result had held up -- moot once the real-threshold
+admission rate turned out to be ~62%, not 30%.
+
+**Verified before writing this up** (code check, not a re-run): the
+tau-threshold implementation already folds sub-threshold blocks into
+ONE residual aggregate (never drops them), matching Option (a)'s
+Louver-style design exactly -- the reported numbers are not an
+artificially pessimistic lower bound from a dropped-not-folded
+implementation bug.
+
+**Fable's closing call**: close the axis. Two independent failure lines
+now converge on the same conclusion via different mechanisms -- the
+negative-margin selection ceiling (from CE-training) and the real-tau
+admission-rate ceiling (61.73% needed vs 50% cap) -- making the
+unresolved amortization question moot (even in the best case, the
+mechanism still needs ~62% admission to hit the quality bar, already
+established as not a real win over reading everything). The five-
+redesign pattern (v1 -> v2 soft-pool -> hard-select quota -> hard-select
+CE-trained -> real-tau threshold), each reversing or substantially
+qualifying the last, is itself a signal to stop per the kill
+criterion's original purpose: preventing an "always slightly
+improvable" trained module from consuming indefinite scope.
+
+**Status: trained-landmark axis (RichLandmark architecture, D=16, this
+training/task setup) is CLOSED.** Fails the pre-committed kill
+criterion under genuine threshold selection, independently corroborated
+by a real capacity ceiling (negative selection margin under direct
+margin-training) and a catastrophic non-amortized FLOP cost whose
+best-case rescue wouldn't have mattered given the accuracy failure.
+This closes the loop the original design-space-closure consult opened:
+FIVE mechanisms now tested under trained-vs-untrained construction
+(bucket routing, Sliding, R-landmarks, CausalMonarchAttention, and now
+trained RichLandmark selection) all fail the same-norm control or its
+economic equivalent -- only Meta's real-per-key-scoring-before-
+exclusion design survives. Larger-D trained landmarks (D=16 might be a
+low-dimension artifact) remain filed as genuinely open, unexplored
+future work -- not pursued now, for the same proportionate-scope
+reasons as the original consult, and inheriting the same unresolved
+72x-per-key economics problem regardless of dimension. Files:
+`train_landmark_selection_objective.py`,
+`train_landmark_threshold_residual.py`,
+`train_landmark_tau_threshold.py`. This closes the entire "stash"
+(LSH-hashing: dead; trained representative construction: closed) and
+the whole Fable-artifact-driven MetaMonarchAttention investigation.
+Meta remains the sole, fully validated production recommendation.
