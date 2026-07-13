@@ -304,7 +304,17 @@ fn rank_sweep() {
 }
 
 fn train_to_target(nd: usize, rng: &mut Lcg, lr_coeff: f32, lr_atom: f32, steps: usize, target_fn: &dyn Fn(&[f32]) -> Vec<f32>) -> f32 {
-    let mut blk = Block::new(8, 8, nd, rng);
+    train_to_target_m(8, nd, rng, lr_coeff, lr_atom, steps, target_fn)
+}
+
+/// Same as `train_to_target`, generalized to an arbitrary block size `m`
+/// (m1=m2=m) instead of the fixed m=8 used throughout the original nd=4
+/// investigation -- needed to test whether the nd=4 dead spot is tied to
+/// this specific block size or appears at the analogous relative point
+/// (teacher_nd = m/2) for other block sizes too.
+#[allow(clippy::too_many_arguments)]
+fn train_to_target_m(m: usize, nd: usize, rng: &mut Lcg, lr_coeff: f32, lr_atom: f32, steps: usize, target_fn: &dyn Fn(&[f32]) -> Vec<f32>) -> f32 {
+    let mut blk = Block::new(m, m, nd, rng);
     let n = blk.n();
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
     let mut adam = Adam::new(&blk);
@@ -425,6 +435,46 @@ fn steps_sweep(nd: usize, steps_list: &[usize], seeds: u64) {
     println!();
 }
 
+/// Is the nd=4 dead spot tied to this specific block size (m=8), or does
+/// the analogous relative point (teacher_nd = m/2) show the same
+/// "matched capacity is stuck, even 2x overcapacity barely solves" pattern
+/// at OTHER block sizes too? For each m, tests teacher_nd=m/2 at three
+/// student points: matched (student_nd=teacher_nd), 2x overcapacity, and
+/// well over (4x), mirroring what m=8/nd=4 showed.
+fn block_size_sweep(ms: &[usize], seeds: u64) {
+    println!("block-size sweep: teacher_nd = m/2, student at 1x/2x/4x that, for each block size m ({seeds} seeds/point)");
+    println!(
+        "  {:>4}  {:>11}  {:>14}  {:>14}  {:>14}",
+        "m", "teacher_nd", "1x (matched)", "2x", "4x"
+    );
+    for &m in ms {
+        let tnd = (m / 2).max(1);
+        let points = [tnd, (2 * tnd).max(tnd + 1), (4 * tnd).max(tnd + 1)];
+        let mut cell = |snd: usize| -> String {
+            let mut errs = Vec::new();
+            for s in 0..seeds {
+                let mut trng = Lcg(0xF17 ^ (m as u64) ^ (tnd as u64) ^ (s << 8));
+                let teacher = Block::new(m, m, tnd, &mut trng);
+                let tf = |x: &[f32]| teacher.forward(x).out;
+                let e = train_to_target_m(
+                    m, snd, &mut Lcg(0xAAA ^ (m as u64) ^ (snd as u64) ^ (tnd as u64) ^ (s << 16)),
+                    5e-3, 5e-3, 8000, &tf,
+                );
+                errs.push(e);
+            }
+            let solved = errs.iter().filter(|&&e| e < 1e-3).count();
+            errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = errs[errs.len() / 2];
+            format!("{solved}/{seeds} ({median:.3})")
+        };
+        println!(
+            "  {m:>4}  {tnd:>11}  {:>14}  {:>14}  {:>14}",
+            cell(points[0]), cell(points[1]), cell(points[2])
+        );
+    }
+    println!();
+}
+
 fn add(a: &mut [f32], b: &[f32]) {
     for (x, y) in a.iter_mut().zip(b) {
         *x += y;
@@ -482,4 +532,7 @@ fn main() {
     decoupled_sweep(8, &[4, 6, 7, 8, 9, 10, 16], 12);
 
     steps_sweep(4, &[8000, 16000, 32000], 8);
+
+    println!("=== nd=4 dead-spot follow-up: is it tied to block size m=8? ===\n");
+    block_size_sweep(&[4, 6, 8, 12, 16], 8);
 }

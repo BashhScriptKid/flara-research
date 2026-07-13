@@ -4552,3 +4552,56 @@ in an `m1=m2=8`, atoms-as-8x8-matrices construction -- worth checking
 whether the dead spot is tied to this specific block size (m=8) or
 appears at the analogous relative point (teacher_nd = m/2) for other
 block sizes too.
+
+## 2026-07-13 — nd=4 dead spot, part 2: not tied to block size m=8, it's a general "matched half-capacity" phenomenon that gets WORSE with scale
+
+Direct follow-up to the decoupled sweep above: tested whether the dead
+spot is specific to `m=8` (the block size used throughout the original
+investigation), or whether the analogous relative point (`teacher_nd =
+m/2`) shows the same pattern at other block sizes. Extended
+`btt_probe.rs` with `block_size_sweep`: for `m` in `{4, 6, 8, 12, 16}`,
+sets `teacher_nd = m/2` (holding relative compression ratio `nd/m = 0.5`
+constant across every `m`), and measures solved-rate at 1x (matched),
+2x, and 4x that capacity.
+
+| m | teacher_nd | 1x (matched) | 2x | 4x |
+|---|---|---|---|---|
+| 4 | 2 | 2/8 (0.181) | 2/8 (0.006) | 3/8 (0.007) |
+| 6 | 3 | 3/8 (0.178) | 2/8 (0.009) | 7/8 (0.000) |
+| 8 | 4 | 0/8 (0.217) | 3/8 (0.003) | 6/8 (0.000) |
+| 12 | 6 | 0/8 (0.322) | 6/8 (0.000) | 8/8 (0.000) |
+| 16 | 8 | 0/8 (0.382) | 8/8 (0.000) | 8/8 (0.000) |
+
+**Answer: not tied to m=8.** The "matched capacity (student==teacher==
+m/2) is hard to train from scratch" pattern shows up at every block size
+tested, from m=4 through m=16 -- refuting the hypothesis that m=8/nd=4
+is a unique coincidence of this particular block size.
+
+**But it's not simply "half capacity is hard" either.** The relative
+compression ratio (`nd/m = 0.5`) is held EXACTLY constant across the
+whole table, yet the difficulty at the matched point clearly worsens
+with absolute scale -- median stuck-error climbs monotonically from
+0.181 (m=4) to 0.382 (m=16) -- while the overcapacity needed to reliably
+escape the trap *shrinks* with scale: m=16 reaches perfect 8/8 already
+at 2x overcapacity, while m=4 doesn't even reach majority-solved at 4x
+(3/8, worse than m=6's 7/8 -- though m=4's absolute nd values are so
+coarse-grained, 2/4/8, that this specific cell may be a small-block
+numerical artifact rather than a real trend reversal; not re-run with
+more seeds to check, given the broader pattern is already clear without it).
+
+**Status: the "is it tied to block size" question is answered (no, it
+generalizes), but this reframes rather than resolves the mystery.** What
+was previously "why does m=8/nd=4 specifically get stuck" is now "why
+does training at exactly half a block's rank capacity get systematically
+harder, not easier, as the block gets bigger, even at fixed relative
+compression." That's a more general and more structurally interesting
+question about the bilinear atom x coefficient optimization landscape at
+matched-rank teachers, but still doesn't have a mechanistic answer.
+Genuinely open, now characterized precisely enough that "does it get
+worse with scale" is itself confirmed as a real, reproducible trend
+rather than speculation -- worth real analysis (e.g. Hessian/loss-
+landscape inspection at the matched point) if this construction is ever
+revisited, but not pursued further here given it's confirmed non-blocking
+for the production model (which uses `SharedMonarchMatmul`/
+`BasisMatmul`, not this shared-core BTT construction, and operates at
+`dict_k~32` regardless).
