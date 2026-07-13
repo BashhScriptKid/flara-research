@@ -55,7 +55,7 @@ fn small_cfg(vocab: usize, full_attn: bool) -> ModelConfig {
     c.ffn_dim = 768;
     c.block = 64;
     c.n_active = 3;
-    c.dict_k = 8;
+    c.dict_k = std::env::var("DICT_K").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     c.kv_block = 64;
     c.window = 64;
     c.vocab = vocab;

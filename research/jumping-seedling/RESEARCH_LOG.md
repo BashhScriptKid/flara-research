@@ -4605,3 +4605,73 @@ revisited, but not pursued further here given it's confirmed non-blocking
 for the production model (which uses `SharedMonarchMatmul`/
 `BasisMatmul`, not this shared-core BTT construction, and operates at
 `dict_k~32` regardless).
+
+## 2026-07-13 — FFN compression-vs-loss tradeoff: measured, no sharp sweet spot, production's dict_k=32 sits mid-curve
+
+Last of the four open threads from earlier in the day. The original
+question: "How much does the circular-basis compression cost in loss
+vs. a dense FFN at matched params, and where does the compression
+dial's (`dict_k`) sweet spot land for the 8 MB L3?" The Monarch-vs-dense
+half was already answered (2026-07-01, "Dense baseline comparison" --
+Monarch beats a param-matched dense model by 0.062 nats at small scale
+by spending its compression budget on a wider hidden dim instead of a
+narrower stream). The `dict_k` sweet-spot half was never measured.
+
+Added a `DICT_K` env override to `train_small_lod.rs` (mirrors the
+existing `CKPT_TAG`/`TOTAL_STEPS` pattern) and ran the REAL production
+kernel path (`Model`/`AttnProj`/`Ffn`, `SharedMonarchMatmul` under the
+hood -- not `train_char.rs`'s standalone toy attention) at 7 `dict_k`
+values, same architecture (12 layers, hidden=256, byte-level vocab,
+3/12 full-attention split matching production's 24/96 ratio),
+2000 steps each (same `total_steps` across every point, so the cosine
+schedule is directly comparable), held-out CE on the same 200-window
+eval set:
+
+| dict_k | held-out CE | Δ from prior point |
+|---|---|---|
+| 2 | 1.9718 | -- |
+| 4 | 1.9448 | -0.027 |
+| 8 | 1.8524 | -0.092 |
+| 16 | 1.8208 | -0.032 |
+| 32 | 1.7637 | -0.057 |
+| 64 | 1.7333 | -0.030 |
+| 128 | 1.7018 | -0.032 |
+
+**No sharp sweet spot.** The naive expectation (diminishing returns,
+flattening toward a plateau) doesn't hold cleanly -- the 4->8 jump
+(-0.092) is the single LARGEST improvement in the whole sweep, bigger
+than 2->4, so the curve isn't even monotonically diminishing until past
+8. From `dict_k=32` onward it does settle into a slow, roughly CONSTANT
+~0.03 nat improvement per doubling (32->64: -0.030, 64->128: -0.032,
+nearly identical) -- a smooth log-linear decline, not a plateau. Quality
+is still improving, just slowly, all the way to 128; the sweep was not
+extended further given the diminishing-but-nonzero pattern was already
+clear and each additional point costs real wall-clock time.
+
+**What this means for production's actual `dict_k=32`:** it sits
+partway down a still-declining curve, not at a demonstrated optimum.
+Whether pushing higher is worth it is a storage-budget question (real
+coefficient storage scales roughly linearly with `dict_k`, so doubling
+it roughly doubles that footprint) traded against a real but small,
+steady ~0.03 nat/doubling gain -- not something this sweep alone can
+resolve without the actual L3 budget arithmetic (bytes available vs.
+bytes per `dict_k` unit at production `p*q*m` dims), which was not
+computed here.
+
+**Caveats:** small proxy config (hidden=256, 12 layers, byte-level
+vocab=128), not exact production shapes (hidden=896, ffn=3072,
+BPE vocab=32768) -- per `train_small_lod.rs`'s own documented caveat,
+quality-cost conclusions at this scale are not guaranteed to transfer
+1:1 to the full 1B model. Single training run per point (no seed
+averaging), 2000 steps (not fully converged against the 3000-step
+convention used elsewhere in this log) -- chosen for wall-clock budget,
+consistent across all 7 points so the comparison itself stays fair even
+if absolute numbers aren't final-converged values.
+
+**Status:** answers the question as far as it can be answered at this
+scale -- no cliff-edge sweet spot exists in `[2, 128]`; the choice of
+`dict_k=32` in production is a reasonable diminishing-returns compromise,
+not a proven optimum. Closes the last of the four open threads flagged
+earlier today (`MONARCH_CONTRACT`, AdaFactor frequency-domain, `nd=4`,
+and now this one) -- all four touched, three closed, one (`nd=4`)
+reframed into a more precise open question.
