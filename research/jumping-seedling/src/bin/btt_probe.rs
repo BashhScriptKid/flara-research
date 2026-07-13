@@ -366,6 +366,65 @@ fn overfit() {
     println!();
 }
 
+/// Decoupled sweep for the `nd=4` dead-spot anomaly (RESEARCH_LOG.md,
+/// 2026-06-27 "Gate (b) follow-up"): the original 12-seed sweep varied
+/// teacher rank and student capacity TOGETHER (both set by the same `nd`),
+/// confounding "student capacity" with "teacher's true rank" -- so a dead
+/// spot fixed at the literal value 4 is indistinguishable from a dead spot
+/// that tracks wherever student capacity equals teacher rank. This fixes the
+/// TEACHER at a specific rank and sweeps STUDENT capacity independently: if
+/// the over-parameterization hypothesis holds, the dead spot should move to
+/// track `student_nd == teacher_nd`, not stay pinned at 4.
+fn decoupled_sweep(teacher_nd: usize, student_nds: &[usize], seeds: u64) {
+    println!(
+        "decoupled sweep: teacher FIXED at nd={teacher_nd}, student nd swept independently ({seeds} seeds/point)"
+    );
+    println!("  {:>11}  {:>8}  {:>10}  {:>10}  {:>10}", "student_nd", "solved", "median", "best", "worst");
+    for &snd in student_nds {
+        let mut errs = Vec::new();
+        for s in 0..seeds {
+            let mut trng = Lcg(0xF17 ^ (teacher_nd as u64) ^ (s << 8));
+            let teacher = Block::new(8, 8, teacher_nd, &mut trng);
+            let tf = |x: &[f32]| teacher.forward(x).out;
+            let e = train_to_target(snd, &mut Lcg(0xAAA ^ (snd as u64) ^ (teacher_nd as u64) ^ (s << 16)), 5e-3, 5e-3, 8000, &tf);
+            errs.push(e);
+        }
+        errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let solved = errs.iter().filter(|&&e| e < 1e-3).count();
+        let median = errs[errs.len() / 2];
+        let marker = if snd == teacher_nd { " <- student==teacher" } else { "" };
+        println!(
+            "  {snd:>11}  {solved:>6}/{seeds}  {median:>10.4}  {:>10.4}  {:>10.4}{marker}",
+            errs[0], errs[errs.len() - 1]
+        );
+    }
+    println!();
+}
+
+/// Steps sweep at the known-anomalous student_nd == teacher_nd == 4 point:
+/// distinguishes "true local-minimum trap" (solved-rate stays low regardless
+/// of training length) from "just slow convergence" (solved-rate climbs with
+/// more steps).
+fn steps_sweep(nd: usize, steps_list: &[usize], seeds: u64) {
+    println!("steps sweep: same-family, student_nd=teacher_nd={nd} ({seeds} seeds/point)");
+    println!("  {:>7}  {:>8}  {:>10}  {:>10}  {:>10}", "steps", "solved", "median", "best", "worst");
+    for &steps in steps_list {
+        let mut errs = Vec::new();
+        for s in 0..seeds {
+            let mut trng = Lcg(0xF17 ^ (nd as u64) ^ (s << 8));
+            let teacher = Block::new(8, 8, nd, &mut trng);
+            let tf = |x: &[f32]| teacher.forward(x).out;
+            let e = train_to_target(nd, &mut Lcg(0xAAA ^ (nd as u64) ^ (steps as u64) ^ (s << 16)), 5e-3, 5e-3, steps, &tf);
+            errs.push(e);
+        }
+        errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let solved = errs.iter().filter(|&&e| e < 1e-3).count();
+        let median = errs[errs.len() / 2];
+        println!("  {steps:>7}  {solved:>6}/{seeds}  {median:>10.4}  {:>10.4}  {:>10.4}", errs[0], errs[errs.len() - 1]);
+    }
+    println!();
+}
+
 fn add(a: &mut [f32], b: &[f32]) {
     for (x, y) in a.iter_mut().zip(b) {
         *x += y;
@@ -411,4 +470,16 @@ fn main() {
     gradcheck();
     rank_sweep();
     overfit();
+
+    println!("=== nd=4 dead-spot follow-up: over-parameterization hypothesis ===\n");
+    // If the dead spot tracks student==teacher (not the literal value 4),
+    // it should show up as a dip at student_nd=4 here (teacher fixed at 4,
+    // matching the original anomaly) ...
+    decoupled_sweep(4, &[2, 3, 4, 5, 6, 8], 12);
+    // ... and shift to a dip at student_nd=8 here if the hypothesis holds
+    // (teacher fixed at 8 -- a rank the original sweep never isolated,
+    // since teacher and student nd were always the same number there).
+    decoupled_sweep(8, &[4, 6, 7, 8, 9, 10, 16], 12);
+
+    steps_sweep(4, &[8000, 16000, 32000], 8);
 }

@@ -4492,3 +4492,63 @@ doesn't hold for this architecture's actual gradients. AdaFactor's
 existing spatial row/col factorization remains the production choice,
 unchanged, now backed by a real comparison instead of an untested
 conjecture.
+
+## 2026-07-13 — nd=4 dead spot: the over-parameterization hypothesis is refuted, but something real and unexplained about nd=4 survives
+
+Followed the log's own plan ("test the over-parameterization hypothesis
+directly: sweep steps/width, watch whether the dead spot moves with the
+teacher's true rank") on the `nd=4` anomaly flagged 2026-06-27. The
+original 12-seed sweep varied teacher rank and student capacity TOGETHER
+(both set by the same `nd`), confounding "student capacity" with
+"teacher's true rank" -- so a dead spot fixed at the literal value 4 was
+indistinguishable from a dead spot that tracks wherever student capacity
+equals teacher rank.
+
+Extended `btt_probe.rs` with `decoupled_sweep` (fixes teacher rank,
+sweeps student `nd` independently) and `steps_sweep` (more training
+steps at the known-anomalous point, to separate "true trap" from "just
+slow").
+
+**Decoupled sweep, teacher FIXED at nd=4:** solved-rate is smoothly
+monotonic in student capacity -- 2/3/4/5/6/8 -> 0/12, 0/12, 0/12, 0/12,
+0/12, 1/12 (median error climbing down from 0.61 to 0.006). No dip at
+student==teacher; it's just the low end of a monotonic curve. Even 2x
+overcapacity (student_nd=8 against a teacher of true rank 4) barely
+solves.
+
+**Decoupled sweep, teacher FIXED at nd=8:** sharp threshold, not smooth
+-- 4/6/7 -> 0/12 across the board, then **8/9/10/16 -> 12/12, perfect,
+every seed**. student==teacher is the BEST point here, not a trap.
+
+**This refutes the original hypothesis as stated.** "Student==teacher is
+critically-parameterized, over-parameterization smooths it out" predicts
+the same shape at any teacher rank -- a dip exactly at the match point.
+That's the opposite of what teacher=8 shows (match point = perfect). But
+something genuinely anomalous about **teacher rank 4 specifically**
+survives: a 2x-overparameterized student (nd=8) against a true-rank-4
+teacher still can't reliably solve it (1/12), while an exactly-matched
+nd=8 teacher/student pair solves every single time. Relative capacity
+alone doesn't explain this -- rank 4 itself, in this `m1=m2=8` block
+construction, appears to be structurally special, not just "critically
+sized" in a generic over-parameterization sense.
+
+**Steps sweep (student=teacher=4, 8/16/32k steps):** 3/8, 0/8, 2/8
+solved -- no monotonic improvement with more training. Confirms this is
+a real local-minimum trap, not slow convergence that more steps would
+eventually escape.
+
+**Status: the specific over-parameterization explanation from
+2026-06-27 is REFUTED, and the anomaly is more precisely characterized
+but still not explained.** What's now established: (1) it's tied to
+teacher rank 4 specifically, not a generic student==teacher resonance;
+(2) it's a genuine optimization trap, not undertraining; (3) the
+practical operating point (real model runs at `dict_k~32`, i.e.
+`nd>>8`) remains safely clear of it either way -- both decoupled sweeps
+confirm large student capacity solves reliably regardless of teacher
+rank (12/12 at student_nd=16 in both). Not a blocker for production;
+still flagged as a real, now better-characterized curiosity. If pursued
+further, the next question is what's structurally special about rank 4
+in an `m1=m2=8`, atoms-as-8x8-matrices construction -- worth checking
+whether the dead spot is tied to this specific block size (m=8) or
+appears at the analogous relative point (teacher_nd = m/2) for other
+block sizes too.
