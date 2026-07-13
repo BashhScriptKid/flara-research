@@ -4409,3 +4409,24 @@ check at session start is not enough -- should have diffed against the
 last commit before trusting the working tree as "current production,"
 especially before spending an entire session's worth of profiling work
 on it.**
+
+**Small follow-up, same session:** re-checked the 2026-07-05 review's
+`MONARCH_CONTRACT` "unexamined serial path" flag against the real,
+restored codebase -- it's already parallelized via rayon at production
+scale (`contract_all_blocks`'s `n_blocks = p*q = 672` for the FFN
+projections, well above `CONTRACT_PARALLEL_THRESHOLD=8`). Not a live gap;
+closing the flag rather than leaving it open.
+
+**Attempted and reverted, same session:** tried flipping `INT16_MATMUL`
+from opt-in to opt-out (default on, disable via `INT16_MATMUL=0`), on the
+assumption that the arc's "zero regression, 116/116 tests" claim meant
+this was safe. It wasn't -- 3 tests failed
+(`backward_batch_matches_summed_looped_backward`,
+`routed_batch_matches_looped_forward_rows_and_cols`,
+`layer_backward_d_hidden_gradchecks`), almost certainly at non-`m=8`
+block shapes (the int16 dual-token path is gated to `m==8` only) that the
+original validation never exercised under the flag turned on by default.
+The "zero regression" claim was validated via explicit `INT16_MATMUL=1`
+test runs, not by changing the static default -- conflating the two was
+the mistake. Reverted immediately; confirmed 116/116 green again. Stays
+opt-in.
