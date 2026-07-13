@@ -4430,3 +4430,65 @@ The "zero regression" claim was validated via explicit `INT16_MATMUL=1`
 test runs, not by changing the static default -- conflating the two was
 the mistake. Reverted immediately; confirmed 116/116 green again. Stays
 opt-in.
+
+## 2026-07-13 — AdaFactor frequency-domain second moment: closed, the energy-compaction intuition is wrong for these gradients
+
+Tested the open design question flagged early in this log: "Does the
+frequency-domain second moment actually beat the spatial factorization,
+or is the energy-compaction intuition wrong for *gradients* (as opposed
+to weights/activations)?" -- never attempted until now.
+
+Built a standalone probe (`src/bin/adafactor_fft_probe.rs`) that runs one
+real forward+backward pass of the actual production model (96 layers,
+hidden 896, seq=64 for speed -- per-layer weight/gradient shapes are
+seq-independent), extracts real gradient tensors at their real optimizer
+shapes (`(2*p*q*m, nd)` per `AttnProj::opt_shape`), and measures the
+relative Frobenius reconstruction error of AdaFactor's exact row/col
+rank-1 factorization -- applied both to `G^2` directly (the current
+spatial-domain formula) and to `|FFT2(G)|^2` (the power spectrum, via a
+separable 2D DFT over the same matrix). Deliberately did NOT attempt to
+design a working optimizer variant (inverting a frequency-domain estimate
+back to a valid per-element second moment is a separate, harder design
+problem) -- this only tests the premise first.
+
+Five real gradient tensors tested: `wq`, `wo` (Q/O projections, Full
+attention layer 0), `ffn_up`, `ffn_down` (FFN projections, same layer),
+and `wq` again on a Sliding-attention layer, as a second structurally-
+different data point.
+
+**Result: near-total rank-1 misfit in BOTH domains, with no meaningful
+difference between them.**
+
+| Tensor | shape | spatial_err | freq_err | freq/spatial |
+|---|---|---|---|---|
+| wq | 3136x32 | 0.9999 | 0.9998 | 1.000 |
+| wo | 3136x32 | 0.9999 | 0.9998 | 1.000 |
+| ffn_up | 10752x32 | 1.0000 | 1.0000 | 1.000 |
+| ffn_down | 10752x32 | 1.0000 | 0.9999 | 1.000 |
+| wq (sliding) | 3136x32 | 0.9999 | 0.9998 | 1.000 |
+
+Not a probe bug: the same row/col rank-1 formula is independently
+verified elsewhere in the test suite
+(`optimizer::tests::factored_reconstructs_separable_second_moment`) to
+correctly return ~0 error on genuinely separable synthetic data. The
+near-1.0 numbers here are real -- these actual Monarch-coefficient
+gradient tensors are almost completely non-row/col-separable, and an FFT
+doesn't help: by Parseval's theorem the power spectrum conserves total
+energy, and empirically it's just as poorly row/col-separable as `G^2`
+itself. The energy-compaction intuition (true for many weight/activation
+tensors, which tend to have smooth, structured, low-frequency-dominated
+content) does not transfer to these gradients, which are apparently
+noise-like enough in the row/col sense that no cheap linear transform
+fixes it.
+
+**Caveat:** single seed, single step, seq=64 -- not a multi-seed
+statistical study. Not repeated because the effect size is not
+borderline (0.9999 vs 0.9998 across 5/5 tensors, not a mix of results
+that could plausibly flip with more trials).
+
+**Status: CLOSED.** Frequency-domain second moment is not worth
+building as an optimizer variant -- the premise it would be built on
+doesn't hold for this architecture's actual gradients. AdaFactor's
+existing spatial row/col factorization remains the production choice,
+unchanged, now backed by a real comparison instead of an untested
+conjecture.
