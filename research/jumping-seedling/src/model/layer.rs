@@ -15,14 +15,15 @@
 use crate::kernels::attn_flash::FlashAttention;
 use crate::kernels::attn_swa::SlidingWindowAttention;
 use crate::kernels::attn_tma::TmaAttention;
-use crate::kernels::ffn::{Ffn, FfnForward, FfnOptState};
+use crate::kernels::ffn::{Ffn, FfnForwardBatch, FfnOptState};
+use crate::kernels::monarch::FwdCache;
 use crate::kernels::norm;
+use crate::kernels::profiling::{self, Timer};
 use crate::kernels::optimizer::{AdaFactor, AdaFactorState};
 use crate::kernels::probe::ExitProbe;
 use crate::kernels::rope::Rope;
 use crate::model::attn_proj::AttnProj;
 use crate::model::config::{AttnKind, ModelConfig};
-use rustfft::num_complex::Complex32;
 
 enum AttnRunner {
     Full(FlashAttention),
@@ -88,20 +89,48 @@ pub struct LayerForward {
     pub normed2: Vec<f32>,
     /// FFN-norm reciprocal-RMS per token, `T`.
     pub rinv2: Vec<f32>,
-    /// Per-token FFN forward caches.
-    pub ffn_fwds: Vec<FfnForward>,
+    /// Batched FFN forward cache (all `t_len` tokens' routing/caches).
+    pub ffn_fwds: FfnForwardBatch,
     /// Per-token early-exit probability, length `T`.
     pub probe_p: Vec<f32>,
+    /// Batched Monarch forward caches for the four attention projections —
+    /// needed by `backward` since (unlike the old BasisMatmul path) Monarch's
+    /// gradient needs the post-stage-1 intermediate, not just `x`.
+    pub wq_fc: FwdCache,
+    pub wk_fc: FwdCache,
+    pub wv_fc: FwdCache,
+    pub wo_fc: FwdCache,
+}
+
+impl LayerForward {
+    /// Return every `BufPool`-sourced buffer this holds (the four attention
+    /// `zs` caches plus the FFN's, via `FfnForwardBatch::discard_into_pool`)
+    /// for reuse, when this `LayerForward` is being discarded without ever
+    /// reaching `TransformerLayer::backward` (which would otherwise be the
+    /// one to give them back) -- activation checkpointing's throwaway
+    /// initial forward pass (see `Model::forward`) only needs a handful of
+    /// cheap fields out of this, not the full cache.
+    pub fn discard_into_pool(self, pool: &mut crate::kernels::scratch::BufPool) {
+        pool.give_f16(self.wq_fc.zs);
+        pool.give_f16(self.wk_fc.zs);
+        pool.give_f16(self.wv_fc.zs);
+        pool.give_f16(self.wo_fc.zs);
+        self.ffn_fwds.discard_into_pool(pool);
+    }
 }
 
 /// Gradients for one layer. `d_hidden` flows to the layer below; the rest are
-/// parameter grads. `d_dict` is the shared-`G` contribution summed across all
-/// four projections and the FFN (empty arms — the dense projection path — add
-/// nothing). Probe grads are populated only when an upstream probe gradient is
-/// supplied; the probe is gradient-stopped, so it never touches `d_hidden`.
+/// parameter grads. Probe grads are populated only when an upstream probe
+/// gradient is supplied; the probe is gradient-stopped, so it never touches
+/// `d_hidden`.
 pub struct LayerGrads {
     pub d_hidden: Vec<f32>,
-    pub d_dict: Vec<Complex32>,
+    /// Shared Monarch attention dictionary contribution, summed across wq/wk/wv/wo.
+    pub d_mono_d1: Vec<f32>,
+    pub d_mono_d2: Vec<f32>,
+    /// Shared Monarch FFN dictionary contribution, summed across up/gate/down.
+    pub d_ffn_mono_d1: Vec<f32>,
+    pub d_ffn_mono_d2: Vec<f32>,
     pub d_attn_norm_gain: Vec<f32>,
     pub d_ffn_norm_gain: Vec<f32>,
     pub d_wq: Vec<f32>,
@@ -187,18 +216,9 @@ fn add_f(acc: &mut Vec<f32>, src: &[f32]) {
     }
 }
 
-fn add_c(acc: &mut Vec<Complex32>, src: &[Complex32]) {
-    if acc.is_empty() {
-        acc.extend_from_slice(src);
-    } else {
-        for (a, b) in acc.iter_mut().zip(src) {
-            *a += *b;
-        }
-    }
-}
-
 /// A single transformer layer. Owns its projections, FFN, norms and probe; the
-/// dictionary `G` is shared and supplied to [`forward`](TransformerLayer::forward).
+/// shared Monarch dictionaries (attention and FFN, separate) are supplied to
+/// [`forward`](TransformerLayer::forward).
 pub struct TransformerLayer {
     cfg: ModelConfig,
     kind: AttnKind,
@@ -241,9 +261,9 @@ impl TransformerLayer {
             wk: self.wk.params().to_vec(),
             wv: self.wv.params().to_vec(),
             wo: self.wo.params().to_vec(),
-            up_coeffs: self.ffn.up_coeffs.clone(),
-            gate_coeffs: self.ffn.gate_coeffs.clone(),
-            down_coeffs: self.ffn.down_coeffs.clone(),
+            up_coeffs: self.ffn.up_coeffs(),
+            gate_coeffs: self.ffn.gate_coeffs(),
+            down_coeffs: self.ffn.down_coeffs(),
             router_w: self.ffn.router_w.clone(),
             probe_w: self.probe.w.clone(),
             probe_bias: self.probe.bias,
@@ -258,9 +278,9 @@ impl TransformerLayer {
         self.wk.set_params(&c.wk);
         self.wv.set_params(&c.wv);
         self.wo.set_params(&c.wo);
-        self.ffn.up_coeffs.copy_from_slice(&c.up_coeffs);
-        self.ffn.gate_coeffs.copy_from_slice(&c.gate_coeffs);
-        self.ffn.down_coeffs.copy_from_slice(&c.down_coeffs);
+        self.ffn.set_up_coeffs(&c.up_coeffs);
+        self.ffn.set_gate_coeffs(&c.gate_coeffs);
+        self.ffn.set_down_coeffs(&c.down_coeffs);
         self.ffn.router_w.copy_from_slice(&c.router_w);
         self.probe.w.copy_from_slice(&c.probe_w);
         self.probe.bias = c.probe_bias;
@@ -319,13 +339,19 @@ impl TransformerLayer {
     }
 
     /// Forward over a sequence of `t_len` tokens. `hidden` is `[T, H]` row-major;
-    /// `dict` is the shared `G`; `rope` is the shared rotary table.
+    /// `mono_d1`/`mono_d2` is the shared real Monarch dictionary for the
+    /// attention projections; `ffn_d1`/`ffn_d2` is the FFN's own (separate)
+    /// shared Monarch dictionary; `rope` is the shared rotary table.
     pub fn forward(
         &self,
-        dict: &[Complex32],
+        mono_d1: &[f32],
+        mono_d2: &[f32],
+        ffn_d1: &[f32],
+        ffn_d2: &[f32],
         rope: &Rope,
         hidden: &[f32],
         t_len: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> LayerForward {
         let cfg = &self.cfg;
         let (h, qd, kvd, hd) = (cfg.hidden, cfg.q_dim(), cfg.kv_dim(), cfg.head_dim);
@@ -340,16 +366,25 @@ impl TransformerLayer {
         let mut v = vec![0.0f32; t_len * kvd];
         let mut probe_p = vec![0.0f32; t_len];
 
-        for ti in 0..t_len {
-            let hin = &hidden[ti * h..(ti + 1) * h];
-            let nrm = &mut normed[ti * h..(ti + 1) * h];
-            rinv[ti] = norm::forward(hin, &self.attn_norm_gain, cfg.norm_eps, nrm);
-            probe_p[ti] = self.probe.forward(nrm);
+        {
+            let _t = Timer::start(&profiling::NORM_FWD);
+            for ti in 0..t_len {
+                let hin = &hidden[ti * h..(ti + 1) * h];
+                let nrm = &mut normed[ti * h..(ti + 1) * h];
+                rinv[ti] = norm::forward(hin, &self.attn_norm_gain, cfg.norm_eps, nrm);
+                probe_p[ti] = self.probe.forward(nrm);
+            }
         }
 
-        self.wq.forward_batch(dict, &normed, &mut q, t_len);
-        self.wk.forward_batch(dict, &normed, &mut k, t_len);
-        self.wv.forward_batch(dict, &normed, &mut v, t_len);
+        let wq_fc;
+        let wk_fc;
+        let wv_fc;
+        {
+            let _t = Timer::start(&profiling::QKV_FWD);
+            wq_fc = self.wq.forward_batch(mono_d1, mono_d2, &normed, &mut q, t_len, pool);
+            wk_fc = self.wk.forward_batch(mono_d1, mono_d2, &normed, &mut k, t_len, pool);
+            wv_fc = self.wv.forward_batch(mono_d1, mono_d2, &normed, &mut v, t_len, pool);
+        }
 
         for ti in 0..t_len {
             for head in 0..cfg.n_q_heads {
@@ -361,11 +396,17 @@ impl TransformerLayer {
         }
 
         let mut attn_out = vec![0.0f32; t_len * qd];
-        let lse = self.attn.forward(&q, &k, &v, &mut attn_out);
+        let lse = {
+            let _t = Timer::start(&profiling::ATTN_CORE_FWD);
+            self.attn.forward(&q, &k, &v, &mut attn_out)
+        };
 
         let mut h_mid = hidden.to_vec();
         let mut o_proj = vec![0.0f32; t_len * qd];
-        self.wo.forward_batch(dict, &attn_out, &mut o_proj, t_len);
+        let wo_fc = {
+            let _t = Timer::start(&profiling::WO_FWD);
+            self.wo.forward_batch(mono_d1, mono_d2, &attn_out, &mut o_proj, t_len, pool)
+        };
         for ti in 0..t_len {
             let oi = &o_proj[ti * qd..(ti + 1) * qd];
             let dst = &mut h_mid[ti * h..(ti + 1) * h];
@@ -375,22 +416,37 @@ impl TransformerLayer {
         }
 
         // --- FFN sub-block ---
+        // Batched: reconstructs each up/gate/down weight block once and
+        // reuses it across every token's routed subset (see
+        // SharedMonarchProj::forward_rows_batch/forward_cols_batch), instead
+        // of the old per-token compute() loop, which paid reconstruction
+        // once per token regardless of routing.
         let mut normed2 = vec![0.0f32; t_len * h];
         let mut rinv2 = vec![0.0f32; t_len];
-        let mut out = h_mid.clone();
-        let mut ffn_fwds = Vec::with_capacity(t_len);
+        {
+            let _t = Timer::start(&profiling::NORM_FWD);
+            for ti in 0..t_len {
+                let hin = &h_mid[ti * h..(ti + 1) * h];
+                let nrm = &mut normed2[ti * h..(ti + 1) * h];
+                rinv2[ti] = norm::forward(hin, &self.ffn_norm_gain, cfg.norm_eps, nrm);
+            }
+        }
+        let sels = {
+            let _t = Timer::start(&profiling::FFN_SELECT);
+            self.ffn.select_batch(&normed2, t_len)
+        };
+        let ffn_fwds = {
+            let _t = Timer::start(&profiling::FFN_FWD);
+            self.ffn.compute_batch(ffn_d1, ffn_d2, &normed2, &sels, t_len, pool)
+        };
+        let mut out = vec![0.0f32; t_len * h];
         for ti in 0..t_len {
-            let hin = &h_mid[ti * h..(ti + 1) * h];
-            let nrm = &mut normed2[ti * h..(ti + 1) * h];
-            rinv2[ti] = norm::forward(hin, &self.ffn_norm_gain, cfg.norm_eps, nrm);
-            let sel = self.ffn.select(nrm);
-            self.ffn.prefetch_coeffs(&sel);
-            let fwd = self.ffn.compute(dict, nrm, sel);
+            let src = &h_mid[ti * h..(ti + 1) * h];
+            let ffn = &ffn_fwds.out[ti * h..(ti + 1) * h];
             let dst = &mut out[ti * h..(ti + 1) * h];
             for j in 0..h {
-                dst[j] += scale * fwd.out[j];
+                dst[j] = src[j] + scale * ffn[j];
             }
-            ffn_fwds.push(fwd);
         }
 
         LayerForward {
@@ -407,6 +463,10 @@ impl TransformerLayer {
             rinv2,
             ffn_fwds,
             probe_p,
+            wq_fc,
+            wk_fc,
+            wv_fc,
+            wo_fc,
         }
     }
 
@@ -417,13 +477,17 @@ impl TransformerLayer {
     /// not contribute to `d_hidden`. Returns the full gradient bundle.
     pub fn backward(
         &self,
-        dict: &[Complex32],
+        mono_d1: &[f32],
+        mono_d2: &[f32],
+        ffn_d1: &[f32],
+        ffn_d2: &[f32],
         rope: &Rope,
         hidden: &[f32],
-        fwd: &LayerForward,
+        fwd: LayerForward,
         d_out: &[f32],
         d_probe_p: Option<&[f32]>,
         t_len: usize,
+        pool: &mut crate::kernels::scratch::BufPool,
     ) -> LayerGrads {
         let cfg = &self.cfg;
         let (h, qd, kvd, hd) = (cfg.hidden, cfg.q_dim(), cfg.kv_dim(), cfg.head_dim);
@@ -432,7 +496,10 @@ impl TransformerLayer {
 
         let mut g = LayerGrads {
             d_hidden: vec![0.0; t_len * h],
-            d_dict: Vec::new(),
+            d_mono_d1: Vec::new(),
+            d_mono_d2: Vec::new(),
+            d_ffn_mono_d1: Vec::new(),
+            d_ffn_mono_d2: Vec::new(),
             d_attn_norm_gain: Vec::new(),
             d_ffn_norm_gain: Vec::new(),
             d_wq: Vec::new(),
@@ -448,56 +515,73 @@ impl TransformerLayer {
         };
 
         // ---- FFN sub-block (last in forward ⇒ first in backward) ----
-        // out = h_mid + scale·ffn(normed2(h_mid)).
-        let mut d_h_mid = vec![0.0f32; t_len * h];
-        for ti in 0..t_len {
-            let mut d_ffn_out = vec![0.0f32; h];
-            for j in 0..h {
-                d_h_mid[ti * h + j] = d_out[ti * h + j]; // identity residual
-                d_ffn_out[j] = scale * d_out[ti * h + j];
-            }
-            let fg = self.ffn.backward(
-                dict,
-                &fwd.normed2[ti * h..(ti + 1) * h],
-                &fwd.ffn_fwds[ti],
-                &d_ffn_out,
-            );
-            add_f(&mut g.d_up_coeffs, &fg.d_up_coeffs);
-            add_f(&mut g.d_gate_coeffs, &fg.d_gate_coeffs);
-            add_f(&mut g.d_down_coeffs, &fg.d_down_coeffs);
-            add_f(&mut g.d_router_w, &fg.d_router_w);
-            add_c(&mut g.d_dict, &fg.d_dict);
+        // out = h_mid + scale·ffn(normed2(h_mid)). Batched: reconstructs each
+        // weight block once and reuses it across every token's routed subset
+        // (see SharedMonarchProj::backward_rows_batch/backward_cols_batch),
+        // instead of the old per-token collect+merge loop. norm::backward is
+        // per-token and nonlinear (can't be hoisted the same way), so it
+        // stays in a collect+merge loop — but now it's the only thing left in it.
+        let mut d_ffn_out = vec![0.0f32; t_len * h];
+        for i in 0..t_len * h {
+            d_ffn_out[i] = scale * d_out[i];
+        }
+        let fg = {
+            let _t = Timer::start(&profiling::FFN_BWD);
+            self.ffn.backward_batch(ffn_d1, ffn_d2, &fwd.normed2, fwd.ffn_fwds, &d_ffn_out, t_len, pool)
+        };
+        add_f(&mut g.d_up_coeffs, &fg.d_up_coeffs);
+        add_f(&mut g.d_gate_coeffs, &fg.d_gate_coeffs);
+        add_f(&mut g.d_down_coeffs, &fg.d_down_coeffs);
+        add_f(&mut g.d_router_w, &fg.d_router_w);
+        add_f(&mut g.d_ffn_mono_d1, &fg.d_mono_d1);
+        add_f(&mut g.d_ffn_mono_d2, &fg.d_mono_d2);
 
-            // FFN-norm backward folds the FFN-input grad back into the residual.
-            let mut dx = vec![0.0f32; h];
-            let mut dg = vec![0.0f32; h];
-            norm::backward(
-                &fwd.h_mid[ti * h..(ti + 1) * h],
-                &self.ffn_norm_gain,
-                &fg.d_h,
-                fwd.rinv2[ti],
-                &mut dx,
-                &mut dg,
-            );
+        struct NormTokenGrad2 {
+            dx: Vec<f32>,
+            dg: Vec<f32>,
+        }
+        let mut d_h_mid = vec![0.0f32; t_len * h];
+        let ffn_norm_results: Vec<NormTokenGrad2> = {
+            let _t = Timer::start(&profiling::NORM_BWD);
+            use rayon::prelude::*;
+            (0..t_len).into_par_iter().map(|ti| {
+                let mut dx = vec![0.0f32; h];
+                let mut dg = vec![0.0f32; h];
+                norm::backward(
+                    &fwd.h_mid[ti * h..(ti + 1) * h],
+                    &self.ffn_norm_gain,
+                    &fg.d_h[ti * h..(ti + 1) * h],
+                    fwd.rinv2[ti],
+                    &mut dx,
+                    &mut dg,
+                );
+                NormTokenGrad2 { dx, dg }
+            }).collect()
+        };
+        for (ti, r) in ffn_norm_results.into_iter().enumerate() {
             for j in 0..h {
-                d_h_mid[ti * h + j] += dx[j];
+                d_h_mid[ti * h + j] = d_out[ti * h + j] + r.dx[j]; // identity residual + norm backward
             }
-            add_f(&mut g.d_ffn_norm_gain, &dg);
+            add_f(&mut g.d_ffn_norm_gain, &r.dg);
         }
 
         // ---- attention sub-block ----
-        // O projection: h_mid = hidden + scale·O(attn_out).
-        let mut d_attn_out = vec![0.0f32; t_len * qd];
-        for ti in 0..t_len {
-            let mut d_oi = vec![0.0f32; h];
-            for j in 0..h {
-                d_oi[j] = scale * d_h_mid[ti * h + j];
-            }
-            let pg = self.wo.backward(dict, &fwd.attn_out[ti * qd..(ti + 1) * qd], &d_oi);
-            add_f(&mut g.d_wo, &pg.d_param);
-            add_c(&mut g.d_dict, &pg.d_dict);
-            d_attn_out[ti * qd..(ti + 1) * qd].copy_from_slice(&pg.d_x);
+        // O projection: h_mid = hidden + scale·O(attn_out). Batched: reconstructs
+        // each Monarch weight block once and reuses it across all t_len tokens
+        // (see SharedMonarchProj::backward_batch), instead of the old per-token
+        // collect+merge loop, which paid the reconstruction cost once per token.
+        let mut d_oi_all = vec![0.0f32; t_len * h];
+        for i in 0..t_len * h {
+            d_oi_all[i] = scale * d_h_mid[i];
         }
+        let wo_g = {
+            let _t = Timer::start(&profiling::WO_BWD);
+            self.wo.backward_batch(mono_d1, mono_d2, &fwd.attn_out, fwd.wo_fc, &d_oi_all, t_len, pool)
+        };
+        let d_attn_out = wo_g.d_x;
+        add_f(&mut g.d_wo, &wo_g.d_param);
+        add_f(&mut g.d_mono_d1, &wo_g.d_d1);
+        add_f(&mut g.d_mono_d2, &wo_g.d_d2);
         // Identity residual of the attention sub-block.
         for i in 0..t_len * h {
             g.d_hidden[i] += d_h_mid[i];
@@ -507,9 +591,12 @@ impl TransformerLayer {
         let mut dq = vec![0.0f32; t_len * qd];
         let mut dk = vec![0.0f32; t_len * kvd];
         let mut dv = vec![0.0f32; t_len * kvd];
-        self.attn.backward(
-            &fwd.q, &fwd.k, &fwd.v, &fwd.attn_out, &fwd.lse, &d_attn_out, &mut dq, &mut dk, &mut dv,
-        );
+        {
+            let _t = Timer::start(&profiling::ATTN_CORE_BWD);
+            self.attn.backward(
+                &fwd.q, &fwd.k, &fwd.v, &fwd.attn_out, &fwd.lse, &d_attn_out, &mut dq, &mut dk, &mut dv,
+            );
+        }
         for ti in 0..t_len {
             for head in 0..cfg.n_q_heads {
                 rope.apply_backward(&mut dq[ti * qd + head * hd..ti * qd + (head + 1) * hd], ti);
@@ -520,36 +607,61 @@ impl TransformerLayer {
         }
 
         // Q/K/V projections → d_normed, then attention-norm backward → d_hidden.
-        for ti in 0..t_len {
-            let nrm = &fwd.normed[ti * h..(ti + 1) * h];
-            let gq = self.wq.backward(dict, nrm, &dq[ti * qd..(ti + 1) * qd]);
-            let gk = self.wk.backward(dict, nrm, &dk[ti * kvd..(ti + 1) * kvd]);
-            let gv = self.wv.backward(dict, nrm, &dv[ti * kvd..(ti + 1) * kvd]);
-            add_f(&mut g.d_wq, &gq.d_param);
-            add_c(&mut g.d_dict, &gq.d_dict);
-            add_f(&mut g.d_wk, &gk.d_param);
-            add_c(&mut g.d_dict, &gk.d_dict);
-            add_f(&mut g.d_wv, &gv.d_param);
-            add_c(&mut g.d_dict, &gv.d_dict);
+        // Same collect+merge shape as the FFN/wo blocks above.
+        // Batched, same reasoning as the wo block above: each of wq/wk/wv
+        // reconstructs its weight blocks once and reuses them across the
+        // whole sequence. norm::backward is per-token and nonlinear (can't
+        // be hoisted the same way), so it stays in a collect+merge loop —
+        // but now it's the *only* thing left in that loop.
+        let wq_g;
+        let wk_g;
+        let wv_g;
+        {
+            let _t = Timer::start(&profiling::QKV_BWD);
+            wq_g = self.wq.backward_batch(mono_d1, mono_d2, &fwd.normed, fwd.wq_fc, &dq, t_len, pool);
+            wk_g = self.wk.backward_batch(mono_d1, mono_d2, &fwd.normed, fwd.wk_fc, &dk, t_len, pool);
+            wv_g = self.wv.backward_batch(mono_d1, mono_d2, &fwd.normed, fwd.wv_fc, &dv, t_len, pool);
+        }
+        add_f(&mut g.d_wq, &wq_g.d_param);
+        add_f(&mut g.d_wk, &wk_g.d_param);
+        add_f(&mut g.d_wv, &wv_g.d_param);
+        add_f(&mut g.d_mono_d1, &wq_g.d_d1);
+        add_f(&mut g.d_mono_d1, &wk_g.d_d1);
+        add_f(&mut g.d_mono_d1, &wv_g.d_d1);
+        add_f(&mut g.d_mono_d2, &wq_g.d_d2);
+        add_f(&mut g.d_mono_d2, &wk_g.d_d2);
+        add_f(&mut g.d_mono_d2, &wv_g.d_d2);
 
-            let mut d_normed = vec![0.0f32; h];
+        let mut d_normed = vec![0.0f32; t_len * h];
+        for i in 0..t_len * h {
+            d_normed[i] = wq_g.d_x[i] + wk_g.d_x[i] + wv_g.d_x[i];
+        }
+        struct NormTokenGrad {
+            dx: Vec<f32>,
+            dg: Vec<f32>,
+        }
+        let norm_results: Vec<NormTokenGrad> = {
+            let _t = Timer::start(&profiling::NORM_BWD);
+            use rayon::prelude::*;
+            (0..t_len).into_par_iter().map(|ti| {
+                let mut dx = vec![0.0f32; h];
+                let mut dg = vec![0.0f32; h];
+                norm::backward(
+                    &hidden[ti * h..(ti + 1) * h],
+                    &self.attn_norm_gain,
+                    &d_normed[ti * h..(ti + 1) * h],
+                    fwd.rinv[ti],
+                    &mut dx,
+                    &mut dg,
+                );
+                NormTokenGrad { dx, dg }
+            }).collect()
+        };
+        for (ti, r) in norm_results.into_iter().enumerate() {
             for j in 0..h {
-                d_normed[j] = gq.d_x[j] + gk.d_x[j] + gv.d_x[j];
+                g.d_hidden[ti * h + j] += r.dx[j];
             }
-            let mut dx = vec![0.0f32; h];
-            let mut dg = vec![0.0f32; h];
-            norm::backward(
-                &hidden[ti * h..(ti + 1) * h],
-                &self.attn_norm_gain,
-                &d_normed,
-                fwd.rinv[ti],
-                &mut dx,
-                &mut dg,
-            );
-            for j in 0..h {
-                g.d_hidden[ti * h + j] += dx[j];
-            }
-            add_f(&mut g.d_attn_norm_gain, &dg);
+            add_f(&mut g.d_attn_norm_gain, &r.dg);
         }
 
         // Probe head: gradient-stopped, so params only — no path into d_hidden.
@@ -614,7 +726,6 @@ impl TransformerLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::fft::init_dict_random;
 
     /// Small but spec-valid config for fast tests.
     fn tiny_cfg() -> ModelConfig {
@@ -637,8 +748,14 @@ mod tests {
         c
     }
 
-    fn tiny_dict(c: &ModelConfig) -> Vec<Complex32> {
-        init_dict_random(c.dict_k, c.block, 0x6, 0.6)
+    fn tiny_mono_dict(c: &ModelConfig) -> (Vec<f32>, Vec<f32>) {
+        let m = (c.block as f64).sqrt() as usize;
+        crate::kernels::monarch::init_shared_atoms(c.dict_k, m, 0x7)
+    }
+
+    fn tiny_ffn_mono_dict(c: &ModelConfig) -> (Vec<f32>, Vec<f32>) {
+        let m = (c.block as f64).sqrt() as usize;
+        crate::kernels::monarch::init_shared_atoms(c.dict_k, m, 0x8)
     }
 
     struct Lcg(u64);
@@ -652,17 +769,19 @@ mod tests {
     #[test]
     fn forward_shapes_and_probe_range() {
         let c = tiny_cfg();
-        let dict = tiny_dict(&c);
+        let (ffn_mono_d1, ffn_mono_d2) = tiny_ffn_mono_dict(&c);
+        let (mono_d1, mono_d2) = tiny_mono_dict(&c);
         let rope = Rope::new(c.head_dim, c.max_seq, c.rope_base);
         let mut layer = TransformerLayer::new(&c, 0, 0xAB);
         let t = 5;
         let mut rng = Lcg(0x1234);
         let hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
 
-        let fwd = layer.forward(&dict, &rope, &hidden, t);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let fwd = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool);
         assert_eq!(fwd.out.len(), t * c.hidden);
         assert_eq!(fwd.probe_p.len(), t);
-        assert_eq!(fwd.ffn_fwds.len(), t);
+        assert_eq!(fwd.ffn_fwds.selected.len(), t);
         for &p in &fwd.probe_p {
             assert!(p > 0.0 && p < 1.0, "probe prob out of range: {p}");
         }
@@ -673,18 +792,21 @@ mod tests {
         // Perturbing the last token's input must not change token 0's output:
         // attention is causal and the FFN/probe are per-token.
         let c = tiny_cfg();
-        let dict = tiny_dict(&c);
+        let (ffn_mono_d1, ffn_mono_d2) = tiny_ffn_mono_dict(&c);
+        let (mono_d1, mono_d2) = tiny_mono_dict(&c);
         let rope = Rope::new(c.head_dim, c.max_seq, c.rope_base);
         let mut layer = TransformerLayer::new(&c, 0, 0xCD); // layer 0 = Full attention
         let t = 4;
         let mut rng = Lcg(0x77);
         let mut hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
 
-        let base = layer.forward(&dict, &rope, &hidden, t).out;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool).out;
         for j in (t - 1) * c.hidden..t * c.hidden {
             hidden[j] += 1.5;
         }
-        let perturbed = layer.forward(&dict, &rope, &hidden, t).out;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let perturbed = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool).out;
         for j in 0..c.hidden {
             assert!((base[j] - perturbed[j]).abs() < 1e-7, "future token leaked into token 0");
         }
@@ -693,18 +815,21 @@ mod tests {
     #[test]
     fn sliding_layer_runs_and_is_causal() {
         let c = tiny_cfg();
-        let dict = tiny_dict(&c);
+        let (ffn_mono_d1, ffn_mono_d2) = tiny_ffn_mono_dict(&c);
+        let (mono_d1, mono_d2) = tiny_mono_dict(&c);
         let rope = Rope::new(c.head_dim, c.max_seq, c.rope_base);
         let mut layer = TransformerLayer::new(&c, 1, 0xEF); // layer 1 = Sliding
         assert_eq!(layer.kind(), AttnKind::Sliding);
         let t = 5;
         let mut rng = Lcg(0x99);
         let mut hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
-        let base = layer.forward(&dict, &rope, &hidden, t).out;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool).out;
         for j in (t - 1) * c.hidden..t * c.hidden {
             hidden[j] += 2.0;
         }
-        let perturbed = layer.forward(&dict, &rope, &hidden, t).out;
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let perturbed = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool).out;
         for j in 0..c.hidden {
             assert!((base[j] - perturbed[j]).abs() < 1e-7, "future leaked (sliding)");
         }
@@ -717,7 +842,8 @@ mod tests {
     #[test]
     fn layer_backward_d_hidden_gradchecks() {
         let c = tiny_cfg();
-        let dict = tiny_dict(&c);
+        let (ffn_mono_d1, ffn_mono_d2) = tiny_ffn_mono_dict(&c);
+        let (mono_d1, mono_d2) = tiny_mono_dict(&c);
         let rope = Rope::new(c.head_dim, c.max_seq, c.rope_base);
         let mut layer = TransformerLayer::new(&c, 0, 0x2024); // Full attention
         let t = 4;
@@ -725,22 +851,24 @@ mod tests {
         let hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
         let r: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect(); // loss=Σ out·r ⇒ d_out=r
 
-        let base = layer.forward(&dict, &rope, &hidden, t);
-        let grads = layer.backward(&dict, &rope, &hidden, &base, &r, None, t);
-        let base_sel: Vec<Vec<usize>> = base.ffn_fwds.iter().map(|f| f.selected.clone()).collect();
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let base = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool);
+        let base_sel: Vec<Vec<usize>> = base.ffn_fwds.selected.clone(); // `backward` consumes `base` by value
+        let grads = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, base, &r, None, t, &mut pool);
 
         let loss = |fwd: &LayerForward| -> f32 { fwd.out.iter().zip(&r).map(|(o, rr)| o * rr).sum() };
-        let sel_stable =
-            |fwd: &LayerForward| fwd.ffn_fwds.iter().zip(&base_sel).all(|(f, s)| f.selected == *s);
+        let sel_stable = |fwd: &LayerForward| fwd.ffn_fwds.selected == base_sel;
 
         const H: f32 = 1e-3;
         let mut checked = 0;
         for i in 0..t * c.hidden {
             let mut hp = hidden.clone();
             hp[i] += H;
-            let fp = layer.forward(&dict, &rope, &hp, t);
+            let mut pool = crate::kernels::scratch::BufPool::new();
+            let fp = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hp, t, &mut pool);
             hp[i] -= 2.0 * H;
-            let fm = layer.forward(&dict, &rope, &hp, t);
+            let mut pool = crate::kernels::scratch::BufPool::new();
+            let fm = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hp, t, &mut pool);
             // Skip coords where the FFN top-k routing flips (non-smooth kink).
             if !sel_stable(&fp) || !sel_stable(&fm) {
                 continue;
@@ -758,18 +886,24 @@ mod tests {
     #[test]
     fn probe_is_gradient_stopped() {
         let c = tiny_cfg();
-        let dict = tiny_dict(&c);
+        let (ffn_mono_d1, ffn_mono_d2) = tiny_ffn_mono_dict(&c);
+        let (mono_d1, mono_d2) = tiny_mono_dict(&c);
         let rope = Rope::new(c.head_dim, c.max_seq, c.rope_base);
         let mut layer = TransformerLayer::new(&c, 0, 0x7);
         let t = 3;
         let mut rng = Lcg(0xC0DE);
         let hidden: Vec<f32> = (0..t * c.hidden).map(|_| rng.f()).collect();
         let d_out = vec![0.1f32; t * c.hidden];
-        let fwd = layer.forward(&dict, &rope, &hidden, t);
+        let mut pool = crate::kernels::scratch::BufPool::new();
+        let fwd = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool);
+        // `backward` consumes its LayerForward by value, and the two calls
+        // below need independent caches -- run forward twice (deterministic,
+        // same inputs) rather than cloning (LayerForward isn't Clone).
+        let fwd2 = layer.forward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, t, &mut pool);
 
-        let g_none = layer.backward(&dict, &rope, &hidden, &fwd, &d_out, None, t);
+        let g_none = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, fwd, &d_out, None, t, &mut pool);
         let dp = vec![0.5f32; t];
-        let g_probe = layer.backward(&dict, &rope, &hidden, &fwd, &d_out, Some(&dp), t);
+        let g_probe = layer.backward(&mono_d1, &mono_d2, &ffn_mono_d1, &ffn_mono_d2, &rope, &hidden, fwd2, &d_out, Some(&dp), t, &mut pool);
 
         for j in 0..t * c.hidden {
             assert!((g_none.d_hidden[j] - g_probe.d_hidden[j]).abs() < 1e-12, "probe leaked into backbone");

@@ -16,7 +16,7 @@ path = "src/main.rs"
 monarch-attn-kernel = { path = "monarch-attn-kernel" }
 rustfft = "6"
 rayon = "1"
-half = "2"
+half = { version = "2", features = ["serde", "bytemuck"] }
 bytemuck = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
