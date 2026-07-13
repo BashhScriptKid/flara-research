@@ -13,9 +13,10 @@ name = "train"
 path = "src/main.rs"
 
 [dependencies]
+monarch-attn-kernel = { path = "monarch-attn-kernel" }
 rustfft = "6"
 rayon = "1"
-half = { version = "2", features = ["serde", "bytemuck"] }
+half = "2"
 bytemuck = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"

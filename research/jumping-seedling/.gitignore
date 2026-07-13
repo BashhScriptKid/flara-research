@@ -1,13 +1,3 @@
 /target
 *.swp
 *.swo
-.idea/
-.data-cache/
-cache/
-checkpoints/
-*.ckpt
-*.step
-checkpoint*.bin
-monarch-attn-causal/venv/
-monarch-attn-causal/__pycache__/
-monarch-attn-causal/repo/

@@ -3963,3 +3963,109 @@ reasons as the original consult, and inheriting the same unresolved
 (LSH-hashing: dead; trained representative construction: closed) and
 the whole Fable-artifact-driven MetaMonarchAttention investigation.
 Meta remains the sole, fully validated production recommendation.
+
+## Real-model forward-latency check: Meta/TMA wired into Jumping Seedling for a profiling swap, crossover found between seq 512 and 1024
+
+Follow-up to the closing conclusion above ("Meta remains the sole, fully
+validated production recommendation"): validated does not mean fast on this
+specific hardware at this specific model's shapes, so `monarch-attn-kernel`'s
+`meta.rs` kernel (`monarch_meta_threshold_fast_residual`) was wired directly
+into the real Jumping Seedling model as a forward-only profiling swap for
+FlashAttention, via a new shim in the main crate
+(`../src/kernels/attn_tma.rs`, `TmaAttention`) behind a `TMA_ATTN=1` env
+toggle, applying only to the 24/96 `AttnKind::Full` layers (Sliding
+untouched). The shim broadcasts the model's GQA K/V (2 heads) across each
+query head's group (14 heads) to satisfy `meta.rs`'s MHA-only `HeadTensor`
+assumption -- real overhead, not part of TMA's own cost, and not present in a
+from-scratch GQA-aware kernel. No backward exists for TMA yet (non-
+differentiable tier/threshold selection as implemented); the profiling used
+the model's existing `FWD_ONLY=1` harness flag, and `AttnRunner::Tma::backward`
+panics rather than silently emitting wrong gradients if ever hit.
+
+Measured mean forward ms/step, full 96-layer/hidden-896 production spec:
+
+| SEQ | FlashAttention | TMA | Δ |
+|---|---|---|---|
+| 256 (production) | 13253.50 | 13525.88 | +2.1% slower |
+| 512 | 26140.95 | 26708.90 | +2.2% slower |
+| 1024 | 65592.71 | 61883.24 | **-5.7% faster** |
+
+**Net loss at the model's actual production `seq_len=256`.** Crossover exists
+but sits between 512 and 1024, not near 256 -- confirms rather than overturns
+the "modest payoff at seq_len=256" caveat flagged back when the paper was
+first evaluated. Single-run measurements (not repeated across the ~65%
+thermal-noise spread this hardware showed on earlier microbenchmarks) --
+directional, not final numbers.
+
+**Status: informational only, not a reopening of the production
+recommendation.** Meta/TMA's validated *accuracy* case stands; this just adds
+that its *speed* case, on real GQA shapes at this model's actual sequence
+length, doesn't hold yet either -- both the quality axis (closed above) and
+now the speed axis at current scale point the same direction: not a near-term
+production swap. Would need either a much larger `seq_len` or a GQA-native
+(broadcast-free) integration to move the needle. Full detail:
+`../RESEARCH_LOG.md`, 2026-07-13 entry.
+
+## NSA-style learned residual gate: two architectures tried, both dead
+
+Follow-up to the NSA literature read (arXiv 2502.11089): NSA's one design
+element not yet tried anywhere in this arc is a learned sigmoid/MLP gate
+blending its three branches (compressed/selected/sliding), as opposed to a
+fixed combination rule. Ported as narrowly as possible onto Meta's actual
+structure -- NOT touching the already-validated real-score survivor
+selection (shared-tau quantile) or the exact-algebraic residual centroid
+math, only adding a learned additive bias to the residual logit that
+competes in the existing softmax against real per-tier survivor scores.
+
+**v1 (`ma_meta_threshold_gated.py`, `ResidualGate`):** a single scalar bias
+per query, `Linear(D,1)` on `q_m` only, shared across every tier. First
+attempt trained/evaluated on the existing fixed-strong-needle same-norm
+battery -- came back with the gate making literally zero difference to 4
+decimal places (0.9312 -> 0.9312 far-block, 0.9296 -> 0.9296 diagonal).
+Diagnosed as likely benchmark saturation: the needle's inflated norm
+already clears the shared-tau cutoff on ~every trial, so the residual
+pathway is never decisive and the gate has nothing to correct.
+
+**Stress test (`eval_gated_stress.py`):** swept needle key norm (0.0 to
+4.0) to map the actual survivor/non-survivor transition band directly via
+frozen Meta's own recall curve (confirmed smooth 0.01 -> 0.99 transition,
+both far-block and diagonal placements -- a real ambiguous zone exists).
+Retrained v1's gate with a curriculum spanning that full range, not the
+single fixed strong value. Result: **still zero measurable effect at every
+point on the curve** (differences <=0.001, noise-level). Training loss
+never converged (bounced 0.13-0.40 across 600 steps) -- not an
+undertrained result, a flat objective surface. Diagnosed structurally: a
+single per-query scalar bias shared across every tier can only nudge
+"trust residuals more/less" globally, but has no way to discriminate which
+specific tier's residual is actually informative -- the softmax already
+resolves per-tier competition using real per-tier scores, leaving no lever
+for an undifferentiated global bias to pull.
+
+**v2 (`ma_meta_threshold_gated_v2.py`, `ResidualGateV2`):** addressed that
+diagnosis directly -- gate now takes real per-tier context (query, the
+residual centroid `mean_k` itself, non-survivor fraction, tier level) via
+a small MLP (`Linear(2D+2,32)->ReLU->Linear(32,1)`), not just the query.
+Same curriculum training, same stress sweep
+(`eval_gated_stress_v2.py`). Result: **no improvement, and marginally
+WORSE** than both the frozen baseline and v1 across the sweep (e.g.
+far-block norm=0.8: 0.3578 frozen vs 0.3511 v2; diagonal norm=0.0: 0.1079
+vs 0.0994) -- small but consistently non-positive, not noise favoring
+either direction. Loss curve nearly identical to v1's despite ~15x more
+parameters and genuine per-tier context -- richer inputs did not unstick
+the flat optimization landscape.
+
+**Status: learned residual gate is CLOSED**, cleanly, not just
+under-tested. Two independent architectures (global scalar, per-tier
+contextual MLP), both properly curriculum-trained across the full
+transition band (confirmed to exist via the frozen baseline's own recall
+curve, not assumed), both come back with zero net improvement. NSA's
+learned-gate design element doesn't have a foothold on Meta's
+survivor/residual structure -- the existing softmax competition between
+real per-tier scores already captures what a gate would try to add. This
+was the one remaining untried piece of the NSA comparison
+(`eval_causal_monarch_samenorm.py`'s note on NSA's real-score-selection
+ablation already having independently corroborated the earlier
+trained-landmark-axis closure) -- with this closed too, the NSA read is
+fully exhausted as a source of new leads for this codebase. Meta (frozen,
+untrained selection/combination) remains the sole validated production
+recommendation, unchanged.
