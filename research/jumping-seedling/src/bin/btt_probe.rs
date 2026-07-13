@@ -314,6 +314,14 @@ fn train_to_target(nd: usize, rng: &mut Lcg, lr_coeff: f32, lr_atom: f32, steps:
 /// (teacher_nd = m/2) for other block sizes too.
 #[allow(clippy::too_many_arguments)]
 fn train_to_target_m(m: usize, nd: usize, rng: &mut Lcg, lr_coeff: f32, lr_atom: f32, steps: usize, target_fn: &dyn Fn(&[f32]) -> Vec<f32>) -> f32 {
+    train_to_target_full(m, nd, rng, lr_coeff, lr_atom, steps, target_fn).1
+}
+
+/// Same as `train_to_target_m`, but also returns the trained `Block` --
+/// needed to inspect the learned `a1`/`a2` coefficients directly (e.g. for
+/// singular-value degeneracy checks) rather than just the final loss.
+#[allow(clippy::too_many_arguments)]
+fn train_to_target_full(m: usize, nd: usize, rng: &mut Lcg, lr_coeff: f32, lr_atom: f32, steps: usize, target_fn: &dyn Fn(&[f32]) -> Vec<f32>) -> (Block, f32) {
     let mut blk = Block::new(m, m, nd, rng);
     let n = blk.n();
     let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
@@ -350,7 +358,7 @@ fn train_to_target_m(m: usize, nd: usize, rng: &mut Lcg, lr_coeff: f32, lr_atom:
         rel = (sse / energy.max(1e-9)).sqrt();
         adam.step(&mut blk, &grads, lr_coeff * decay, lr_atom * decay, b1, b2, eps, step + 1);
     }
-    rel
+    (blk, rel)
 }
 
 fn overfit() {
@@ -475,6 +483,104 @@ fn block_size_sweep(ms: &[usize], seeds: u64) {
     println!();
 }
 
+/// Cyclic Jacobi eigenvalue solver for a small symmetric matrix (row-major,
+/// `n x n`). Simple and numerically robust for the tiny matrices here
+/// (n = nd, at most a few dozen) -- not intended for large-scale use.
+fn jacobi_eigenvalues(mut a: Vec<f32>, n: usize) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    for _sweep in 0..100 {
+        let mut off = 0.0f32;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                off += a[i * n + j] * a[i * n + j];
+            }
+        }
+        if off < 1e-12 {
+            break;
+        }
+        for p in 0..n {
+            for q in (p + 1)..n {
+                let apq = a[p * n + q];
+                if apq.abs() < 1e-12 {
+                    continue;
+                }
+                let app = a[p * n + p];
+                let aqq = a[q * n + q];
+                let phi = 0.5 * (2.0 * apq).atan2(aqq - app);
+                let (c, s) = (phi.cos(), phi.sin());
+                for k in 0..n {
+                    let akp = a[k * n + p];
+                    let akq = a[k * n + q];
+                    a[k * n + p] = c * akp - s * akq;
+                    a[k * n + q] = s * akp + c * akq;
+                }
+                for k in 0..n {
+                    let apk = a[p * n + k];
+                    let aqk = a[q * n + k];
+                    a[p * n + k] = c * apk - s * aqk;
+                    a[q * n + k] = s * apk + c * aqk;
+                }
+            }
+        }
+    }
+    let mut eig: Vec<f32> = (0..n).map(|i| a[i * n + i]).collect();
+    eig.sort_by(|x, y| y.partial_cmp(x).unwrap()); // descending
+    eig
+}
+
+/// Singular values of `a` (`rows x cols`, row-major), via eigenvalues of the
+/// `cols x cols` Gram matrix `a^T a`. Descending order.
+fn singular_values(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut gram = vec![0.0f32; cols * cols];
+    for i in 0..cols {
+        for j in 0..cols {
+            let mut s = 0.0f32;
+            for r in 0..rows {
+                s += a[r * cols + i] * a[r * cols + j];
+            }
+            gram[i * cols + j] = s;
+        }
+    }
+    jacobi_eigenvalues(gram, cols).into_iter().map(|e| e.max(0.0).sqrt()).collect()
+}
+
+/// Mechanistic follow-up to the nd=4 dead-spot investigation: WHY are
+/// matched-capacity instances stuck? Trains one deliberately-matched
+/// (student==teacher, the known-hard point) and one deliberately-
+/// overparameterized (student==2x teacher, known to solve reliably)
+/// instance side by side, then compares the singular value spectrum of
+/// their learned `a1`/`a2` coefficient matrices. A stuck instance whose
+/// effective rank has collapsed (small trailing singular values, active
+/// atoms redundant) would point at atom-collapse/redundancy as the
+/// mechanism; a stuck instance with a healthy, full-rank spectrum despite
+/// high loss would point elsewhere (e.g. a genuine rugged bilinear
+/// landscape, not degenerate parameters).
+fn condition_probe(m: usize, teacher_nd: usize, seed: u64) {
+    println!("condition probe: m={m}, teacher_nd={teacher_nd}, seed={seed}");
+    for (label, student_nd) in [("matched (stuck regime)", teacher_nd), ("2x overcapacity (solves)", 2 * teacher_nd)] {
+        let mut trng = Lcg(0xF17 ^ (m as u64) ^ (teacher_nd as u64) ^ (seed << 8));
+        let teacher = Block::new(m, m, teacher_nd, &mut trng);
+        let tf = |x: &[f32]| teacher.forward(x).out;
+        let (trained, rel) = train_to_target_full(
+            m, student_nd,
+            &mut Lcg(0xAAA ^ (m as u64) ^ (student_nd as u64) ^ (teacher_nd as u64) ^ (seed << 16)),
+            5e-3, 5e-3, 8000, &tf,
+        );
+        let sv_a1 = singular_values(&trained.a1, m, student_nd);
+        let sv_a2 = singular_values(&trained.a2, m, student_nd);
+        let fmt = |v: &[f32]| v.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(", ");
+        println!("  {label}: student_nd={student_nd}, rel_err={rel:.4}");
+        println!("    a1 singular values: [{}]", fmt(&sv_a1));
+        println!("    a2 singular values: [{}]", fmt(&sv_a2));
+        let a1_ratio = sv_a1.last().copied().unwrap_or(0.0) / sv_a1.first().copied().unwrap_or(1.0).max(1e-9);
+        let a2_ratio = sv_a2.last().copied().unwrap_or(0.0) / sv_a2.first().copied().unwrap_or(1.0).max(1e-9);
+        println!("    smallest/largest ratio: a1={a1_ratio:.4}  a2={a2_ratio:.4}  (near-0 = collapsed/redundant atom usage)");
+    }
+    println!();
+}
+
 fn add(a: &mut [f32], b: &[f32]) {
     for (x, y) in a.iter_mut().zip(b) {
         *x += y;
@@ -514,7 +620,8 @@ fn upd(p: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32], lr: f32, b1: f32,
     }
 }
 
-fn main() {
+#[allow(dead_code)]
+fn full_sweep_suite() {
     println!("=== gate (b): shared-core BTT block ===\n");
     println!("gradcheck (n=64, nd=4):");
     gradcheck();
@@ -535,4 +642,11 @@ fn main() {
 
     println!("=== nd=4 dead-spot follow-up: is it tied to block size m=8? ===\n");
     block_size_sweep(&[4, 6, 8, 12, 16], 8);
+}
+
+fn main() {
+    println!("=== nd=4 dead-spot follow-up: mechanism -- atom collapse or rugged landscape? ===\n");
+    for seed in 0..4u64 {
+        condition_probe(8, 4, seed);
+    }
 }

@@ -4675,3 +4675,57 @@ not a proven optimum. Closes the last of the four open threads flagged
 earlier today (`MONARCH_CONTRACT`, AdaFactor frequency-domain, `nd=4`,
 and now this one) -- all four touched, three closed, one (`nd=4`)
 reframed into a more precise open question.
+
+## 2026-07-14 — nd=4 dead spot, part 3: mechanism found -- it's a genuine local minimum, not atom collapse, and over-parameterization helps via slack, not avoided degeneracy
+
+Chased the mechanism question left open above ("worth real analysis...
+if this construction is ever revisited"). Added `condition_probe` to
+`btt_probe.rs`: trains a matched-capacity instance (student_nd==
+teacher_nd==4, the known-stuck regime) and a 2x-overparameterized
+instance (student_nd=8, known to solve reliably) side by side, then
+inspects the singular-value spectrum of the trained `a1`/`a2`
+coefficient matrices (via a small Jacobi eigenvalue solver on the Gram
+matrix -- cheap and exact enough at these sizes). The question: is the
+stuck instance stuck because its atoms have collapsed/become redundant
+(degenerate parameterization), or is something else going on?
+
+4 seeds, m=8, teacher_nd=4:
+
+| seed | matched rel_err | matched sv ratio (a1/a2) | 2x rel_err | 2x sv ratio (a1/a2) |
+|---|---|---|---|---|
+| 0 | 0.4119 | 0.740 / 0.793 | 0.0000 | 0.158 / 0.136 |
+| 1 | 0.2490 | 0.732 / 0.481 | 0.0024 | 0.088 / 0.040 |
+| 2 | 0.1992 | 0.403 / 0.528 | 0.0073 | 0.037 / 0.098 |
+| 3 | 0.2083 | 0.421 / 0.536 | 0.0016 | 0.002 / 0.005 |
+
+**Refutes atom collapse as the mechanism, and in the opposite direction
+than expected.** The STUCK matched instances stay well-conditioned and
+full-rank (smallest/largest singular-value ratio 0.40-0.79 -- every atom
+meaningfully used) despite failing to reduce loss. The SOLVED
+overparameterized instances show MORE collapse, not less (ratios
+0.002-0.16 -- some atoms end up nearly redundant even in success).
+That's backwards from "degenerate parameters cause failure."
+
+**What this actually shows:** matched-capacity training isn't failing
+because the parameterization degenerates -- it's finding a genuine,
+fully-utilized, well-conditioned local minimum that is simply the wrong
+one, and the rigid (exactly-matched, no slack) landscape has no spare
+directions to route around it. Overparameterized training succeeds not
+by avoiding degeneracy but by having EXTRA redundant directions (which
+later show up as small singular values / underused atoms) that give the
+optimizer room to escape bad basins during training. This is consistent
+with -- and gives a concrete mechanistic instance of -- the general
+over-parameterization intuition that more parameters help by connecting
+the loss landscape, not by avoiding parameter redundancy in the final
+solution.
+
+**Status: the nd=4 mystery now has a real, satisfying mechanistic
+account**, closing the loop opened by parts 1 and 2 today. Not "why does
+nd=4 specifically fail" (refuted as block-size-specific in part 2) and
+not "atom collapse" (refuted here) -- it's a genuine bad local minimum in
+a rigid, exactly-matched bilinear landscape, and the escape mechanism is
+landscape connectivity via redundant capacity, not cleaner-conditioned
+parameters. Still not a production concern (real model operates at
+`dict_k~32`, far from any matched-capacity regime), but this closes the
+curiosity with an actual explanation rather than leaving it as an
+unexplained empirical pattern.
