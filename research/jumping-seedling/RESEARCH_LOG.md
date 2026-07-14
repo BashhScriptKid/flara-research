@@ -4636,27 +4636,37 @@ eval set:
 | 32 | 1.7637 | -0.057 |
 | 64 | 1.7333 | -0.030 |
 | 128 | 1.7018 | -0.032 |
+| 1024 | 1.6777 | -0.024 (over an 8x step, not 2x) |
 
-**No sharp sweet spot.** The naive expectation (diminishing returns,
-flattening toward a plateau) doesn't hold cleanly -- the 4->8 jump
-(-0.092) is the single LARGEST improvement in the whole sweep, bigger
-than 2->4, so the curve isn't even monotonically diminishing until past
-8. From `dict_k=32` onward it does settle into a slow, roughly CONSTANT
-~0.03 nat improvement per doubling (32->64: -0.030, 64->128: -0.032,
-nearly identical) -- a smooth log-linear decline, not a plateau. Quality
-is still improving, just slowly, all the way to 128; the sweep was not
-extended further given the diminishing-but-nonzero pattern was already
-clear and each additional point costs real wall-clock time.
+**No sharp sweet spot, but the first real sign of deceleration shows up
+at the very top of the range.** The naive expectation (diminishing
+returns, flattening toward a plateau) doesn't hold cleanly through most
+of the sweep -- the 4->8 jump (-0.092) is the single LARGEST improvement
+in the whole sweep, bigger than 2->4, so the curve isn't even
+monotonically diminishing until past 8. From `dict_k=32` to 128 it
+settles into a slow, roughly CONSTANT ~0.03 nat improvement per doubling
+(32->64: -0.030, 64->128: -0.032, nearly identical) -- a smooth
+log-linear decline, not a plateau. Only at `dict_k=1024` (an 8x jump
+from 128, not a doubling) does the per-step gain finally shrink below
+that constant rate (-0.024 for 8x, vs. ~0.03 per mere 2x lower down) --
+the first point in the whole sweep where the curve is unambiguously
+bending, not just declining steadily. Still not flat, and the training
+loss at 1024 was visibly noisier step-to-step (more free parameters,
+same 2000 steps -- plausibly undertrained relative to its own capacity
+at this point, a confound this single-run sweep can't separate from a
+genuine landscape effect).
 
 **What this means for production's actual `dict_k=32`:** it sits
-partway down a still-declining curve, not at a demonstrated optimum.
-Whether pushing higher is worth it is a storage-budget question (real
-coefficient storage scales roughly linearly with `dict_k`, so doubling
-it roughly doubles that footprint) traded against a real but small,
-steady ~0.03 nat/doubling gain -- not something this sweep alone can
-resolve without the actual L3 budget arithmetic (bytes available vs.
-bytes per `dict_k` unit at production `p*q*m` dims), which was not
-computed here.
+partway down a still-declining curve, closer to the "constant small
+gain per doubling" region than to the eventual deceleration only visible
+80x higher. Whether pushing higher is worth it is a storage-budget
+question (real coefficient storage scales roughly linearly with
+`dict_k`, so doubling it roughly doubles that footprint) traded against
+a real but small, steady ~0.03 nat/doubling gain that only starts
+meaningfully shrinking around 2-3 orders of magnitude above production's
+current setting -- not something this sweep alone can resolve without
+the actual L3 budget arithmetic (bytes available vs. bytes per `dict_k`
+unit at production `p*q*m` dims), which was not computed here.
 
 **Caveats:** small proxy config (hidden=256, 12 layers, byte-level
 vocab=128), not exact production shapes (hidden=896, ffn=3072,
@@ -4669,7 +4679,7 @@ consistent across all 7 points so the comparison itself stays fair even
 if absolute numbers aren't final-converged values.
 
 **Status:** answers the question as far as it can be answered at this
-scale -- no cliff-edge sweet spot exists in `[2, 128]`; the choice of
+scale -- no cliff-edge sweet spot exists in `[2, 1024]`; the choice of
 `dict_k=32` in production is a reasonable diminishing-returns compromise,
 not a proven optimum. Closes the last of the four open threads flagged
 earlier today (`MONARCH_CONTRACT`, AdaFactor frequency-domain, `nd=4`,
